@@ -1,0 +1,151 @@
+<p align="center"><img src="assets/duck.png" width="112" alt="Duck"></p>
+
+<h1 align="center">Duck</h1>
+
+<p align="center"><b>Terminal com GPU e multiplexador embutido, feito para trabalhar com agentes de IA.</b><br>
+Rust · wgpu · config em Lua · Windows primeiro, builds para Linux e macOS</p>
+
+<p align="center"><a href="README.md">Read in English</a></p>
+
+---
+
+O Duck é emulador de terminal e multiplexador num programa só. Fechar a janela
+desanexa em vez de matar os shells, e o terminal sabe quais panes rodam um
+agente de IA (Claude Code, Codex, Kiro, Gemini, aider…) e o que cada um está
+fazendo.
+
+## Por que o Duck
+
+- **Sessões que sobrevivem.** Cada shell vive num processo próprio
+  (`ptyhost`). Fechar a janela, ou até uma queda do server, não derruba nada;
+  o próximo server reconecta. Um checkpoint a cada 5 minutos restaura
+  workspaces, abas e divisões depois de reiniciar a máquina, e **retoma as
+  conversas do Claude Code** que estavam abertas (`claude --resume`).
+- **Sabe dos agentes.** Cada aba mostra se o agente está trabalhando, pedindo
+  aprovação ou se terminou. Aprove ou negue por um cartão ou pela notificação
+  do Windows, sem trocar de aba. Painel lateral com o plano do agente, tokens
+  de contexto e custo; linha do tempo da sessão; recados entregues quando o
+  agente para; "corrigir com agente" manda o comando que falhou e a saída.
+- **Blocos de comando.** Com a shell integration (OSC 133), cada comando vira
+  um cartão com exit code e duração, botões de copiar, re-executar, recolher e
+  fixar, e um minimapa que marca as falhas.
+- **Cara própria.** Barra de título própria, abas em pílula (ou na lateral),
+  panes como cartões arredondados, cursor suave, paleta que também busca abas,
+  sessões, histórico e arquivos, 22 temas embutidos mais um gerado do papel de
+  parede, Mica/Acrylic no Windows 11 e shaders de pós-processamento.
+- **Programável.** Config em Lua com recarga automática, tabelas de atalhos,
+  workflows, layouts, plugins WASM, CLI e servidor MCP para agentes
+  controlarem o terminal (`duck cli spawn`, `read`, `send`, `blocks`,
+  `last-failure`…).
+- **Leve.** Um binário nativo (~19 MB), CPU parada perto de 0%, cerca de 12 mil
+  linhas/s de vazão de saída.
+
+## Instalação
+
+Precisa do [Rust](https://rustup.rs) (stable). O primeiro build leva uns 5
+minutos.
+
+### Windows 10/11
+
+```powershell
+winget install Rustlang.Rustup        # precisa também do MSVC Build Tools
+git clone https://github.com/herlondf/duck.git
+cd duck
+pwsh -File .\install.ps1               # compila, PATH, ~/.duck.lua, atalho no menu Iniciar
+pwsh -File .\install.ps1 -Boot         # + abre no logon restaurando o último checkpoint
+pwsh -File .\install.ps1 -ClaudeHooks  # + estado exato dos agentes pelos hooks do Claude Code
+```
+
+### Linux
+
+```bash
+curl https://sh.rustup.rs -sSf | sh
+sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
+git clone https://github.com/herlondf/duck.git && cd duck
+./install.sh                 # compila, ~/.local/bin, ~/.duck.lua, atalho no menu de apps
+./install.sh --boot --claude-hooks
+```
+
+### macOS
+
+```bash
+curl https://sh.rustup.rs -sSf | sh
+git clone https://github.com/herlondf/duck.git && cd duck
+./install.sh                 # compila, ~/.local/bin, ~/Applications/Duck.app
+```
+
+Depois rode `duck` (abre a janela) ou `duck doctor` (confere config, server,
+hooks e shell integration).
+
+**Estado por sistema:** o Windows é o de uso diário. No Linux o projeto
+compila e passa nos testes, mas foi pouco usado na prática. O macOS ainda não
+foi testado. A tecla global do quick terminal e o Mica/Acrylic são só do
+Windows.
+
+## Primeiros passos
+
+| Atalho | Ação |
+|---|---|
+| `Ctrl+Shift+P` | Paleta (comandos, abas, sessões, histórico, arquivos) |
+| `Ctrl+Shift+Home` | Início: projetos recentes, sessões do Claude, ações |
+| `Alt+\` / `Alt+-` | Dividir à direita / abaixo |
+| `Ctrl+Shift+T` / `Ctrl+Shift+W` | Nova aba / fechar aba |
+| `Ctrl+Shift+S` / `Ctrl+Alt+N` | Trocar / criar workspace |
+| `Ctrl+Alt+M` | Mover a aba para outro workspace |
+| `Ctrl+Shift+A` | Agent Manager: todos os agentes numa grade ao vivo |
+| `Ctrl+Shift+I` / `Ctrl+Shift+Y` | Painel do agente / linha do tempo da sessão |
+| `Ctrl+Shift+E` | Corrigir com agente o último comando que falhou |
+| `Ctrl+Shift+Enter` | Editor de comando em várias linhas (desfazer, seleção) |
+| `Ctrl+,` | Configurações: temas, sliders, shaders, fontes |
+
+Clique em CPU/RAM na barra de título para abrir o painel do sistema (uso por
+núcleo, memória, processos que mais gastam). Tudo se configura em
+`~/.duck.lua`; veja o [duck.example.lua](duck.example.lua).
+
+## Comparativo
+
+Um retrato do que cada ferramenta faz de fábrica (plugins e scripts externos
+podem acrescentar mais). ✅ sim · 🟡 em parte · ❌ não
+
+| | Duck | WezTerm | Windows Terminal | Ghostty | kitty | Alacritty | Warp | Wave | tmux | Zellij |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Windows (nativo) | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Linux / macOS | 🟡 | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Renderização na GPU | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Abas e divisões | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| Shells sobrevivem a fechar a janela | ✅ | 🟡 | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ |
+| Restaura o layout depois de reiniciar | ✅ | ❌ | 🟡 | ❌ | 🟡 | ❌ | 🟡 | 🟡 | 🟡 | ✅ |
+| Retoma sessões de agente de IA depois de reiniciar | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Estado do agente por aba (trabalhando / pede aprovação / terminou) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | 🟡 | ❌ | ❌ | ❌ |
+| Aprovar pedidos do agente de outra aba | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Blocos de comando (exit code, duração) | ✅ | 🟡 | 🟡 | ❌ | 🟡 | ❌ | ✅ | ✅ | ❌ | ❌ |
+| Config programável | Lua | Lua | JSON | texto | texto/Python | TOML | ❌ | JSON | texto | KDL |
+| Plugins | Lua, WASM | Lua | ❌ | ❌ | Python | ❌ | ❌ | widgets | shell | WASM |
+| API/CLI para agentes controlarem panes | ✅ (CLI + MCP) | ✅ (CLI) | 🟡 | ❌ | ✅ | ❌ | ❌ | 🟡 | ✅ | ✅ |
+| Chat de IA embutido | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| Código aberto | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
+
+O Duck não tenta ser um app de chat de IA: é um terminal em que os agentes que
+você já usa (na linha de comando) ficam visíveis e controláveis. Para um chat
+integrado, o Warp e o Wave fazem isso; para só um terminal rápido no
+Linux/macOS, o Ghostty, o kitty e o Alacritty estão mais maduros lá.
+
+## Documentação
+
+- [Manual completo](docs/MANUAL.pt-BR.md): todos os atalhos, a CLI, os
+  recursos de agente, segurança, persistência e a arquitetura.
+- [Lista de funcionalidades e status](docs/FUNCIONALIDADES.md) e as
+  [notas de pesquisa](docs/PESQUISA.md) que guiaram o projeto.
+
+## Créditos
+
+- Emulação de terminal: [alacritty_terminal](https://github.com/alacritty/alacritty).
+  Renderização: [wgpu](https://wgpu.rs) e [glyphon](https://github.com/grovesNL/glyphon).
+- Fonte embutida: JetBrains Mono (SIL Open Font License 1.1) com os ícones do
+  [Nerd Fonts](https://www.nerdfonts.com).
+- Ícone do pato: baseado num SVG do [SVG Repo](https://www.svgrepo.com).
+- Inspirado em WezTerm, herdr, Warp, Ghostty, kitty, Zellij, Wave e Kiro.
+
+## Licença
+
+MIT. Veja [LICENSE](LICENSE). A fonte embutida mantém a licença dela ([fonts/OFL.txt](fonts/OFL.txt)).
