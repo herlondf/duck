@@ -143,7 +143,7 @@ Linux/macOS, o Ghostty, o kitty e o Alacritty estão mais maduros lá.
   Renderização: [wgpu](https://wgpu.rs) e [glyphon](https://github.com/grovesNL/glyphon).
 - Fonte embutida: JetBrains Mono (SIL Open Font License 1.1) com os ícones do
   [Nerd Fonts](https://www.nerdfonts.com).
-- Ícone do pato: baseado num SVG do [SVG Repo](https://www.svgrepo.com).
+- Ícone do pato: baseado num SVG em CC0 (domínio público) do [SVG Repo](https://www.svgrepo.com).
 - Inspirado em WezTerm, herdr, Warp, Ghostty, kitty, Zellij, Wave e Kiro.
 
 ## Licença

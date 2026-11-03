@@ -141,7 +141,7 @@ on Linux/macOS, Ghostty, kitty and Alacritty are more mature there.
   Rendering: [wgpu](https://wgpu.rs) and [glyphon](https://github.com/grovesNL/glyphon).
 - Bundled font: JetBrains Mono (SIL Open Font License 1.1) patched by
   [Nerd Fonts](https://www.nerdfonts.com).
-- Duck icon: based on an SVG from [SVG Repo](https://www.svgrepo.com).
+- Duck icon: based on a CC0 (public domain) SVG from [SVG Repo](https://www.svgrepo.com).
 - Inspired by WezTerm, herdr, Warp, Ghostty, kitty, Zellij, Wave and Kiro.
 
 ## License
