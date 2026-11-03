@@ -200,11 +200,15 @@ pub fn log(msg: &str) {
 }
 
 /// Variaveis que uma sessao do Claude Code injeta e que nao podem vazar para
-/// o mux nem para os shells (README do WezTerm, secao 6). NO_COLOR so sai
-/// quando veio junto com o Claude: fora dele e preferencia legitima do usuario.
+/// o mux nem para os shells (README do WezTerm, secao 6). As da segunda lista
+/// so saem quando vieram junto com o Claude: fora dele sao escolha do usuario.
+/// CLAUDE_CONFIG_DIR e a pior: o Duck aberto de uma sessao de outro perfil (~/.claude-trabalho)
+/// fazia todo `claude` digitado num pane logar na conta desse perfil.
 pub fn leaked_env(k: &str) -> bool {
+    let k = k.to_uppercase();
     let from_claude = std::env::var_os("CLAUDECODE").is_some();
-    k == "CLAUDECODE" || k.starts_with("CLAUDE_CODE_") || (from_claude && k == "NO_COLOR")
+    k == "CLAUDECODE" || k.starts_with("CLAUDE_CODE_")
+        || (from_claude && ["NO_COLOR", "CLAUDE_CONFIG_DIR", "CLAUDE_BROWSER_PROFILE", "CLAUDE_PID"].contains(&k.as_str()))
 }
 
 /// Atalho para respostas: {"ok":true,...}.
