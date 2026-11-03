@@ -1,0 +1,14 @@
+{
+  "name": "snippets",
+  "title": "Snippets",
+  "icon": "",
+  "version": "0.1.0",
+  "category": "Produtividade",
+  "description": "Trechos de comando em ~/.duck/snippets.md e histórico do que foi copiado no Duck",
+  "command": ["node", "dist/index.js"],
+  "permissions": ["paste", "clipboard"],
+  "settings": [
+    { "key": "persist", "title": "Guardar o histórico do clipboard em disco", "type": "bool", "default": false },
+    { "key": "max_items", "title": "Entradas no histórico", "type": "number", "default": 30 }
+  ]
+}

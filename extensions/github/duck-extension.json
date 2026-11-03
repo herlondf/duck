@@ -1,0 +1,8 @@
+{
+  "name": "github",
+  "title": "GitHub",
+  "icon": "github",
+  "version": "0.1.0",
+  "description": "Notificacoes, issues, PRs e repositorios do GitHub (varias contas, via gh)",
+  "command": ["node", "dist/index.js"]
+}

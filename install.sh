@@ -5,6 +5,7 @@
 #   ./install.sh --boot          also open Duck at login, restoring the last checkpoint
 #   ./install.sh --claude-hooks  also register `duck hook` in ~/.claude*/settings.json
 #   ./install.sh --skip-build    reuse target/release
+#   ./install.sh --extensions    build the bundled extensions (Node 18+); enable them in Ctrl+Shift+P
 #
 # Nothing outside your home directory is changed. / Nada fora do seu home e alterado.
 set -euo pipefail
@@ -13,12 +14,13 @@ root="$(cd "$(dirname "$0")" && pwd)"
 case "${LANG:-}${LC_ALL:-}" in pt*) pt=1 ;; *) pt=0 ;; esac
 say() { if [ "$pt" = 1 ]; then printf '%s\n' "$1"; else printf '%s\n' "$2"; fi; }
 
-boot=0; hooks=0; build=1
+boot=0; hooks=0; build=1; exts=0
 for a in "$@"; do
   case "$a" in
     --boot) boot=1 ;;
     --claude-hooks) hooks=1 ;;
     --skip-build) build=0 ;;
+    --extensions) exts=1 ;;
     -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) say "opcao desconhecida: $a" "unknown option: $a"; exit 2 ;;
   esac
@@ -106,6 +108,20 @@ if [ "$hooks" = 1 ]; then
   for d in "$HOME"/.claude*; do
     [ -f "$d/settings.json" ] && "$bin/duck" install --hooks "$d/settings.json"
   done
+fi
+
+if [ "$exts" = 1 ]; then
+  command -v npm >/dev/null || { say "Node.js nao encontrado (precisa do 18+)" "Node.js not found (18+ required)"; exit 1; }
+  for e in "$root"/extensions/*/; do
+    [ -f "$e/duck-extension.json" ] || continue
+    n="$(basename "$e")"
+    (cd "$e" && npm install --no-audit --no-fund >/dev/null && npm run build >/dev/null)
+    say "Extensao compilada: $n" "Extension built: $n"
+  done
+  # O Duck procura <prefixo>/share/duck/extensions ao lado do ~/.local/bin.
+  mkdir -p "$HOME/.local/share/duck"
+  ln -sfn "$root/extensions" "$HOME/.local/share/duck/extensions"
+  say "Ative as extensoes no Duck: Ctrl+Shift+P > Extensoes." "Enable extensions in Duck: Ctrl+Shift+P > Extensions."
 fi
 
 say "Pronto. Abra pelo menu de aplicativos (Duck) ou rode: duck" "Done. Open Duck from your app menu or run: duck"

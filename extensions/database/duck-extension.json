@@ -1,0 +1,27 @@
+{
+  "name": "database",
+  "short": "Banco",
+  "title": "Banco de dados",
+  "icon": "list",
+  "version": "0.1.0",
+  "description": "Consultas salvas em Postgres e Redis, com resultado em tabela e modo somente leitura",
+  "category": "Dev",
+  "command": ["node", "dist/index.js"],
+  "settings": [
+    { "key": "allow_write", "title": "Permitir escrita (desligado = somente leitura)", "type": "bool", "default": false }
+  ],
+  "accounts": {
+    "key": "accounts",
+    "title": "Conexões",
+    "fields": [
+      { "key": "name", "title": "Nome curto (ex.: local)" },
+      { "key": "kind", "title": "Tipo (postgres ou redis)", "default": "postgres" },
+      { "key": "host", "title": "Servidor", "default": "localhost" },
+      { "key": "port", "title": "Porta (vazio = 5432 no postgres, 6379 no redis)" },
+      { "key": "database", "title": "Banco (só postgres)" },
+      { "key": "user", "title": "Usuário (só postgres)" }
+    ],
+    "secret": "database/{name}",
+    "secret_title": "Senha (pode ficar vazia)"
+  }
+}

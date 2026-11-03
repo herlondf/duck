@@ -102,6 +102,52 @@ Clique em CPU/RAM na barra de título para abrir o painel do sistema (uso por
 núcleo, memória, processos que mais gastam). Tudo se configura em
 `~/.duck.lua`; veja o [duck.example.lua](duck.example.lua).
 
+## Extensões
+
+Extensões são programas à parte (SDK oficial em TypeScript) que mandam dados
+para o Duck, e o Duck desenha tudo: painel lateral, detalhe flutuante, item na
+barra, comandos na paleta e avisos. Uma extensão que cai não derruba o
+terminal, e uma extensão desligada não gasta memória.
+
+### As que vêm junto
+
+| Área | Extensões |
+|---|---|
+| Código | **GitHub** (notificações, revisões pedidas, PRs, issues; todas as contas do `gh auth login`), **Azure DevOps** (PRs e builds), **Git** (branch, mudanças, worktrees e stashes do pane ativo) |
+| Tarefas e erros | **Jira** (Server/DC e Cloud), **Rollbar** (erros ativos, resolver, silenciar), **Grafana** (consultas LogQL no Loki, aviso quando a contagem sobe) |
+| Infraestrutura | **Containers** (Docker e Podman, também dentro do WSL), **Banco de dados** (consultas salvas em Postgres e Redis, só leitura por padrão), **Portas** (portas TCP abertas e o processo de cada uma) |
+| Dia a dia | **Agenda** (Google/Outlook por URL iCal, lembretes e botão Entrar), **Notas** (por projeto e geral), **Snippets** (trechos de comando e histórico do que foi copiado), **Uso do Claude** (limites de 5h/7d e custo por perfil do Claude Code) |
+| Outras | **Google Play** (releases e avaliações, com resposta), **Home Assistant** (luzes, interruptores, cortinas, avisos) |
+
+Compile com `install.ps1 -Extensions` (ou `./install.sh --extensions`). Elas
+começam desligadas; ligue em `Ctrl+Shift+P` → "Extensões", onde também ficam
+as configurações e as contas de cada uma.
+
+### Contas e segredos
+
+Token nunca vai para arquivo de config. O menu de Extensões pede o token, ou
+você grava na mão:
+
+```sh
+echo <token> | duck secret set rollbar/<conta>
+duck secret has rollbar/<conta>
+```
+
+No Windows ficam no Gerenciador de Credenciais (`duck:<nome>`, por usuário); no
+Linux/macOS em `~/.duck/secrets`, com permissão 600. A do GitHub não precisa de
+segredo: ela lê as contas do `gh`.
+
+### Criar a sua
+
+Ponha uma pasta com o manifesto `duck-extension.json` em
+`~/.duck/extensions/<nome>` (pessoal) ou em `<duck>/extensions/<nome>`
+(compartilhada por todos os usuários da máquina; a pessoal com o mesmo nome
+ganha). Qualquer linguagem serve: o Duck roda o `command` do manifesto e
+conversa por linhas JSON no stdin/stdout. O manifesto pode declarar
+configurações, contas e segredos, e o menu de Extensões monta os formulários a
+partir dele. Veja o [docs/EXTENSIONS.md](docs/EXTENSIONS.md) (em inglês); a
+extensão do GitHub é a implementação de referência.
+
 ## Comparativo
 
 Um retrato do que cada ferramenta faz de fábrica (plugins e scripts externos
@@ -120,7 +166,7 @@ podem acrescentar mais). ✅ sim · 🟡 em parte · ❌ não
 | Aprovar pedidos do agente de outra aba | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Blocos de comando (exit code, duração) | ✅ | 🟡 | 🟡 | ❌ | 🟡 | ❌ | ✅ | ✅ | ❌ | ❌ |
 | Config programável | Lua | Lua | JSON | texto | texto/Python | TOML | ❌ | JSON | texto | KDL |
-| Plugins | Lua, WASM | Lua | ❌ | ❌ | Python | ❌ | ❌ | widgets | shell | WASM |
+| Plugins | Lua, WASM, extensões (qualquer linguagem) | Lua | ❌ | ❌ | Python | ❌ | ❌ | widgets | shell | WASM |
 | API/CLI para agentes controlarem panes | ✅ (CLI + MCP) | ✅ (CLI) | 🟡 | ❌ | ✅ | ❌ | ❌ | 🟡 | ✅ | ✅ |
 | Chat de IA embutido | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
 | Código aberto | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |

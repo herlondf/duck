@@ -1,0 +1,13 @@
+{
+  "name": "ports",
+  "title": "Portas",
+  "icon": "",
+  "version": "0.1.0",
+  "description": "Portas TCP abertas (escutando) e o processo de cada uma: abrir no navegador, copiar o endereço, encerrar",
+  "category": "Dev",
+  "command": ["node", "dist/index.js"],
+  "settings": [
+    { "key": "poll_seconds", "title": "Atualizar a cada (s)", "type": "number", "default": 30 },
+    { "key": "ignore", "title": "Ignorar processos (separados por vírgula)", "type": "list" }
+  ]
+}

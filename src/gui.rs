@@ -24,6 +24,7 @@ use crate::config::{self, Config, Rgb, Theme};
 use crate::proto::Conn;
 use crate::render::{lin, Layer, Quad, Renderer, TextItem};
 
+mod ext;
 mod ui;
 use ui::{Ac, AgentPanel, Card, Composer, Hit};
 
@@ -214,6 +215,8 @@ enum OverlayKind {
     Preview { file: String, line: i64, col: i64, first: i64, lines: Vec<String> },
     /// Ajuste ao vivo (setas), Enter grava na config.
     Slider { key: String, label: String, val: f32, orig: f32, min: f32, max: f32, step: f32 },
+    /// Detalhe vindo de uma extensao (issue, PR...): texto rolavel e botoes.
+    Detail { ext: String, subtitle: String, lines: Vec<String>, actions: Vec<(String, String, String)>, scroll: usize },
 }
 
 struct Overlay {
@@ -233,17 +236,27 @@ struct Overlay {
     palette: bool,
     /// Galeria de temas: tema antes da previa (Esc volta).
     gallery: Option<Theme>,
+    /// Campo de token: mostra bolinhas no lugar do texto.
+    secret: bool,
 }
 
 /// Fuzzy por subsequencia: todos os chars na ordem; consecutivos e inicio de
 /// palavra pontuam mais. None = nao casa.
+/// Minusculo e sem acento: "Extensões" casa com "extensoes" e vice-versa.
+fn fold(c: char) -> char {
+    match c {
+        'á' | 'à' | 'â' | 'ã' | 'ä' => 'a', 'é' | 'è' | 'ê' | 'ë' => 'e', 'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o', 'ú' | 'ù' | 'û' | 'ü' => 'u', 'ç' => 'c', c => c,
+    }
+}
+
 fn fuzzy(q: &str, s: &str) -> Option<i32> {
     if q.is_empty() { return Some(0); }
-    let s: Vec<char> = s.to_lowercase().chars().collect();
+    let s: Vec<char> = s.to_lowercase().chars().map(fold).collect();
     let mut score = 0;
     let mut last: Option<usize> = None;
     let mut i = 0;
-    for qc in q.to_lowercase().chars() {
+    for qc in q.to_lowercase().chars().map(fold) {
         if qc == ' ' { continue; }
         while i < s.len() && s[i] != qc { i += 1; }
         if i == s.len() { return None; }
@@ -259,13 +272,13 @@ fn fuzzy(q: &str, s: &str) -> Option<i32> {
 impl Overlay {
     fn list(title: &str, items: Vec<Item>) -> Overlay {
         let mut o = Overlay { title: title.into(), input: String::new(), items, shown: vec![], sel: 0, kind: OverlayKind::List, agents: false,
-            dialog: false, home: false, palette: false, gallery: None };
+            dialog: false, home: false, palette: false, gallery: None, secret: false };
         o.filter();
         o
     }
     fn prompt(title: &str, initial: &str, action: &str, args: Vec<Value>) -> Overlay {
         Overlay { title: title.into(), input: initial.into(), items: vec![], shown: vec![], sel: 0, kind: OverlayKind::Prompt(action.into(), args), agents: false,
-            dialog: false, home: false, palette: false, gallery: None }
+            dialog: false, home: false, palette: false, gallery: None, secret: false }
     }
     fn dialog(title: &str, items: Vec<Item>) -> Overlay {
         let mut o = Overlay::list(title, items);
@@ -287,7 +300,7 @@ const DANGEROUS: &str = r"(?i)(\bsudo\b|\brm\s+-[a-z]*[rf]|\b(curl|wget|iwr|irm|
 // ------------------------------------------------------------------ app
 
 #[derive(Debug)]
-pub enum UserEv { Frame, Reload, Tick, Quick, Connected }
+pub enum UserEv { Frame, Reload, Tick, Quick, Connected, Ext }
 
 #[derive(Clone, Copy, PartialEq)]
 struct Cell { col: i32, row: i32 }
@@ -388,6 +401,12 @@ pub struct Gui {
     tab_hover: Option<(usize, Instant)>,
     tab_preview: Option<(usize, Vec<String>)>,
     tab_drag: Option<(usize, f32, bool)>,
+    /// Arrastando um badge de extensao: (nome, x inicial, ja moveu).
+    badge_drag: Option<(String, f32, bool)>,
+    /// Badges do ultimo quadro: (x0, x1, nome, acao do clique).
+    badge_rects: Vec<(f32, f32, String, Action)>,
+    /// Ordem dos badges (config ext_order).
+    ext_order: Vec<String>,
     div_drag: Option<(u64, bool, f32)>,
     title_click: Instant,
     resize_edge: Option<winit::window::ResizeDirection>,
@@ -410,6 +429,17 @@ pub struct Gui {
     splash: Option<Instant>,
     /// Painel lateral do sistema (clique em CPU/RAM na barra).
     sys_panel: bool,
+    /// Extensoes (src/gui/ext.rs): processos, visoes, status.
+    exts: ext::Exts,
+    /// Visao de extensao aberta na lateral ("extensao/visao"), rolagem e altura do conteudo.
+    ext_panel: Option<String>,
+    /// Largura do painel lateral das extensoes (arrastavel; config ext_panel_width).
+    ext_w: f32,
+    ext_drag: bool,
+    ext_scroll: f32,
+    ext_content: f32,
+    /// Ultimo contexto (pane ativo) mandado as extensoes.
+    ext_context: Option<Value>,
 }
 
 struct Grid { panes: Vec<(u64, String, String)>, sel: usize, texts: HashMap<u64, String>, fetched: Instant }
@@ -433,9 +463,9 @@ impl Gui {
             hits: vec![], tab_rects: vec![], tab_row: (0.0, 0.0), sidebar_collapsed: false, focus_mode: false, agent_panel: None,
             cards: vec![], card_seq: 0, rect_anim: HashMap::new(), prev_rects: HashMap::new(), ghosts: vec![], anim_tab_key: String::new(),
             ws_anim: None, cursor_anim: None, cursor_shown: [0.0, 0.0], last_key: Instant::now(), tab_hover: None, tab_preview: None,
-            tab_drag: None, div_drag: None, title_click: Instant::now() - Duration::from_secs(5), resize_edge: None,
+            tab_drag: None, badge_drag: None, badge_rects: vec![], ext_order: vec![], div_drag: None, title_click: Instant::now() - Duration::from_secs(5), resize_edge: None,
             collapsed: HashMap::new(), pinned: HashMap::new(), search_hits: None, composer: None, ac: None, ac_dismissed: String::new(),
-            usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), splash: None, sys_panel: false,
+            usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
         };
         g.load_config();
         g
@@ -517,6 +547,8 @@ impl Gui {
         self.hyperlinks = self.cfg.hyperlinks.iter().filter_map(|(r, f)| regex::Regex::new(r).ok().map(|r| (r, f.clone()))).collect();
         self.install_runtime(&lua);
         self.lua = lua;
+        if let Ok(w) = t.get::<f32>("ext_panel_width") { self.ext_w = w.clamp(260.0, 1400.0); }
+        self.ext_order = t.get::<Vec<String>>("ext_order").unwrap_or_default();
         self.cfg_table = Some(t);
         let bg = self.cfg.background.clone();
         let shader = self.cfg.shader.clone();
@@ -1097,6 +1129,7 @@ impl Gui {
             b("Editor de comando (varias linhas, Ctrl+Z)", "composer", vec![]),
             b("Galeria de temas (previa ao vivo)", "theme_gallery", vec![]),
             b("Tema a partir do papel de parede", "wallpaper_theme", vec![]),
+            b("Extensões: ativar, configurar, contas e tokens", "extensions", vec![]),
         ];
         defs.extend([
             b("Agentes: corrigir com agente o ultimo comando que falhou", "fix_with_agent", vec![]),
@@ -1125,6 +1158,7 @@ impl Gui {
         }).collect();
         items.extend(self.palette_extra.iter().cloned());
         self.palette_more(&mut items);
+        self.ext_palette(&mut items);
         let mut o = Overlay::list("Paleta: comandos, abas, sessoes, historico e arquivos", items);
         o.palette = true;
         self.overlay = Some(o);
@@ -1589,7 +1623,8 @@ impl Gui {
 
     fn copy_selection(&mut self) {
         if let Some(t) = self.selection_text().filter(|t| !t.trim().is_empty()) {
-            if let Ok(mut c) = arboard::Clipboard::new() { let _ = c.set_text(t); }
+            if let Ok(mut c) = arboard::Clipboard::new() { let _ = c.set_text(t.clone()); }
+            self.ext_clipboard(&t);
             self.flash("Copiado");
         }
     }
@@ -1850,6 +1885,7 @@ impl Gui {
             self.frame = f;
             self.compute_ghost();
             self.compute_ac();
+            self.ext_context_tick();
         }
         if self.grid.is_some() { self.refresh_grid(); }
         if self.agent_panel.is_some() { self.refresh_agent_panel(false); }
@@ -1894,13 +1930,13 @@ impl Gui {
                     let acts: Vec<(String, String)> = if ev["state"] == "blocked" {
                         vec![("Aprovar".into(), format!("duck://approve/{pane}")), ("Negar".into(), format!("duck://deny/{pane}")), ("Abrir".into(), format!("duck://focus/{pane}"))]
                     } else { vec![("Abrir".into(), format!("duck://focus/{pane}"))] };
-                    toast_actions(&format!("Agente {state}"), &format!("{what} · pane {pane}"), &acts);
+                    toast_actions(&format!("Agente {state}"), &format!("{what} · {}", self.pane_place(pane)), &acts);
                     if let Some(r) = &self.r { r.window.request_user_attention(Some(UserAttentionType::Informational)); }
                 }
                 "budget" => toast("Orcamento de tokens", &format!("Os agentes ja gastaram {} tokens nesta rodada", ev["tokens"])),
                 "command-finished" => {
                     let secs = ev["duration_ms"].as_u64().unwrap_or(0) / 1000;
-                    toast("Comando terminou", &format!("{what} · {secs}s · pane {pane}"));
+                    toast("Comando terminou", &format!("{what} · {secs}s · {}", self.pane_place(pane)));
                 }
                 _ => {}
             }
@@ -1953,6 +1989,25 @@ impl Gui {
             Ok(_) => vec![],
             Err(e) => vec![(format!(" status: {e} "), theme.blocked)],
         }
+    }
+
+    /// "Aba X" (e o workspace, se for outro) do pane: os avisos dizem onde, nao "pane 10".
+    pub(super) fn pane_place(&self, pane: u64) -> String {
+        let Ok(r) = self.call(json!({"cmd": "list"})) else { return format!("pane {pane}") };
+        for w in r["workspaces"].as_array().into_iter().flatten() {
+            for t in w["tabs"].as_array().into_iter().flatten() {
+                let ps = t["panes"].as_array().cloned().unwrap_or_default();
+                let Some(p) = ps.iter().find(|p| p["id"] == pane) else { continue };
+                let s = |v: &Value| v.as_str().unwrap_or("").trim().to_string();
+                let mut name = s(&t["title"]);
+                if name.is_empty() { name = s(&p["title"]).trim_start_matches(|c: char| !c.is_alphanumeric()).to_string(); }
+                if name.is_empty() { name = s(&p["cwd"]).rsplit(['/', '\\']).find(|x| !x.is_empty()).unwrap_or("").to_string(); }
+                let name: String = name.chars().take(40).collect();
+                let ws = s(&w["name"]);
+                return if ws != self.frame.workspace { format!("aba {name} ({ws})") } else { format!("aba {name}") };
+            }
+        }
+        format!("pane {pane}")
     }
 
     fn tab_label(&self, t: &TabInfo, branch: &str) -> String {
@@ -2057,7 +2112,17 @@ fn read_head(path: &str, max: usize) -> String {
 /// Grava `chave = valor` (Lua) num bloco gerenciado do ~/.duck-local.lua; o
 /// hot reload aplica. Chave com ponto vira campo aninhado (font.size).
 fn set_local_setting(key: &str, value: &str) -> Result<(), String> {
-    if !key.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') { return Err(format!("chave invalida: {key}")); }
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')) {
+        return Err(format!("chave invalida: {key}"));
+    }
+    // Nome com hifen (claude-usage) nao e identificador Lua: vira ["claude-usage"].
+    let lua_path = |ps: &[&str]| -> String {
+        ps.iter().fold("config".to_string(), |acc, p| {
+            let ident = p.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && p.chars().all(|c| c.is_alphanumeric() || c == '_');
+            if ident { format!("{acc}.{p}") } else { format!("{acc}[\"{p}\"]") }
+        })
+    };
     let path = config::local_path();
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let (begin, end) = ("-- duck:configuracoes (gerado pela tela de configuracoes)", "-- duck:fim");
@@ -2065,14 +2130,22 @@ fn set_local_setting(key: &str, value: &str) -> Result<(), String> {
         (Some(a), Some(b)) if b > a => (text[..a].to_string(), text[a + begin.len()..b].to_string(), text[b + end.len()..].to_string()),
         _ => (text.clone(), String::new(), String::new()),
     };
-    let line_key = format!("config.{key} =");
+    let full = lua_path(&parts);
+    let line_key = format!("{full} =");
     block = block.lines().filter(|l| !l.trim_start().starts_with(&line_key) && !l.trim().is_empty()).map(|l| format!("{l}\n")).collect();
-    // Garante a tabela pai (config.font, config.background).
-    if let Some((parent, _)) = key.rsplit_once('.') {
-        let guard = format!("config.{parent} = config.{parent} or {{}}");
-        if !block.contains(&guard) { block = format!("{guard}\n{block}"); }
+    // Garante as tabelas pai, em todos os niveis (config.extensions.jira...).
+    // As guardas ficam no topo, a mais curta primeiro: o pai vem antes do filho.
+    let is_guard = |l: &str| l.split_once(" = ").is_some_and(|(a, b)| b == format!("{a} or {{}}"));
+    let mut guards: Vec<String> = block.lines().filter(|l| is_guard(l)).map(str::to_string).collect();
+    let rest: String = block.lines().filter(|l| !is_guard(l)).map(|l| format!("{l}\n")).collect();
+    for k in 1..parts.len() {
+        let parent = lua_path(&parts[..k]);
+        let guard = format!("{parent} = {parent} or {{}}");
+        if !guards.contains(&guard) { guards.push(guard); }
     }
-    block.push_str(&format!("config.{key} = {value}\n"));
+    guards.sort_by_key(|g| g.len());
+    block = guards.iter().map(|g| format!("{g}\n")).collect::<String>() + &rest;
+    block.push_str(&format!("{full} = {value}\n"));
     let out = format!("{}{begin}\n{block}{end}{}", head.trim_end().to_string() + if head.trim().is_empty() { "" } else { "\n\n" }, tail);
     std::fs::write(&path, out).map_err(|e| e.to_string())
 }
@@ -2126,8 +2199,13 @@ fn with_conn<T>(conn: &Arc<Mutex<Option<Conn>>>, f: impl Fn(&mut Conn) -> Result
 }
 
 fn open_url(url: &str) {
+    // ShellExecute direto: o explorer.exe com URL longa (aspas, |, =) desiste e abre Documentos.
     #[cfg(windows)]
-    let _ = std::process::Command::new("explorer.exe").arg(url).spawn();
+    unsafe {
+        let w = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let (op, u) = (w("open"), w(url));
+        windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), u.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
+    }
     #[cfg(not(windows))]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
@@ -2367,6 +2445,7 @@ impl ApplicationHandler<UserEv> for Gui {
         self.r = Some(r);
         self.load_config();
         ui::register_protocol();
+        self.start_extensions();
         self.connect();
         self.send_size();
         self.cmd(json!({"cmd": "window-focus", "focused": true}));
@@ -2490,6 +2569,7 @@ impl Gui {
             }
             UserEv::Quick => self.toggle_quick(),
             UserEv::Connected => { self.send_size(); self.cmd(json!({"cmd": "window-focus", "focused": self.focused})); }
+            UserEv::Ext => self.ext_poll(),
         }
     }
 
@@ -2552,6 +2632,12 @@ impl Gui {
 }
 
 pub fn run(startup: Vec<Value>, quick: bool) {
+    // Queda da janela fica registrada no gui.log (a janela nao tem console).
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        gui_log(&format!("PANIC: {info} | {}", std::backtrace::Backtrace::force_capture().to_string().lines().filter(|l| l.contains("duck")).take(8).collect::<Vec<_>>().join(" / ")));
+        prev(info);
+    }));
     let el = EventLoop::<UserEv>::with_user_event().build().expect("event loop");
     let mut app = Gui::new(el.create_proxy(), startup, quick);
     el.run_app(&mut app).expect("event loop");
@@ -2560,6 +2646,12 @@ pub fn run(startup: Vec<Value>, quick: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzzy_ignora_acento() {
+        assert!(fuzzy("extensões", "Extensoes: ativar").is_some());
+        assert!(fuzzy("extensoes", "Extensões: ativar").is_some());
+    }
 
     #[test]
     fn fuzzy_ranks() {

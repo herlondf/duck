@@ -1,0 +1,10 @@
+{
+  "name": "git",
+  "title": "Git",
+  "icon": "branch",
+  "version": "0.1.0",
+  "description": "Repositório do pane ativo: branch, mudanças, branches, worktrees e stashes (Windows e WSL)",
+  "category": "Dev",
+  "command": ["node", "dist/index.js"],
+  "permissions": ["context"]
+}

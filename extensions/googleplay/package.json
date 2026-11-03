@@ -1,0 +1,9 @@
+{
+  "name": "duck-extension-googleplay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Google Play extension for the Duck terminal",
+  "license": "MIT",
+  "scripts": { "build": "tsc -p .", "test": "node dist/jwt.check.js" },
+  "devDependencies": { "typescript": "^5.6.0", "@types/node": "^22.0.0" }
+}

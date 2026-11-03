@@ -1,0 +1,9 @@
+{
+  "name": "azure",
+  "short": "Azure",
+  "title": "Azure DevOps",
+  "icon": "azure",
+  "version": "0.1.0",
+  "description": "PRs para revisar, meus PRs e builds do Azure DevOps",
+  "command": ["node", "dist/index.js"]
+}

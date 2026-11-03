@@ -533,10 +533,54 @@ pub fn transcript_plan(path: &str) -> Vec<(String, String)> {
     if tasks.is_empty() { todo } else { tasks.into_iter().map(|t| (t.1, t.2)).collect() }
 }
 
+/// `duck secret set <nome>` (valor pelo stdin, nunca na linha de comando),
+/// `duck secret has <nome>`, `duck secret delete <nome>`.
+pub fn secret(args: &[String]) -> i32 {
+    let (Some(op), Some(name)) = (args.first(), args.get(1)) else {
+        eprintln!("uso: duck secret set|has|delete <nome>   (set le o valor do stdin)");
+        return 2;
+    };
+    match op.as_str() {
+        "set" => {
+            let mut v = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut v);
+            let v = v.trim_end_matches(['\r', '\n']).to_string();
+            if v.is_empty() { eprintln!("valor vazio no stdin"); return 1; }
+            match crate::secret::set(name, &v) {
+                Ok(_) => { println!("gravado: {}", crate::secret::target(name)); 0 }
+                Err(e) => { eprintln!("{e}"); 1 }
+            }
+        }
+        "has" => { let ok = crate::secret::get(name).is_some(); println!("{}", if ok { "sim" } else { "nao" }); if ok { 0 } else { 1 } }
+        "delete" => if crate::secret::delete(name) { println!("apagado"); 0 } else { eprintln!("nao existe"); 1 },
+        _ => { eprintln!("uso: duck secret set|has|delete <nome>"); 2 }
+    }
+}
+
 /// `duck url duck://approve/12`: botoes dos toasts do Windows (protocolo duck:).
 pub fn url(args: &[String]) -> i32 {
     let u = args.first().map(|s| s.trim_end_matches('/').to_string()).unwrap_or_default();
     let rest = u.trim_start_matches("duck://").trim_start_matches("duck:").trim_start_matches("lasso://").trim_start_matches("lasso:");
+    // Botao de toast de extensao: duck://ext/<extensao>/<acao>/<item>
+    if let Some(e) = rest.strip_prefix("ext/") {
+        let mut it = e.splitn(3, '/');
+        let dec = |s: &str| {
+            let b = s.as_bytes();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'%' && i + 2 < b.len() + 0 && i + 2 <= b.len() - 1 { if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) { out.push(v); i += 3; continue; } }
+                out.push(b[i]);
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).to_string()
+        };
+        let (ext, act, item) = (it.next().unwrap_or(""), dec(it.next().unwrap_or("")), dec(it.next().unwrap_or("")));
+        let Ok(mut c) = Conn::connect() else { return 1 };
+        let _ = c.call(json!({"cmd": "gui-action", "name": "ext_action", "args": [ext, act, item]}));
+        let _ = c.call(json!({"cmd": "raise", "pane": 0}));
+        return 0;
+    }
     let (what, id) = rest.split_once('/').unwrap_or((rest, "0"));
     let Ok(pane) = id.parse::<u64>() else { return 2 };
     let Ok(mut c) = Conn::connect() else { return 1 };

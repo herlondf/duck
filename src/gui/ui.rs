@@ -39,11 +39,11 @@ const DUCK_ART: &str = include_str!("../../assets/duck.txt");
 
 fn ease(t: f32) -> f32 { let t = t.clamp(0.0, 1.0); 1.0 - (1.0 - t).powi(3) }
 fn lerp4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] { [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t] }
-fn inside(r: [f32; 4], p: (f32, f32)) -> bool { p.0 >= r[0] && p.0 < r[0] + r[2] && p.1 >= r[1] && p.1 < r[1] + r[3] }
-fn uit(x: f32, y: f32, text: &str, color: Rgb, size: f32) -> TextItem {
+pub(super) fn inside(r: [f32; 4], p: (f32, f32)) -> bool { p.0 >= r[0] && p.0 < r[0] + r[2] && p.1 >= r[1] && p.1 < r[1] + r[3] }
+pub(super) fn uit(x: f32, y: f32, text: &str, color: Rgb, size: f32) -> TextItem {
     TextItem { x, y, text: text.into(), color, alpha: 1.0, bold: false, italic: false, clip_right: None, ui: true, size }
 }
-fn mt(x: f32, y: f32, text: &str, color: Rgb) -> TextItem {
+pub(super) fn mt(x: f32, y: f32, text: &str, color: Rgb) -> TextItem {
     TextItem { x, y, text: text.into(), color, alpha: 1.0, bold: false, italic: false, clip_right: None, ui: false, size: 1.0 }
 }
 fn shift(l: &mut Layer, from: (usize, usize, usize), dx: f32) {
@@ -153,7 +153,7 @@ impl Gui {
             top: if tb == "top" || self.custom_titlebar() { bar_h } else { 0.0 },
             bottom: if tb == "bottom" { bar_h } else { 0.0 },
             left: if tb == "left" { if self.sidebar_collapsed { 52.0 } else { self.cfg.ui.sidebar_width } } else { 0.0 },
-            right: if self.agent_panel.is_some() || self.sys_panel { 340.0 } else { 0.0 },
+            right: if self.ext_panel.is_some() || self.agent_panel.is_some() || self.sys_panel { self.ext_w } else { 0.0 },
             bar_h, margin,
         }
     }
@@ -161,6 +161,13 @@ impl Gui {
     pub(super) fn grid_origin(&self) -> (f32, f32) {
         let c = self.chrome();
         (c.left + c.margin, c.top + c.margin)
+    }
+
+    /// Mouse na borda esquerda do painel das extensoes (arrasta para redimensionar).
+    fn ext_panel_edge(&self, x: f32, y: f32) -> bool {
+        let Some(r) = &self.r else { return false };
+        let c = self.chrome();
+        (self.ext_panel.is_some() || self.agent_panel.is_some() || self.sys_panel) && self.overlay.is_none() && y > c.top && y < r.height() - c.bottom && (x - (r.width() - c.right)).abs() <= 5.0
     }
 
     pub(super) fn send_size(&mut self) {
@@ -234,6 +241,43 @@ impl Gui {
         let wsl: HashSet<String> = self.cfg.domains.iter().filter(|d| d.cmd.first().is_some_and(|c| c.to_lowercase().contains("wsl"))).map(|d| d.name.clone()).collect();
         let ghost = self.ghost.clone();
         let st = if self.sys_panel { Some(self.stats.lock().unwrap().clone()) } else { None };
+        let ext_view = self.ext_panel.as_ref().and_then(|k| self.exts.view(k).cloned());
+        // Um badge por extensao: icone + nome curto + contadores (status) dela.
+        // A chave "duck:<acao>" e de extensao interna: o clique roda a acao.
+        let mut ext_badges: Vec<(String, String, String, Vec<(String, String)>)> = Vec::new();
+        let ext_cfg = self.ext_settings();
+        let builtin_on = |n: &str| ext_cfg[n]["enabled"].as_bool().unwrap_or(true);
+        if builtin_on("system") {
+            let st = self.stats.lock().unwrap();
+            let chips = vec![(format!("CPU {}%", st.cpu.round()), if st.cpu >= 85.0 { "blocked".into() } else { String::new() }),
+                             (format!("RAM {:.1}/{:.0}G", st.ram, st.ram_total), if st.ram_total > 0.0 && st.ram / st.ram_total >= 0.9 { "blocked".into() } else { String::new() })];
+            ext_badges.push(("duck:sys_panel".into(), "\u{f4bc}".into(), "Sistema".into(), chips));
+        }
+        if builtin_on("agents") {
+            let g = |k: &str| self.frame.agents.get(k).copied().unwrap_or(0);
+            let chips: Vec<(String, String)> = [("blocked", "bloqueado"), ("working", "trabalhando"), ("done", "pronto")].iter()
+                .filter(|(k, _)| g(k) > 0).map(|(k, t)| (format!("{} {t}", g(k)), k.to_string())).collect();
+            ext_badges.push(("duck:agent_panel".into(), "\u{f06a9}".into(), "Agentes".into(), chips));
+        }
+        for v in &self.exts.views {
+            if ext_badges.iter().any(|b| b.0.starts_with(&format!("{}/", v.ext))) { continue; }
+            let label = self.exts.label(&v.ext);
+            let sts: Vec<&super::ext::ExtStatus> = self.exts.status.iter().filter(|s| s.ext == v.ext).collect();
+            // O status abre a visao dele; sem status, a 1a visao.
+            let key = sts.first().filter(|s| !s.view.is_empty()).map(|s| format!("{}/{}", s.ext, s.view)).unwrap_or_else(|| v.key());
+            // Tira o glifo do inicio ("⌂ 57" -> "57"): o icone ja esta no badge.
+            let chips = sts.iter().map(|s| {
+                let t = s.text.trim();
+                let t = match t.split_once(' ') { Some((a, rest)) if !a.chars().any(|c| c.is_alphanumeric()) => rest.trim(), _ => t };
+                (t.to_string(), s.color.clone())
+            }).filter(|c| !c.0.is_empty() && c.0 != "0").collect();
+            ext_badges.push((key, v.icon.clone(), label, chips));
+        }
+        let rank = |k: &str| self.ext_order.iter().position(|n| n == badge_name(k)).unwrap_or(usize::MAX);
+        ext_badges.sort_by_key(|b| rank(&b.0)); // estavel: as sem posicao mantem a ordem
+        let ext_siblings: Vec<(String, String)> = ext_view.as_ref().map(|cv| self.exts.views.iter().filter(|v| v.ext == cv.ext).map(|v| (v.key(), v.title.clone())).collect()).unwrap_or_default();
+        let ext_open = self.ext_panel.clone();
+        let (sys_open, agent_open) = (self.sys_panel, self.agent_panel.is_some());
         let chrome = self.chrome();
         let (ox, oy) = self.grid_origin();
         self.origin = (ox, oy);
@@ -716,6 +760,15 @@ impl Gui {
         if chrome.top > 0.0 {
             base.shapes.push(Shape::rect(0.0, 0.0, w, chrome.top, lin(theme.tab_bar, alpha), 0.0));
             let mut x = 8.0;
+            {
+                let bw = 30.0;
+                let br = [x, 7.0, bw, bar_h - 14.0];
+                let hv = inside(br, mouse);
+                if hv { base.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(mix(theme.tab_bar, theme.fg, 0.12), 1.0), 6.0)); }
+                base.texts.push(TextItem { size: 0.9, ..txt(x + (bw - cw * 0.9) / 2.0, (bar_h - ch * 0.9) / 2.0, "\u{f015}", if hv { theme.fg } else { theme.muted }) });
+                self.hits.push(Hit { r: br, action: Action::Builtin("home".into(), vec![]) });
+                x += bw + 4.0;
+            }
             // Chip do workspace (troca de workspace).
             let wsz = 0.85;
             let ww = r.measure(&ws_name, true, wsz) + 34.0;
@@ -739,15 +792,52 @@ impl Gui {
                     self.hits.push(Hit { r: br, action: Action::Builtin(act.into(), vec![]) });
                 }
             }
-            // Atalhos de UI: inicio e painel do agente.
-            for (icon, act) in [("\u{f015}", "home"), ("\u{f06a9}", "agent_panel")] {
-                let bw = 30.0;
-                rx -= bw + 2.0;
-                let br = [rx, 7.0, bw, bar_h - 14.0];
+            // Extensoes: um badge por extensao (icone, nome e contadores).
+            // Sem espaco (janela estreita): so icone + contador; o nome fica para quando couber.
+            let (ls, cs) = (0.78, 0.74);
+            let width = |r: &mut Renderer, label: &str, chips: &[(String, String)], named: bool| 8.0 + cw * 0.9 + 5.0
+                + if named { r.measure(label, true, ls) } else { 0.0 } + chips.iter().map(|c| r.measure(&c.0, true, cs) + 14.0).sum::<f32>() + 8.0 + 4.0;
+            let full: f32 = ext_badges.iter().map(|b| width(r, &b.2, &b.3, true)).sum();
+            let named = full <= (rx - x - 360.0).max(0.0);
+            self.badge_rects.clear();
+            let dragging = self.badge_drag.as_ref().filter(|d| d.2).map(|d| d.0.clone());
+            for (key, icon, label, chips) in ext_badges.iter().rev() {
+                let chip_w: Vec<f32> = chips.iter().map(|c| r.measure(&c.0, true, cs) + 10.0).collect();
+                let label = if named { label.as_str() } else { "" };
+                let bw = width(r, label, chips, named) - 4.0;
+                rx -= bw + 4.0;
+                let br = [rx, 8.0, bw, bar_h - 16.0];
+                let open = match key.strip_prefix("duck:") {
+                    Some("sys_panel") => sys_open,
+                    Some(_) => agent_open,
+                    None => ext_open.as_deref().is_some_and(|k| k.split('/').next() == key.split('/').next()),
+                };
                 let hv = inside(br, mouse);
-                if hv { base.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(mix(theme.tab_bar, theme.fg, 0.12), 1.0), 6.0)); }
-                base.texts.push(TextItem { size: 0.9, ..txt(rx + (bw - cw * 0.9) / 2.0, (bar_h - ch * 0.9) / 2.0, icon, if hv { theme.fg } else { theme.muted }) });
-                self.hits.push(Hit { r: br, action: Action::Builtin(act.into(), vec![]) });
+                base.shapes.push(Shape::rect(br[0], br[1], br[2], br[3],
+                    lin(if open { theme.accent } else { mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }) }, if open { 0.3 } else { 1.0 }), (bar_h - 16.0) / 2.0));
+                let mut bx = rx + 8.0;
+                base.texts.push(TextItem { size: 0.85, ..txt(bx, (bar_h - ch * 0.85) / 2.0, &super::ext::icon(icon), if open || hv { theme.fg } else { theme.muted }) });
+                bx += cw * 0.9 + 5.0;
+                if named {
+                    base.texts.push(uit(bx, (bar_h - ch * ls) / 2.0, label, if open || hv { theme.fg } else { theme.muted }, ls));
+                    bx += r.measure(label, true, ls) + 4.0;
+                }
+                for ((t, color), w) in chips.iter().zip(&chip_w) {
+                    let c = if color.is_empty() { theme.accent } else { theme.named(color) };
+                    let chh = ch * 0.95;
+                    base.shapes.push(Shape::rect(bx, (bar_h - chh) / 2.0, *w, chh, lin(c, 0.22), chh / 2.0));
+                    base.texts.push(uit(bx + 5.0, (bar_h - ch * cs) / 2.0, t, c, cs));
+                    bx += w + 4.0;
+                }
+                let action = match key.strip_prefix("duck:") {
+                    Some(a) => Action::Builtin(a.into(), vec![]),
+                    None => Action::Builtin("ext_view".into(), vec![json!(key)]),
+                };
+                if dragging.as_deref() == Some(badge_name(key)) {
+                    base.shapes.push(Shape::ring(br[0], br[1], br[2], br[3], lin(theme.accent, 1.0), (bar_h - 16.0) / 2.0, 1.5));
+                }
+                // O clique e tratado pelo arrasto (press + release): sem Hit aqui.
+                self.badge_rects.push((br[0], br[0] + br[2], badge_name(key).to_string(), action));
             }
             // Abas primeiro; o status fica com o que sobrar (cortado pela esquerda).
             let ssz = 0.85;
@@ -809,6 +899,14 @@ impl Gui {
                 for (k, l) in lines.iter().enumerate() {
                     modal.texts.push(TextItem { size: 0.75, clip_right: Some(px + pwid - 10.0), ..txt(px + 12.0, py + 26.0 + ch * 0.75 * k as f32, l, theme.fg) });
                 }
+            }
+        }
+        // Arrastando badge: marca onde ele vai cair.
+        if let Some((name, _, true)) = &self.badge_drag {
+            let from = self.badge_rects.iter().find(|b| &b.2 == name).map(|b| b.0);
+            if let (Some(fx), Some(t)) = (from, self.badge_rects.iter().find(|b| mouse.0 >= b.0 && mouse.0 < b.1 && &b.2 != name)) {
+                let bx = if t.0 > fx { t.1 + 1.0 } else { t.0 - 3.0 };
+                base.shapes.push(Shape::rect(bx, 8.0, 2.0, chrome.bar_h - 16.0, lin(theme.accent, 1.0), 1.0));
             }
         }
         // Arrastando aba: marca onde ela vai cair.
@@ -957,6 +1055,12 @@ impl Gui {
                 self.hits.push(Hit { r: br, action: Action::Builtin(act.into(), args) });
                 bx += bw + 6.0;
             }
+        }
+
+        // ---- painel de extensao (direita)
+        if let Some(v) = &ext_view {
+            let rect = [w - chrome.right, chrome.top, chrome.right, h - chrome.top - chrome.bottom];
+            self.ext_content = super::ext::draw_view(r, &mut base, &mut self.hits, v, rect, &theme, mouse, self.ext_scroll, &ext_siblings);
         }
 
         // ---- painel do sistema (direita)
@@ -1275,6 +1379,13 @@ impl Gui {
                     return;
                 }
             }
+            // Badge de extensao: clique abre; segurar e arrastar reordena.
+            if self.overlay.is_none() && button == MouseButton::Left && y < self.chrome().top {
+                if let Some(b) = self.badge_rects.iter().find(|b| x >= b.0 && x < b.1) {
+                    self.badge_drag = Some((b.2.clone(), x, false));
+                    return;
+                }
+            }
             // Botoes e alvos do ultimo quadro (o de cima primeiro).
             if let Some(a) = self.hits.iter().rev().find(|h| inside(h.r, (x, y))).map(|h| h.action.clone()) {
                 self.run(a);
@@ -1306,12 +1417,25 @@ impl Gui {
             }
         }
         if !pressed && button == MouseButton::Left {
+            if let Some((name, _, moved)) = self.badge_drag.take() {
+                if !moved {
+                    if let Some(a) = self.badge_rects.iter().find(|b| b.2 == name).map(|b| b.3.clone()) { self.run(a); }
+                } else { self.drop_badge(&name, x); }
+                self.redraw();
+                return;
+            }
             if let Some((idx, _, moved)) = self.tab_drag.take() {
                 if moved { self.drop_tab(idx, x, y); }
                 self.redraw();
                 return;
             }
             if self.div_drag.take().is_some() { self.redraw(); return; }
+            if std::mem::take(&mut self.ext_drag) {
+                let _ = set_local_setting("ext_panel_width", &format!("{}", self.ext_w.round()));
+                self.send_size();
+                self.redraw();
+                return;
+            }
         }
         // Barra de titulo vazia: arrasta a janela; duplo clique maximiza.
         let c = self.chrome();
@@ -1321,6 +1445,10 @@ impl Gui {
                 else { let _ = r.window.drag_window(); }
             }
             self.title_click = Instant::now();
+            return;
+        }
+        if pressed && button == MouseButton::Left && self.ext_panel_edge(x, y) {
+            self.ext_drag = true;
             return;
         }
         if pressed && button == MouseButton::Left {
@@ -1392,6 +1520,21 @@ impl Gui {
     }
 
     /// Soltou a aba: em outra posicao reordena; fora da janela vira janela nova.
+    /// Solta o badge: reordena e grava a ordem (ext_order no ~/.duck-local.lua).
+    fn drop_badge(&mut self, name: &str, x: f32) {
+        let mut rects = self.badge_rects.clone();
+        rects.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut order: Vec<String> = rects.iter().map(|b| b.2.clone()).collect();
+        let (Some(from), Some(to)) = (order.iter().position(|n| n == name), rects.iter().position(|b| x >= b.0 && x < b.1)) else { return };
+        if from == to { return; }
+        let n = order.remove(from);
+        order.insert(to, n);
+        // Extensoes sem badge agora (desativadas) mantem o lugar salvo no fim.
+        for o in &self.ext_order { if !order.contains(o) { order.push(o.clone()); } }
+        self.ext_order = order.clone();
+        if let Err(e) = set_local_setting("ext_order", &super::ext::lua_lit(&json!(order))) { self.flash(&e); }
+    }
+
     fn drop_tab(&mut self, idx: usize, x: f32, y: f32) {
         let Some(r) = &self.r else { return };
         let (w, h) = (r.width(), r.height());
@@ -1414,6 +1557,11 @@ impl Gui {
 
     pub(super) fn mouse_move(&mut self, x: f32, y: f32) {
         self.mouse = (x, y);
+        if let Some((name, x0, moved)) = self.badge_drag.clone() {
+            if !moved && (x - x0).abs() > 8.0 { self.badge_drag = Some((name, x0, true)); }
+            self.redraw();
+            return;
+        }
         if let Some((idx, x0, moved)) = self.tab_drag {
             if !moved && (x - x0).abs() > 8.0 { self.tab_drag = Some((idx, x0, true)); }
             self.redraw();
@@ -1421,6 +1569,12 @@ impl Gui {
         }
         let Some(r) = &self.r else { return };
         let (cw, ch, w, h) = (r.cell_w, r.cell_h, r.width(), r.height());
+        if self.ext_drag {
+            self.ext_w = (w - x).clamp(260.0, (w * 0.75).max(260.0));
+            self.send_size();
+            self.redraw();
+            return;
+        }
         if let Some((pane, vertical, last)) = self.div_drag {
             let cell = if vertical { cw } else { ch };
             let n = (((if vertical { x } else { y }) - last) / cell).trunc() as i64;
@@ -1449,12 +1603,13 @@ impl Gui {
         }
         let ctrl = self.mods.control_key();
         let c = self.chrome();
-        let over_hit = self.hits.iter().any(|hh| inside(hh.r, (x, y)));
+        let over_hit = self.hits.iter().any(|hh| inside(hh.r, (x, y))) || (y < c.top && self.badge_rects.iter().any(|b| x >= b.0 && x < b.1));
         let icon = match self.resize_edge {
             Some(ResizeDirection::West | ResizeDirection::East) => CursorIcon::EwResize,
             Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
             Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => CursorIcon::NwseResize,
             Some(_) => CursorIcon::NeswResize,
+            None if self.ext_drag || self.ext_panel_edge(x, y) => CursorIcon::ColResize,
             None => match self.divider_at(x, y) {
                 Some((_, true)) => CursorIcon::ColResize,
                 Some((_, false)) => CursorIcon::RowResize,
@@ -1496,6 +1651,20 @@ impl Gui {
         if n == 0 { return; }
         // Roda sobre as abas troca de aba; sobre a paleta move a selecao.
         if self.tab_at(x, y).is_some() { return self.cmd(json!({"cmd": "tab", "delta": if n > 0 { -1 } else { 1 }})); }
+        if self.ext_panel.is_some() && self.overlay.is_none() {
+            let c = self.chrome();
+            if let Some(r) = &self.r {
+                if x >= r.width() - c.right {
+                    let max = (self.ext_content - (r.height() - c.top - c.bottom) + 60.0).max(0.0);
+                    self.ext_scroll = (self.ext_scroll - lines * r.cell_h * 3.0).clamp(0.0, max);
+                    return self.redraw();
+                }
+            }
+        }
+        if let Some(Overlay { kind: OverlayKind::Detail { scroll, lines: body, .. }, .. }) = self.overlay.as_mut() {
+            *scroll = (*scroll as i64 - n).clamp(0, body.len().saturating_sub(5) as i64) as usize;
+            return self.redraw();
+        }
         if let Some(o) = self.overlay.as_mut() {
             if !o.shown.is_empty() { o.sel = (o.sel as i64 - n.signum()).rem_euclid(o.shown.len() as i64) as usize; }
             return self.redraw();
@@ -1536,13 +1705,13 @@ impl Gui {
             }
             "focus_mode" => { self.focus_mode = !self.focus_mode; self.send_size(); if self.focus_mode { self.flash("Modo foco (Ctrl+Shift+Z sai)"); } }
             "agent_panel" => {
-                if self.agent_panel.take().is_none() { self.sys_panel = false; self.refresh_agent_panel(true); }
+                if self.agent_panel.take().is_none() { self.sys_panel = false; self.ext_panel = None; self.refresh_agent_panel(true); }
                 self.stats.lock().unwrap().want_procs = self.sys_panel;
                 self.send_size();
             }
             "sys_panel" => {
                 self.sys_panel = !self.sys_panel;
-                if self.sys_panel { self.agent_panel = None; }
+                if self.sys_panel { self.agent_panel = None; self.ext_panel = None; }
                 self.stats.lock().unwrap().want_procs = self.sys_panel;
                 self.send_size();
             }
@@ -1672,7 +1841,14 @@ impl Gui {
                     if let OverlayKind::Preview { file, line, col, .. } = o.kind { self.open_in_editor(&file, line, col); }
                 }
             }
-            _ => return false,
+            "detail_action" => {
+                if let Some(o) = self.overlay.take() {
+                    if let OverlayKind::Detail { ext, actions, .. } = o.kind {
+                        if let Some((id, _, item)) = actions.get(n(0) as usize) { self.ext_builtin("ext_action", &[json!(ext), json!(id), json!(item)]); }
+                    }
+                }
+            }
+            _ => return self.ext_builtin(name, args),
         }
         self.redraw();
         true
@@ -1706,6 +1882,7 @@ impl Gui {
             },
             OverlayKind::Prompt(action, mut args) => { args.push(json!(o.input)); self.builtin(&action, &args); }
             OverlayKind::Preview { file, line, col, .. } => self.open_in_editor(&file, line, col),
+            OverlayKind::Detail { .. } => {}
             OverlayKind::Slider { key, val, .. } => {
                 let v = if key == "ui.font_weight" { format!("{}", val.round() as i64) } else { format!("{val:.2}") };
                 match set_local_setting(&key, &v) { Ok(_) => self.flash(&format!("{key} = {v}")), Err(e) => self.flash(&e) }
@@ -1718,6 +1895,18 @@ impl Gui {
         let Some(o) = self.overlay.as_mut() else { return false };
         let key = &ev.logical_key;
         match &mut o.kind {
+            OverlayKind::Detail { scroll, lines, .. } => {
+                let max = lines.len().saturating_sub(5);
+                match key {
+                    Key::Named(NamedKey::Escape) => { self.overlay = None; }
+                    Key::Named(NamedKey::ArrowDown) => *scroll = (*scroll + 1).min(max),
+                    Key::Named(NamedKey::ArrowUp) => *scroll = scroll.saturating_sub(1),
+                    Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => *scroll = (*scroll + 15).min(max),
+                    Key::Named(NamedKey::PageUp) => *scroll = scroll.saturating_sub(15),
+                    _ => {}
+                }
+                return true;
+            }
             OverlayKind::Preview { .. } => {
                 match key {
                     Key::Named(NamedKey::Escape) => { self.overlay = None; }
@@ -1824,7 +2013,7 @@ impl Gui {
             _ => return,
         };
         self.cards.retain(|c| !c.buttons.iter().any(|b| b.2.first() == Some(&json!(pane))));
-        self.cards.push(Card { id, title, body: format!("{what} · pane {pane}"), color, buttons, until: Instant::now() + Duration::from_secs(secs) });
+        self.cards.push(Card { id, title, body: format!("{what} · {}", self.pane_place(pane)), color, buttons, until: Instant::now() + Duration::from_secs(secs) });
         self.redraw();
     }
 
@@ -2600,6 +2789,49 @@ fn draw_overlay(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, o: &Overla
             hits.push(Hit { r: [tx - 6.0, ty - 12.0, tw + 12.0, 30.0], action: Action::Builtin("slider_set".into(), vec![json!(tx), json!(tw)]) });
             l.texts.push(uit(x + 20.0, y + oh - ch - 10.0, "←/→ ajusta ao vivo · Enter grava · Esc desfaz", theme.muted, 0.8));
         }
+        OverlayKind::Detail { subtitle, lines, actions, scroll, .. } => {
+            let ow = (w - 60.0).min(cw * 110.0);
+            let oh = (h * 0.82).min(h - top - 30.0);
+            let (x, y) = ((w - ow) / 2.0, top + ((h - top) - oh) / 2.0);
+            card(l, x, y, ow, oh);
+            l.texts.push(TextItem { bold: true, clip_right: Some(x + ow - 20.0), ..uit(x + 20.0, y + 16.0, &o.title, theme.fg, 1.05) });
+            l.texts.push(TextItem { clip_right: Some(x + ow - 20.0), ..uit(x + 20.0, y + 16.0 + ch * 1.35, subtitle, theme.muted, 0.82) });
+            let body_top = y + 20.0 + ch * 2.7;
+            let body_bottom = y + oh - 60.0;
+            l.quads.push(Quad { x: x + 16.0, y: body_top - 6.0, w: ow - 32.0, h: 1.0, color: lin(theme.border, 0.8) });
+            // Texto monoespacado quebrado pela largura (cabe como num terminal).
+            let per = (((ow - 48.0) / (cw * 0.9)) as usize).max(20);
+            let mut wrapped: Vec<String> = Vec::new();
+            for line in lines.iter() {
+                let chars: Vec<char> = line.chars().collect();
+                if chars.is_empty() { wrapped.push(String::new()); continue; }
+                for c in chars.chunks(per) { wrapped.push(c.iter().collect()); }
+            }
+            let rows = ((body_bottom - body_top) / (ch * 0.9 * 1.05)).max(1.0) as usize;
+            for (k, t) in wrapped.iter().skip(*scroll).take(rows).enumerate() {
+                let c = if t.starts_with('#') { theme.accent } else if t.starts_with('>') { theme.muted } else if t.starts_with("──") || t.starts_with("--") { theme.border } else { theme.fg };
+                l.texts.push(TextItem { size: 0.9, ..mt(x + 24.0, body_top + k as f32 * ch * 0.9 * 1.05, t, c) });
+            }
+            if wrapped.len() > rows {
+                let th = (body_bottom - body_top) * rows as f32 / wrapped.len() as f32;
+                let ty = body_top + (body_bottom - body_top - th) * (*scroll as f32 / (wrapped.len() - rows).max(1) as f32).min(1.0);
+                l.shapes.push(Shape::rect(x + ow - 10.0, ty, 3.0, th, lin(theme.muted, 0.5), 1.5));
+            }
+            let mut bx = x + ow - 16.0;
+            for (k, (_, title, _)) in actions.iter().enumerate().rev() {
+                let bw = r.measure(title, true, 0.88) + 26.0;
+                bx -= bw;
+                let br = [bx, y + oh - 46.0, bw, 32.0];
+                let hv = inside(br, mouse);
+                let primary = k == 0;
+                let bg = if primary { theme.accent } else { mix(theme.tab_bar, theme.fg, if hv { 0.16 } else { 0.10 }) };
+                l.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(if hv && primary { mix(bg, theme.fg, 0.15) } else { bg }, 1.0), 8.0));
+                l.texts.push(uit(bx + 13.0, br[1] + (32.0 - ch * 0.88) / 2.0, title, if primary { theme.bg } else { theme.fg }, 0.88));
+                hits.push(Hit { r: br, action: Action::Builtin("detail_action".into(), vec![json!(k)]) });
+                bx -= 8.0;
+            }
+            l.texts.push(uit(x + 20.0, y + oh - 40.0, "↑↓/roda rolam · Esc fecha", theme.muted, 0.75));
+        }
         _ if o.dialog => {
             let ow = (w * 0.5).clamp(380.0_f32.min(w - 20.0), 580.0);
             let lines = wrap(r, &o.title, ow - 40.0, 0.95, 6);
@@ -2654,7 +2886,8 @@ fn draw_overlay(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, o: &Overla
             if o.input.is_empty() && is_list {
                 l.texts.push(uit(fr[0] + 32.0, iy, "Digite para filtrar…", theme.muted, 0.9));
             } else {
-                l.texts.push(TextItem { clip_right: Some(fr[0] + fr[2] - 8.0), ..mt(fr[0] + 32.0, iy, &format!("{}▏", o.input), theme.fg) });
+                let shown = if o.secret { "•".repeat(o.input.chars().count()) } else { o.input.clone() };
+                l.texts.push(TextItem { clip_right: Some(fr[0] + fr[2] - 8.0), ..mt(fr[0] + 32.0, iy, &format!("{shown}▏"), theme.fg) });
             }
             cy += row_h + 14.0;
             if is_list {
@@ -2787,4 +3020,9 @@ mod tests {
         assert!(is_shortcut("Ctrl+Shift+P"));
         assert!(!is_shortcut("historico"));
     }
+}
+
+/// Nome da extensao dona do badge ("duck:sys_panel" -> "system", "jira/issues" -> "jira").
+fn badge_name(key: &str) -> &str {
+    match key { "duck:sys_panel" => "system", "duck:agent_panel" => "agents", k => k.split('/').next().unwrap_or(k) }
 }

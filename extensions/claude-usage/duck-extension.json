@@ -1,0 +1,14 @@
+{
+  "name": "claude-usage",
+  "short": "Claude",
+  "title": "Uso do Claude",
+  "icon": "",
+  "version": "0.1.0",
+  "category": "IA",
+  "description": "Limites de 5h e 7d, custo do dia e sessões recentes do Claude Code por perfil",
+  "command": ["node", "dist/index.js"],
+  "settings": [
+    { "key": "poll_seconds", "title": "Atualizar a cada (s)", "type": "number", "default": 60 },
+    { "key": "warn_percent", "title": "Avisar a partir de (%)", "type": "number", "default": 80 }
+  ]
+}

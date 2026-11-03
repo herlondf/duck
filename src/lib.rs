@@ -19,6 +19,7 @@ pub mod plugins;
 pub mod proto;
 pub mod ptyhost;
 pub mod render;
+pub mod secret;
 pub mod server;
 
 /// Executavel da janela (duckw.exe ao lado deste), se existir.
@@ -47,6 +48,7 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("view") => cli::view(&args[1..]),
         Some("play") => cli::play(&args[1..]),
         Some("url") => cli::url(&args[1..]),
+        Some("secret") => cli::secret(&args[1..]),
         Some("--version" | "-V") => { println!("duck {}", env!("CARGO_PKG_VERSION")); 0 }
         Some("--help" | "-h") => {
             println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update");

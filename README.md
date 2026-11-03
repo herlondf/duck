@@ -100,6 +100,51 @@ Click CPU/RAM in the title bar for a system panel (per-core usage, memory,
 top processes). Everything is configurable in `~/.duck.lua`; see
 [duck.example.lua](duck.example.lua).
 
+## Extensions
+
+Extensions are separate programs (official SDK in TypeScript) that send data to
+Duck; Duck draws them as side panels, floating details, title-bar items,
+palette commands and notifications. A crashing extension never takes the
+terminal down, and an extension that is turned off costs no memory.
+
+### Bundled
+
+| Area | Extensions |
+|---|---|
+| Code | **GitHub** (notifications, review requests, PRs, issues; every `gh auth login` account), **Azure DevOps** (PRs and builds), **Git** (branch, changes, worktrees and stashes of the active pane) |
+| Issues and errors | **Jira** (Server/DC and Cloud), **Rollbar** (active errors, resolve, mute), **Grafana** (LogQL queries on Loki, alert when a count goes up) |
+| Infrastructure | **Containers** (Docker and Podman, also inside WSL), **Database** (saved Postgres and Redis queries, read-only by default), **Ports** (listening TCP ports and their process) |
+| Daily use | **Calendar** (Google/Outlook via iCal URL, reminders and Join button), **Notes** (per project and global), **Snippets** (command snippets and clipboard history), **Claude usage** (5h/7d limits and cost per Claude Code profile) |
+| Others | **Google Play** (releases and reviews, reply to reviews), **Home Assistant** (lights, switches, covers, alerts) |
+
+Build them with `install.ps1 -Extensions` (or `./install.sh --extensions`).
+They start turned off; turn them on in `Ctrl+Shift+P` → "Extensões", where you
+also change their settings and add accounts.
+
+### Accounts and secrets
+
+Tokens never go into a config file. The Extensions menu asks for them, or you
+store them yourself:
+
+```sh
+echo <token> | duck secret set rollbar/<account>
+duck secret has rollbar/<account>
+```
+
+On Windows they live in the Credential Manager (`duck:<name>`, per user); on
+Linux/macOS in `~/.duck/secrets` with mode 600. The GitHub extension needs no
+secret: it reads the accounts from the `gh` CLI.
+
+### Write your own
+
+Put a folder with a `duck-extension.json` manifest in `~/.duck/extensions/<name>`
+(personal) or in `<duck>/extensions/<name>` (shared by every user of the
+machine; a personal one with the same name wins). Any language works: Duck
+starts the manifest's `command` and talks JSON lines over stdin/stdout. The
+manifest can declare settings, accounts and secrets, and the Extensions menu
+builds the forms from it. See [docs/EXTENSIONS.md](docs/EXTENSIONS.md); the
+GitHub extension is the reference implementation.
+
 ## How it compares
 
 A snapshot of the default, built-in capabilities of each tool (plugins and
@@ -118,7 +163,7 @@ external scripts can add more). ✅ yes · 🟡 partial · ❌ no
 | Approve agent requests from another tab | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Command blocks (exit code, duration) | ✅ | 🟡 | 🟡 | ❌ | 🟡 | ❌ | ✅ | ✅ | ❌ | ❌ |
 | Scriptable config | Lua | Lua | JSON | text | text/Python | TOML | ❌ | JSON | text | KDL |
-| Plugins | Lua, WASM | Lua | ❌ | ❌ | Python | ❌ | ❌ | widgets | shell | WASM |
+| Plugins | Lua, WASM, extensions (any language) | Lua | ❌ | ❌ | Python | ❌ | ❌ | widgets | shell | WASM |
 | API/CLI for agents to drive panes | ✅ (CLI + MCP) | ✅ (CLI) | 🟡 | ❌ | ✅ | ❌ | ❌ | 🟡 | ✅ | ✅ |
 | Built-in AI chat | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
 | Open source | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |

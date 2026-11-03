@@ -1,0 +1,56 @@
+{
+  "name": "grafana",
+  "title": "Grafana",
+  "icon": "eye",
+  "version": "0.1.0",
+  "description": "Consultas LogQL no Loki do Grafana: contagem na janela, últimas linhas e aviso quando sobe",
+  "category": "Dev",
+  "command": [
+    "node",
+    "dist/index.js"
+  ],
+  "secrets": [],
+  "settings": [
+    {
+      "key": "queries",
+      "title": "Consultas (uma por item: Nome=LogQL)",
+      "type": "list",
+      "default": [
+        "Erros={service_name=\"api\"} |= \"ERROR\""
+      ]
+    },
+    {
+      "key": "window_hours",
+      "title": "Janela (horas)",
+      "type": "number",
+      "default": 24
+    },
+    {
+      "key": "poll_seconds",
+      "title": "Atualizar a cada (s)",
+      "type": "number",
+      "default": 300
+    }
+  ],
+  "accounts": {
+    "key": "accounts",
+    "title": "Contas",
+    "fields": [
+      {
+        "key": "name",
+        "title": "Nome curto (ex.: prod)"
+      },
+      {
+        "key": "url",
+        "title": "Endereço do Grafana",
+        "default": "https://"
+      },
+      {
+        "key": "datasource_uid",
+        "title": "UID do datasource Loki"
+      }
+    ],
+    "secret": "grafana/{name}",
+    "secret_title": "Usuário e senha no formato usuario:senha"
+  }
+}

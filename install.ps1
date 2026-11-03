@@ -12,10 +12,11 @@
   -Boot          open Duck at logon restoring the last checkpoint / abre no logon restaurando o checkpoint
   -ClaudeHooks   register `duck hook` in ~/.claude*/settings.json (backup in settings.json.bak-duck)
   -SkipBuild     reuse target\release / usa o binario ja compilado
+  -Extensions    build the bundled extensions (Node 18+); enable them in Ctrl+Shift+P / compila as extensoes; ative no Ctrl+Shift+P
 .EXAMPLE
   pwsh -File .\install.ps1 -Boot -ClaudeHooks
 #>
-param([switch] $Boot, [switch] $ClaudeHooks, [switch] $SkipBuild)
+param([switch] $Boot, [switch] $ClaudeHooks, [switch] $SkipBuild, [switch] $Extensions)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $pt = (Get-UICulture).Name -like 'pt*'
@@ -62,6 +63,21 @@ if ($ClaudeHooks) {
   Get-ChildItem $env:USERPROFILE -Directory -Force -Filter '.claude*' |
     Where-Object { Test-Path (Join-Path $_.FullName 'settings.json') } |
     ForEach-Object { & $exe install --hooks (Join-Path $_.FullName 'settings.json') }
+}
+
+if ($Extensions) {
+  if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw ($pt ? 'Node.js nao encontrado: winget install OpenJS.NodeJS.LTS' : 'Node.js not found: winget install OpenJS.NodeJS.LTS') }
+  foreach ($e in Get-ChildItem "$root\extensions" -Directory | Where-Object { Test-Path "$($_.FullName)\duck-extension.json" }) {
+    Push-Location $e.FullName
+    npm install --no-audit --no-fund | Out-Null
+    npm run build | Out-Null
+    $failed = $LASTEXITCODE
+    Pop-Location
+    if ($failed) { throw "extension $($e.Name): build failed" }
+    Say "Extensao compilada: $($e.Name)" "Extension built: $($e.Name)"
+  }
+  # Ficam na instalacao (para todos os usuarios); cada um liga as suas no menu.
+  Say 'Ative as extensoes no Duck: Ctrl+Shift+P > Extensoes.' 'Enable extensions in Duck: Ctrl+Shift+P > Extensions.' Yellow
 }
 
 # Servidor ja rodando (atualizacao): reinicia sem fechar os shells.

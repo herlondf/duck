@@ -1,2 +1,4 @@
 target/
 bin/
+node_modules/
+extensions/*/dist/

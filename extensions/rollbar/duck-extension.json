@@ -1,0 +1,25 @@
+{
+  "name": "rollbar",
+  "title": "Rollbar",
+  "icon": "bug",
+  "version": "0.1.0",
+  "description": "Erros e avisos ativos do Rollbar, com detalhe da última ocorrência, resolver e silenciar",
+  "category": "Dev",
+  "command": ["node", "dist/index.js"],
+  "secrets": [],
+  "settings": [
+    { "key": "poll_seconds", "title": "Atualizar a cada (s)", "type": "number", "default": 120 },
+    { "key": "environments", "title": "Ambientes (separados por vírgula; vazio = todos)", "type": "list" }
+  ],
+  "accounts": {
+    "key": "accounts",
+    "title": "Projetos",
+    "fields": [
+      { "key": "name", "title": "Nome curto do projeto (ex.: api)" },
+      { "key": "account_slug", "title": "Slug da conta no Rollbar (opcional, para links)" },
+      { "key": "project_slug", "title": "Slug do projeto no Rollbar (opcional, para links)" }
+    ],
+    "secret": "rollbar/{name}",
+    "secret_title": "Project access token (read, e write para resolver/silenciar)"
+  }
+}

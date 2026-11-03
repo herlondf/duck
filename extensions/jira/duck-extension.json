@@ -1,0 +1,8 @@
+{
+  "name": "jira",
+  "title": "Jira",
+  "icon": "jira",
+  "version": "0.1.0",
+  "description": "Tarefas, issues acompanhadas, prazos e avisos do Jira (Server/DC e Cloud)",
+  "command": ["node", "dist/index.js"]
+}

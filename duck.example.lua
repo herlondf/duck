@@ -205,15 +205,8 @@ return {
   status = function(info)
     local out = {}
     if info.mode then table.insert(out, { text = ' ' .. info.mode:upper() .. ' ', fg = 'accent' }) end
-    local a = info.agents
-    if a.blocked > 0 then table.insert(out, { text = ' ' .. a.blocked .. ' bloqueado ', fg = 'blocked' }) end
-    if a.working > 0 then table.insert(out, { text = ' ' .. a.working .. ' trabalhando ', fg = 'working' }) end
-    if a.done > 0 then table.insert(out, { text = ' ' .. a.done .. ' pronto ', fg = 'done' }) end
-    if info.ports and #info.ports > 0 then
-      table.insert(out, { text = ' ⇄ ' .. table.concat(info.ports, ' ') .. ' ', fg = 'done' })
-    end
-    table.insert(out, { text = (' CPU %d%% '):format(info.cpu), fg = 'muted' })
-    table.insert(out, { text = (' RAM %.1f/%.0fG '):format(info.ram, info.ram_total), fg = 'muted' })
+    -- Agentes e CPU/RAM viraram badges (Ctrl+Shift+P > Extensoes > Agentes/Sistema).
+    -- Portas abertas: extensao Portas (Ctrl+Shift+P > Extensoes).
     return out
   end,
 

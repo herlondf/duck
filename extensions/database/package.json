@@ -1,0 +1,10 @@
+{
+  "name": "duck-extension-database",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Postgres and Redis saved queries for the Duck terminal",
+  "license": "MIT",
+  "scripts": { "build": "tsc -p .", "test": "node dist/check.js" },
+  "dependencies": { "pg": "^8.13.0", "redis": "^4.7.0" },
+  "devDependencies": { "typescript": "^5.6.0", "@types/node": "^22.0.0", "@types/pg": "^8.11.0" }
+}

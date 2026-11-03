@@ -1,0 +1,25 @@
+{
+  "name": "homeassistant",
+  "short": "Casa",
+  "title": "Home Assistant",
+  "icon": "󰟐",
+  "version": "0.1.0",
+  "description": "Luzes, interruptores, cortinas e avisos do Home Assistant (API REST)",
+  "category": "Casa",
+  "command": ["node", "dist/index.js"],
+  "settings": [
+    { "key": "favorites", "title": "Favoritos (entity_id separados por vírgula; vazio = por domínio)", "type": "list" },
+    { "key": "alerts", "title": "Alertas (binary_sensor que avisam ao ligar)", "type": "list" },
+    { "key": "poll_seconds", "title": "Atualizar a cada (s) com a visão aberta", "type": "number", "default": 30 }
+  ],
+  "accounts": {
+    "key": "accounts",
+    "title": "Instâncias",
+    "fields": [
+      { "key": "name", "title": "Nome curto", "default": "casa" },
+      { "key": "url", "title": "Endereço", "default": "http://homeassistant.local:8123" }
+    ],
+    "secret": "homeassistant/{name}",
+    "secret_title": "Token de longa duração (Perfil → Segurança)"
+  }
+}

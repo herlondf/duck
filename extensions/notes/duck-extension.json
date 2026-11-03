@@ -1,0 +1,10 @@
+{
+  "name": "notes",
+  "title": "Notas",
+  "icon": "",
+  "version": "0.1.0",
+  "category": "Produtividade",
+  "description": "Notas e tarefas por projeto (raiz git do pane ativo) e uma nota geral, em ~/.duck/notes",
+  "command": ["node", "dist/index.js"],
+  "permissions": ["context"]
+}

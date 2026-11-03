@@ -1,0 +1,22 @@
+{
+  "name": "googleplay",
+  "title": "Google Play",
+  "icon": "rocket",
+  "version": "0.1.0",
+  "description": "Publicações (faixas e releases) e avaliações dos apps no Google Play, com resposta às avaliações",
+  "category": "Dev",
+  "command": ["node", "dist/index.js"],
+  "settings": [
+    { "key": "packages", "title": "Apps (applicationId, separados por vírgula)", "type": "list" },
+    { "key": "poll_seconds", "title": "Atualizar a cada (s)", "type": "number", "default": 900 }
+  ],
+  "accounts": {
+    "key": "accounts",
+    "title": "Contas de serviço",
+    "fields": [
+      { "key": "name", "title": "Nome curto (ex.: empresa)" }
+    ],
+    "secret": "googleplay/{name}",
+    "secret_title": "JSON da conta de serviço (conteúdo inteiro do arquivo)"
+  }
+}

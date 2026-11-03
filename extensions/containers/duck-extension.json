@@ -1,0 +1,13 @@
+{
+  "name": "containers",
+  "title": "Containers",
+  "icon": "",
+  "version": "0.1.0",
+  "description": "Containers do Docker e do Podman (inclusive dentro das distros do WSL): logs, shell, iniciar, parar e reiniciar",
+  "category": "Dev",
+  "command": ["node", "dist/index.js"],
+  "settings": [
+    { "key": "engines", "title": "Motores (auto, docker, podman ou nome da distro do WSL; separados por vírgula)", "type": "list", "default": "auto" },
+    { "key": "poll_seconds", "title": "Atualizar a cada (s)", "type": "number", "default": 60 }
+  ]
+}

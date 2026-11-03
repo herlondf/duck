@@ -1,0 +1,23 @@
+{
+  "name": "calendar",
+  "title": "Agenda",
+  "icon": "clock",
+  "version": "0.1.0",
+  "description": "Compromissos do Google Agenda e do Outlook por URL secreta iCal (ICS), com lembretes e botão Entrar",
+  "category": "Produtividade",
+  "command": ["node", "dist/index.js"],
+  "settings": [
+    { "key": "remind_minutes", "title": "Lembrar quantos minutos antes", "type": "number", "default": 5 },
+    { "key": "refresh_minutes", "title": "Baixar a agenda a cada (min)", "type": "number", "default": 15 },
+    { "key": "days", "title": "Dias à frente na visão", "type": "number", "default": 7 }
+  ],
+  "accounts": {
+    "key": "accounts",
+    "title": "Agendas",
+    "fields": [
+      { "key": "name", "title": "Nome curto (ex.: trabalho)" }
+    ],
+    "secret": "calendar/{name}",
+    "secret_title": "URL secreta iCal (.ics) do Google Agenda ou do Outlook"
+  }
+}
