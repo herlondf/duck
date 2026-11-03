@@ -40,6 +40,15 @@ const DUCK_ART: &str = include_str!("../../assets/duck.txt");
 fn ease(t: f32) -> f32 { let t = t.clamp(0.0, 1.0); 1.0 - (1.0 - t).powi(3) }
 fn lerp4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] { [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t] }
 pub(super) fn inside(r: [f32; 4], p: (f32, f32)) -> bool { p.0 >= r[0] && p.0 < r[0] + r[2] && p.1 >= r[1] && p.1 < r[1] + r[3] }
+/// "nome|subtitulo": o que vem depois do primeiro '|' e desenhado menor, em cinza.
+pub(super) fn split_subtitle(label: &str) -> (&str, &str) {
+    match label.split_once('|') {
+        Some((a, b)) if !a.trim().is_empty() => (a.trim(), b.trim()),
+        Some((_, b)) => (b.trim(), ""),
+        None => (label, ""),
+    }
+}
+
 pub(super) fn uit(x: f32, y: f32, text: &str, color: Rgb, size: f32) -> TextItem {
     TextItem { x, y, text: text.into(), color, alpha: 1.0, bold: false, italic: false, clip_right: None, ui: true, size }
 }
@@ -962,7 +971,13 @@ impl Gui {
                     } else {
                         let tx = rr[0] + 32.0;
                         let fg = if t.active { theme.fg } else { theme.muted };
-                        base.texts.push(TextItem { clip_right: Some(rr[0] + rr[2] - 34.0), ..uit(tx, y + (row_h - ch * 0.9) / 2.0, label, fg, 0.9) });
+                        let (name, sub) = split_subtitle(label);
+                        let clip = rr[0] + rr[2] - 34.0;
+                        base.texts.push(TextItem { clip_right: Some(clip), ..uit(tx, y + (row_h - ch * 0.9) / 2.0, name, fg, 0.9) });
+                        let sx = tx + r.measure(name, true, 0.9) + 6.0;
+                        if !sub.is_empty() && sx < clip {
+                            base.texts.push(TextItem { italic: true, clip_right: Some(clip), ..uit(sx, y + (row_h - ch * 0.8) / 2.0, sub, mix(fg, theme.muted, 0.6), 0.8) });
+                        }
                         let (glyph, c, a) = state_glyph(&theme, t, t_now);
                         if !glyph.is_empty() {
                             if t.state == "working" { pulse = true; }
@@ -2660,7 +2675,10 @@ fn tabs_row(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, rects: &mut Ve
     for (label, t, color) in labels {
         if x > x_max - 40.0 { break; }
         let ind = !state_glyph(theme, t, c.t).0.is_empty();
-        let text_w = r.measure(label, true, size);
+        let (name, sub) = split_subtitle(label);
+        let sub_gap = if sub.is_empty() { 0.0 } else { 6.0 };
+        let name_w = r.measure(name, true, size);
+        let text_w = name_w + sub_gap + if sub.is_empty() { 0.0 } else { r.measure(sub, true, size * 0.9) };
         // Espaco fixo do ✕: nunca por cima do titulo ou do icone de estado.
         let close_w = 26.0;
         let tw = (14.0 + text_w + if ind { 16.0 } else { 0.0 } + close_w).clamp(72.0, max_w);
@@ -2680,7 +2698,11 @@ fn tabs_row(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, rects: &mut Ve
         let cy = ty + pill_h / 2.0;
         let fg = if t.active { theme.fg } else if hover { mix(theme.fg, theme.muted, 0.3) } else { theme.muted };
         let text_right = x + tw - close_w - if ind { 16.0 } else { 0.0 };
-        l.texts.push(TextItem { clip_right: Some(text_right), ..uit(x + 12.0, cy - ch * size / 2.0, label, fg, size) });
+        l.texts.push(TextItem { clip_right: Some(text_right), ..uit(x + 12.0, cy - ch * size / 2.0, name, fg, size) });
+        if !sub.is_empty() && x + 12.0 + name_w + sub_gap < text_right {
+            let ss = size * 0.9;
+            l.texts.push(TextItem { italic: true, clip_right: Some(text_right), ..uit(x + 12.0 + name_w + sub_gap, cy - ch * ss / 2.0, sub, mix(fg, theme.muted, 0.6), ss) });
+        }
         if ind {
             let (g, gc, a) = state_glyph(theme, t, c.t);
             if t.state == "working" { pulse = true; }

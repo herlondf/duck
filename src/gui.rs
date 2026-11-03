@@ -759,7 +759,7 @@ impl Gui {
             "zoom" => self.cmd(json!({"cmd": "zoom"})),
             "rename_tab" => {
                 let cur = self.frame.tabs.iter().find(|t| t.active).map(|t| t.title.clone()).unwrap_or_default();
-                self.overlay = Some(Overlay::prompt("Novo nome da aba (vazio volta ao automatico)", &cur, "rename_tab_to", vec![]));
+                self.overlay = Some(Overlay::prompt("Novo nome da aba (nome|subtitulo; vazio volta ao automatico)", &cur, "rename_tab_to", vec![]));
             }
             "rename_tab_to" => self.cmd(json!({"cmd": "rename-tab", "title": s(0)})),
             "tab_color" => {
@@ -2020,7 +2020,7 @@ impl Gui {
             })).ok()?;
             f.call::<String>(arg).ok()
         }).unwrap_or_else(|| if t.title.is_empty() { t.pane_title.clone() } else { t.title.clone() });
-        title.chars().take(40).collect::<String>().trim().to_string()
+        title.chars().take(60).collect::<String>().trim().to_string()
     }
 
     /// Cor da aba: manual > perfil do dominio > regra da config.
