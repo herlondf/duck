@@ -17,13 +17,15 @@ type Settings = { accounts?: AccountCfg[]; queries?: string[] | string; window_h
 type Account = AccountCfg & { auth: string };
 type Query = { name: string; expr: string };
 type Result = { count: number; lastNs: number };
+/** Resultado de uma consulta: um por service_name (quem gerou as linhas). */
+type Results = Map<string, Result>;
 type Line = { ns: number; text: string; group: string };
 
 const DEFAULT_QUERY = 'Erros={service_name="api"} |= "ERROR"';
 let settings: Settings = {};
 let accounts: Account[] = [];
 let queries: Query[] = [];
-const results = new Map<string, Result>(); // "conta|idx"
+const results = new Map<string, Results>(); // "conta|idx" -> service -> resultado
 const errors = new Map<string, string>();
 let first = true;
 
@@ -92,13 +94,43 @@ async function lines(a: Account, expr: string, fromMs: number, toMs: number, lim
   return out.sort((x, y) => x.ns - y.ns);
 }
 
-async function measure(a: Account, q: Query): Promise<Result> {
+/** A consulta restrita a um serviço: service_name="x" entra no seletor {...}. */
+export function narrow(expr: string, svc: string): string {
+  if (!svc) return expr;
+  const i = expr.indexOf("{");
+  if (i < 0) return expr;
+  const rest = expr.slice(i + 1);
+  return `${expr.slice(0, i + 1)}service_name=${JSON.stringify(svc)}${rest.trimStart().startsWith("}") ? "" : ", "}${rest}`;
+}
+
+/** Contagem por serviço na janela e a última ocorrência de cada um. */
+async function measure(a: Account, q: Query): Promise<Results> {
   const now = Date.now();
-  const [c, last] = await Promise.all([
-    loki(a, "query", { query: `sum(count_over_time(${q.expr} [${hours()}h]))`, time: ns(now) }),
-    lines(a, q.expr, now - hours() * 3600e3, now, 1),
+  const selector = q.expr.slice(0, q.expr.indexOf("}") + 1);
+  const [c, names] = await Promise.all([
+    loki(a, "query", { query: `sum by (service_name) (count_over_time(${q.expr} [${hours()}h]))`, time: ns(now) }),
+    // Todos os servicos do seletor, para os sem ocorrencia aparecerem com 0.
+    selector ? loki(a, "label/service_name/values", { query: selector, start: ns(now - hours() * 3600e3), end: ns(now) }).catch(() => []) : Promise.resolve([]),
   ]);
-  return { count: Number(c?.result?.[0]?.value?.[1] ?? 0), lastNs: last[0]?.ns ?? 0 };
+  const out: Results = new Map();
+  for (const n of (names ?? []) as string[]) out.set(n, { count: 0, lastNs: 0 });
+  await Promise.all((c?.result ?? []).map(async (r: any) => {
+    const svc = String(r.metric?.service_name ?? "");
+    const count = Number(r.value?.[1] ?? 0);
+    if (!count) return;
+    const [last] = await lines(a, narrow(q.expr, svc), now - hours() * 3600e3, now, 1);
+    out.set(svc, { count, lastNs: last?.ns ?? 0 });
+  }));
+  return out;
+}
+
+/** Nome curto do serviço: tira o prefixo comum dos servicos (ex.: "ctn-app-"). */
+export function shortSvc(svc: string, all: string[]): string {
+  if (!svc) return "(sem service_name)";
+  let pre = all.length > 1 ? all.reduce((p, x) => { let k = 0; while (k < p.length && p[k] === x[k]) k++; return p.slice(0, k); }) : "";
+  pre = pre.slice(0, pre.lastIndexOf("-") + 1);
+  const s = svc.slice(pre.length) || svc;
+  return s;
 }
 
 // ---------------------------------------------------------------- texto
@@ -145,14 +177,16 @@ async function poll(): Promise<void> {
     try {
       for (let i = 0; i < queries.length; i++) {
         const q = queries[i], k = `${a.name}|${i}`;
-        const r = await measure(a, q);
+        const rs = await measure(a, q);
         const before = results.get(k);
-        results.set(k, r);
+        results.set(k, rs);
         // Compara a última ocorrência e não a contagem: na janela móvel a contagem cai sozinha.
-        if (!first && before && r.lastNs > before.lastNs && r.count > 0) {
+        for (const [svc, r] of rs) {
+          const b = before?.get(svc);
+          if (first || !before || r.lastNs <= (b?.lastNs ?? 0)) continue;
           duck.notify({
-            title: `Grafana · ${q.name}: ocorrência nova`, body: `${r.count} na janela de ${hours()}h · última às ${when(r.lastNs)}`,
-            item: `q|${a.name}|${i}`, actions: [{ id: "open", title: "Ver linhas" }, { id: "web", title: "Abrir no Grafana" }], color: "blocked",
+            title: `Grafana · ${q.name}: ${svc || "ocorrência nova"}`, body: `${r.count} na janela de ${hours()}h · última às ${when(r.lastNs)}`,
+            item: `q|${a.name}|${i}|${svc}`, actions: [{ id: "open", title: "Ver linhas" }, { id: "web", title: "Abrir no Grafana" }], color: "blocked",
           });
         }
       }
@@ -167,19 +201,29 @@ function render(): void {
   const multi = (settings.accounts?.length ?? 0) > 1;
   const secs: Section[] = [];
   let total = 0;
+  const rowActs = [{ id: "open", title: "Ver linhas", primary: true }, { id: "incident", title: "Último incidente" }, { id: "web", title: "Abrir no Grafana" }, { id: "refresh", title: "Atualizar" }];
+  // Uma seção por consulta; dentro, um item por serviço (quem gerou), o mais recente primeiro.
   for (const a of accounts) {
-    secs.push({
-      title: `${multi ? `${a.name} · ` : ""}Últimas ${hours()}h`,
-      items: queries.map((q, i) => {
-        const r = results.get(`${a.name}|${i}`);
-        total += r?.count ?? 0;
-        return {
-          id: `q|${a.name}|${i}`, title: q.name, icon: "list",
-          badge: r ? String(r.count) : "…", color: r?.count ? "blocked" : "muted",
-          subtitle: !r ? (errors.has(a.name) ? "sem dados" : "carregando") : r.lastNs ? `última ${when(r.lastNs)} · ${ago(r.lastNs)}` : "nenhuma ocorrência na janela",
-          actions: [{ id: "open", title: "Ver linhas", primary: true }, { id: "incident", title: "Último incidente" }, { id: "web", title: "Abrir no Grafana" }, { id: "refresh", title: "Atualizar" }],
-        };
-      }),
+    queries.forEach((q, i) => {
+      const rs = results.get(`${a.name}|${i}`);
+      const sum = rs ? [...rs.values()].reduce((n, r) => n + r.count, 0) : 0;
+      total += sum;
+      const title = `${multi ? `${a.name} · ` : ""}${q.name} · ${hours()}h${rs ? ` · ${sum}` : ""}`;
+      if (!rs || !rs.size) {
+        secs.push({ title, items: [{
+          id: `q|${a.name}|${i}|`, title: !rs ? (errors.has(a.name) ? "sem dados" : "carregando…") : "nenhuma ocorrência na janela",
+          icon: "check", color: "muted", actions: rowActs,
+        }] });
+        return;
+      }
+      const svcs = [...rs.keys()];
+      const items = [...rs.entries()].sort((x, y) => y[1].lastNs - x[1].lastNs || x[0].localeCompare(y[0])).map(([svc, r]) => ({
+        id: `q|${a.name}|${i}|${svc}`, title: shortSvc(svc, svcs), icon: r.count ? "list" : "check",
+        badge: String(r.count), color: r.count ? "blocked" : "muted",
+        subtitle: r.lastNs ? `última ${when(r.lastNs)} · ${ago(r.lastNs)} · ${svc}` : `nenhuma ocorrência · ${svc}`,
+        actions: rowActs,
+      }));
+      secs.push({ title, items });
     });
   }
   duck.view("queries", secs, { error: [...errors.entries()].map(([n, e]) => n === "config" ? e : `${n}: ${e}`).join(" | ") });
@@ -195,27 +239,27 @@ function exploreUrl(a: Account, expr: string, from = `now-${hours()}h`, to = "no
 
 const acts = [{ id: "incident", title: "Último incidente" }, { id: "web", title: "Abrir no Grafana" }, { id: "open", title: "Atualizar" }];
 
-async function showLines(a: Account, i: number): Promise<void> {
-  const q = queries[i], now = Date.now();
-  const ls = await lines(a, q.expr, now - hours() * 3600e3, now, 200);
+async function showLines(a: Account, i: number, svc: string): Promise<void> {
+  const q = queries[i], now = Date.now(), expr = narrow(q.expr, svc);
+  const ls = await lines(a, expr, now - hours() * 3600e3, now, 200);
   duck.detail({
-    title: `${q.name} · últimas ${ls.length} linha(s)`, item: `q|${a.name}|${i}`,
-    subtitle: `${a.name} · janela de ${hours()}h · horário local · ${q.expr}`,
+    title: `${q.name}${svc ? ` · ${svc}` : ""} · últimas ${ls.length} linha(s)`, item: `q|${a.name}|${i}|${svc}`,
+    subtitle: `${a.name} · janela de ${hours()}h · horário local · ${expr}`,
     body: format(ls), actions: acts,
   });
 }
 
 /** Como o passo 2 da skill: todas as linhas da instância do último hit, de -2s a +20s. */
-async function showIncident(a: Account, i: number): Promise<void> {
-  const q = queries[i], now = Date.now();
-  const [hit] = (await lines(a, q.expr, now - hours() * 3600e3, now, 1));
+async function showIncident(a: Account, i: number, svc: string): Promise<void> {
+  const q = queries[i], now = Date.now(), qexpr = narrow(q.expr, svc);
+  const [hit] = (await lines(a, qexpr, now - hours() * 3600e3, now, 1));
   if (!hit) { duck.flash(`${q.name}: nenhuma ocorrência em ${hours()}h`); return; }
-  const selector = q.expr.slice(0, q.expr.indexOf("}") + 1);
-  if (!hit.group || !selector) { await showLines(a, i); return; }
+  const selector = qexpr.slice(0, qexpr.indexOf("}") + 1);
+  if (!hit.group || !selector) { await showLines(a, i, svc); return; }
   const expr = `${selector} |= ${JSON.stringify(hit.group)}`;
   const ls = await lines(a, expr, hit.ns - 2000, hit.ns + 20000, 5000);
   duck.detail({
-    title: `${q.name} · incidente de ${when(hit.ns)}`, item: `q|${a.name}|${i}`,
+    title: `${q.name}${svc ? ` · ${svc}` : ""} · incidente de ${when(hit.ns)}`, item: `q|${a.name}|${i}|${svc}`,
     subtitle: `${a.name} · instância ${hit.group} · ${ls.length} linha(s), ${ls.filter((l) => /\[0x[0-9a-f]+\]/.test(l.text)).length} frame(s)`,
     body: ls.map((l) => `${when(l.ns)}  ${l.text}`).join("\n") || "(sem linhas)",
     actions: [{ id: "web", title: "Abrir no Grafana" }],
@@ -224,14 +268,14 @@ async function showIncident(a: Account, i: number): Promise<void> {
 
 async function onAction(action: string, item: string): Promise<void> {
   if (action === "refresh") { await poll(); return; }
-  const [, name, idx] = item.split("|");
+  const [, name, idx, svc = ""] = item.split("|");
   const a = accounts.find((x) => x.name === name);
   const i = Number(idx);
   if (!a || !queries[i]) return;
   switch (action) {
-    case "open": await showLines(a, i); break;
-    case "incident": await showIncident(a, i); break;
-    case "web": duck.openUrl(exploreUrl(a, queries[i].expr)); break;
+    case "open": await showLines(a, i, svc); break;
+    case "incident": await showIncident(a, i, svc); break;
+    case "web": duck.openUrl(exploreUrl(a, narrow(queries[i].expr, svc))); break;
   }
 }
 
