@@ -277,7 +277,8 @@ config. Nos exemplos, troque os nomes de conta e as URLs pelos seus.
   configurar)". Lista as definições e os ambientes de cada uma, com um trecho
   pronto para copiar. Um ambiente digitado errado aparece no painel com os
   nomes que existem.
-- **No painel:** no modo automático, cada linha abre o detalhe do projeto;
+- **No painel:** quatro abas no topo, com a contagem: Revisão, Meus PRs,
+  Releases e Builds recentes. No modo automático, cada linha abre o detalhe do projeto;
   nos itens configurados um a um, cada linha abre a release no navegador. "Historico" mostra os
   15 últimos deploys do ambiente. O badge do rodapé mostra quantos deploys
   falharam.

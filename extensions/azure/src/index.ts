@@ -535,32 +535,53 @@ function buildItem(o: Org, b: Build): Item {
   };
 }
 
+const VIEWS = [
+  { id: "review", label: "Revisao", icon: "azure" },
+  { id: "mine", label: "Meus PRs", icon: "pr" },
+  { id: "releases", label: "Releases", icon: "tag" },
+  { id: "builds", label: "Builds recentes", icon: "check" },
+];
+
 function render(): void {
   const multi = orgs.length > 1;
-  const secs: Section[] = [];
+  // Uma visao por assunto: o painel mostra as quatro como abas no topo.
+  const tabs: Record<string, { secs: Section[]; n: number }> = {
+    review: { secs: [], n: 0 }, mine: { secs: [], n: 0 }, releases: { secs: [], n: 0 }, builds: { secs: [], n: 0 },
+  };
   let pending = 0;
   let relFailed = 0;
   for (const o of orgs) {
     const p = multi ? `${o.name} · ` : "";
     const rv = review.get(o.name) ?? [];
+    const my = mine.get(o.name) ?? [];
+    const bl = builds.get(o.name) ?? [];
     pending += rv.filter((x) => (x.reviewers.find((r) => r.id === o.me?.id)?.vote ?? 0) === 0).length;
-    secs.push({ title: `${p}Revisao pedida (${rv.length})`, items: rv.map((x) => prItem(o, x, true)) });
-    secs.push({ title: `${p}Meus PRs (${mine.get(o.name)?.length ?? 0})`, items: (mine.get(o.name) ?? []).map((x) => prItem(o, x, false)) });
+    tabs.review.n += rv.length;
+    tabs.mine.n += my.length;
+    tabs.builds.n += bl.length;
+    tabs.review.secs.push({ title: multi ? o.name : "", items: rv.map((x) => prItem(o, x, true)) });
+    tabs.mine.secs.push({ title: multi ? o.name : "", items: my.map((x) => prItem(o, x, false)) });
+    tabs.builds.secs.push({ title: multi ? o.name : "", items: bl.map((b) => buildItem(o, b)) });
+    const secs = tabs.releases.secs;
     const groups = new Map<string, Item[]>();
     for (const rel of releases.get(o.name) ?? []) {
       relFailed += rel.stages.filter((s) => s.status === "failed").length;
       if (rel.group) {
-        if (!groups.has(rel.group)) { groups.set(rel.group, []); secs.push({ title: `${p}${rel.group}`, items: groups.get(rel.group)! }); }
+        if (!groups.has(rel.group)) { groups.set(rel.group, []); secs.push({ title: multi || rel.group !== "Releases" ? `${p}${rel.group}` : "", items: groups.get(rel.group)! }); }
         groups.get(rel.group)!.push(rel.stages.some((x) => x.error) ? stageItem(o, rel, rel.stages[0]) : relRowItem(o, rel));
       } else secs.push({ title: `${p}Release · ${rel.name}`, items: rel.stages.map((s) => stageItem(o, rel, s)) });
     }
-    for (const sec of secs) if (sec.items.length && [...groups.values()].includes(sec.items)) sec.title = `${sec.title} (${sec.items.length})`;
-    secs.push({ title: `${p}Builds recentes`, items: (builds.get(o.name) ?? []).map((b) => buildItem(o, b)) });
+    for (const sec of secs) if (sec.title && sec.items.length && [...groups.values()].includes(sec.items)) sec.title = `${sec.title} (${sec.items.length})`;
+    tabs.releases.n += (releases.get(o.name) ?? []).length;
   }
   const err = [...errors.entries()].map(([n, e]) => `${n}: ${e}`).join(" | ");
-  duck.view("prs", secs, { error: err });
-  duck.status("prs", ` ${pending}`, { color: pending ? "accent" : "muted", view: "prs" });
-  duck.status("rel", relFailed ? ` ${relFailed} deploy falhou` : "", { color: "blocked", view: "prs" });
+  const empty = (secs: Section[]) => (secs.every((x) => !x.items.length) ? [] : secs);
+  for (const v of VIEWS) {
+    const t = tabs[v.id];
+    duck.view(v.id, v.id === "releases" ? t.secs : empty(t.secs), { error: err, title: `Azure · ${v.label}${t.n ? ` (${t.n})` : ""}` });
+  }
+  duck.status("prs", ` ${pending}`, { color: pending ? "accent" : "muted", view: "review" });
+  duck.status("rel", relFailed ? ` ${relFailed} deploy falhou` : "", { color: "blocked", view: "releases" });
 }
 
 async function showPR(o: Org, repoId: string, id: number): Promise<void> {
@@ -636,9 +657,11 @@ async function onAction(action: string, item: string): Promise<void> {
 run({
   async init(m) {
     settings = (m.settings ?? {}) as Settings;
-    duck.register([{ id: "prs", title: "Azure DevOps · PRs, releases e builds", icon: "azure" }],
-      [{ id: "prs", title: "Azure DevOps: PRs, releases e builds" }, { id: "release-defs", title: "Azure: definicoes de release (para configurar)" }]);
-    if (!settings.orgs?.length) { duck.view("prs", [], { error: "Configure extensions.azure.orgs no ~/.duck.lua" }); return; }
+    duck.register(VIEWS.map((v) => ({ id: v.id, title: `Azure · ${v.label}`, icon: v.icon })), [
+      ...VIEWS.map((v) => ({ id: v.id, title: `Azure: ${v.label.toLowerCase()}` })),
+      { id: "release-defs", title: "Azure: definicoes de release (para configurar)" },
+    ]);
+    if (!settings.orgs?.length) { for (const v of VIEWS) duck.view(v.id, [], { error: "Configure extensions.azure.orgs no ~/.duck.lua" }); return; }
     orgs = await loadOrgs();
     await poll();
     setInterval(() => void poll(), Math.max(60, settings.poll_seconds ?? 120) * 1000);
@@ -646,7 +669,7 @@ run({
   async viewOpen() { render(); },
   async command(m) {
     if (m.command === "release-defs") { await listDefinitions(); return; }
-    duck.showView(m.command);
+    duck.showView(m.command === "prs" ? "review" : m.command);   // "prs": nome antigo
   },
   async action(m) { await onAction(m.action, m.item); },
   async input(m) {

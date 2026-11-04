@@ -282,7 +282,8 @@ config. In the examples, replace account names and URLs with yours.
   configurar)" (release definitions, to configure). It lists the definitions
   and the environments of each, with a snippet ready to copy. A mistyped
   environment shows in the panel together with the names that exist.
-- **In the panel:** in automatic mode each line opens the project detail; for
+- **In the panel:** four tabs on top, with counts: Revisao (review), Meus
+  PRs (my PRs), Releases and Builds recentes (recent builds). In automatic mode each line opens the project detail; for
   items configured one by one, each line opens the release in the browser. "Historico"
   (history) shows the last 15 deploys of the environment. The footer badge
   counts failed deploys.
