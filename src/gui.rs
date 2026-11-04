@@ -655,12 +655,19 @@ impl Gui {
         let latest = self.latest.clone();
         let proxy = self.proxy.clone();
         let client = self.client.clone();
+        let inbox = self.exts.inbox.clone();
         std::thread::spawn(move || loop {
             if let Ok(mut c) = Conn::connect_or_spawn() {
                 if c.send(&json!({"cmd": "subscribe", "client": client})).is_ok() {
                     // Server novo (reinicio/queda) nao sabe o tamanho da janela.
                     let _ = proxy.send_event(UserEv::Connected);
                     while let Ok(v) = c.recv() {
+                        if v.get("t").and_then(|t| t.as_str()) == Some("ext") {
+                            let ext = v["ext"].as_str().unwrap_or("").to_string();
+                            inbox.lock().unwrap().push((ext, v["msg"].clone()));
+                            if proxy.send_event(UserEv::Ext).is_err() { return; }
+                            continue;
+                        }
                         let mut l = latest.lock().unwrap();
                         match v.get("t").and_then(|t| t.as_str()) {
                             // Frames por diferenca se acumulam: aplica sobre o anterior ainda nao lido.
@@ -2445,7 +2452,8 @@ impl ApplicationHandler<UserEv> for Gui {
         self.r = Some(r);
         self.load_config();
         ui::register_protocol();
-        self.start_extensions();
+        // As extensoes rodam no server; a janela recebe o estado delas ao assinar.
+        self.exts.conn = self.conn.clone();
         self.connect();
         self.send_size();
         self.cmd(json!({"cmd": "window-focus", "focused": true}));

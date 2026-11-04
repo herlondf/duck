@@ -577,7 +577,8 @@ pub fn url(args: &[String]) -> i32 {
         };
         let (ext, act, item) = (it.next().unwrap_or(""), dec(it.next().unwrap_or("")), dec(it.next().unwrap_or("")));
         let Ok(mut c) = Conn::connect() else { return 1 };
-        let _ = c.call(json!({"cmd": "gui-action", "name": "ext_action", "args": [ext, act, item]}));
+        // Direto para a extensao no server: funciona com a janela fechada.
+        let _ = c.call(json!({"cmd": "ext-send", "ext": ext, "msg": {"type": "action", "action": act, "item": item, "view": ""}}));
         let _ = c.call(json!({"cmd": "raise", "pane": 0}));
         return 0;
     }

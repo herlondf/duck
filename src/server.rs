@@ -353,6 +353,10 @@ pub struct Mux {
     /// em history.jsonl.
     history: Vec<Value>,
     budget_warned: bool,
+    /// Extensoes: rodam aqui, com ou sem janela aberta.
+    ext: crate::ext::Host,
+    /// Janelas assinando a tela agora.
+    subs: usize,
 }
 
 pub struct Server {
@@ -1492,7 +1496,7 @@ fn needs_approval(m: &Mux, caller: Caller, cmd: &str, a: &Value) -> Option<Strin
 fn audit(m: &Mux, caller: Caller, a: &Value) {
     if !m.cfg.audit { return; }
     let cmd = arg_str(a, "cmd").unwrap_or("");
-    if READ_CMDS.contains(&cmd) || ["subscribe", "resize", "window-focus", "theme-mode"].contains(&cmd) { return; }
+    if READ_CMDS.contains(&cmd) || ["subscribe", "resize", "window-focus", "theme-mode", "ext-send"].contains(&cmd) { return; }
     // A GUI digitando nao e auditoria; agentes e scripts sao.
     if arg_str(a, "client").is_some_and(|c| c.starts_with("gui-")) { return; }
     let mut a = a.clone();
@@ -2134,6 +2138,18 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             std::thread::spawn(|| { std::thread::sleep(Duration::from_millis(300)); std::process::exit(0); });
             proto::ok(json!({"restarting": true}))
         }
+        // Extensoes (src/ext.rs): so o dono; um pane nao fala com elas.
+        "ext-send" | "ext-restart" => {
+            if caller.0.is_some() { return Err(format!("{cmd}: so fora dos panes")); }
+            let ext = arg_str(a, "ext").unwrap_or("");
+            if cmd == "ext-restart" {
+                m.ext.restart(Some(ext).filter(|e| !e.is_empty()), &ext_sink(srv));
+            } else {
+                let msg = a.get("msg").cloned().ok_or("falta msg")?;
+                match arg_str(a, "perm") { Some(p) => m.ext.send_perm(ext, p, msg), None => m.ext.send(ext, msg) }
+            }
+            proto::ok(json!({}))
+        }
         "kill-server" => {
             for p in m.panes.values() { let _ = p.io.send(Io::Kill); }
             let _ = std::fs::remove_file(proto::data_dir().join("live.json"));
@@ -2567,7 +2583,7 @@ fn serve_conn(srv: Arc<Server>, conn: Stream, token: String) {
                 json!({"error": "erro interno (detalhes em server.log)"})
             }
         };
-        let quiet = matches!(req.get("cmd").and_then(|c| c.as_str()), Some("ping" | "list" | "read" | "states" | "events" | "doctor" | "grep" | "last-output" | "last-failure" | "history"));
+        let quiet = matches!(req.get("cmd").and_then(|c| c.as_str()), Some("ping" | "list" | "read" | "states" | "events" | "doctor" | "grep" | "last-output" | "last-failure" | "history" | "ext-send"));
         if !quiet { srv.notify(); }
         let mut out = serde_json::to_vec(&resp).unwrap();
         out.push(b'\n');
@@ -2580,7 +2596,12 @@ fn serve_conn(srv: Arc<Server>, conn: Stream, token: String) {
 /// so o prompt pisca.
 fn subscribe(srv: Arc<Server>, mut conn: Stream, client: String) {
     let mut last_gen = u64::MAX;
-    let mut last_event = srv.lock().event_seq;
+    // A janela nova recebe primeiro o estado das extensoes (visoes, badges).
+    let (mut last_event, mut last_ext, mut pending) = {
+        let mut m = srv.lock();
+        m.subs += 1;
+        (m.event_seq, m.ext.seq, m.ext.snapshot())
+    };
     let mut sent: HashMap<u64, (u16, u16, Vec<u64>)> = HashMap::new();
     let mut pause = Duration::from_millis(8);
     loop {
@@ -2599,10 +2620,17 @@ fn subscribe(srv: Arc<Server>, mut conn: Stream, client: String) {
                 .unwrap_or_else(|_| Err("panic montando o frame".into()));
             let ev: Vec<Value> = m.events.iter().filter(|(s, _)| *s > last_event).map(|(_, e)| e.clone()).collect();
             last_event = m.event_seq;
+            pending.extend(m.ext.out.iter().filter(|(s, _, _)| *s > last_ext).map(|(_, e, v)| (e.clone(), v.clone())));
+            last_ext = m.ext.seq;
             (f, ev)
         };
         pause = (t0.elapsed() * 2).clamp(Duration::from_millis(8), Duration::from_millis(50));
         let mut out = Vec::new();
+        let exts = std::mem::take(&mut pending);
+        for (e, v) in &exts {
+            out.extend(serde_json::to_vec(&json!({"t": "ext", "ext": e, "msg": v})).unwrap());
+            out.push(b'\n');
+        }
         for e in events {
             let mut e = e;
             e["t"] = json!("event");
@@ -2618,10 +2646,55 @@ fn subscribe(srv: Arc<Server>, mut conn: Stream, client: String) {
         }
         out.push(b'\n');
         if conn.write_all(&out).is_err() {
-            srv.lock().clients.remove(&client);
+            // A janela fechou: o aviso que ia para ela vira toast.
+            for (e, v) in exts.iter().filter(|(_, v)| v["type"] == "notify") { ext_toast(e, v); }
+            let mut m = srv.lock();
+            m.clients.remove(&client);
+            m.subs = m.subs.saturating_sub(1);
+            if m.subs == 0 { m.ext.views_closed(); }
             return;
         }
     }
+}
+
+fn ext_sink(srv: &Arc<Server>) -> crate::ext::Sink {
+    let s = srv.clone();
+    Arc::new(move |ext, msg, gen| ext_incoming(&s, &ext, msg, gen))
+}
+
+/// Mensagem de uma extensao: vai para as janelas. Sem janela aberta, o server
+/// resolve o que da (aviso vira toast, pane abre numa aba); o resto (painel,
+/// pergunta, colar) espera a janela, que recebe o estado ao conectar.
+fn ext_incoming(srv: &Arc<Server>, ext: &str, msg: Value, gen: u64) {
+    let mut m = srv.lock();
+    let Some(msg) = m.ext.incoming(ext, msg, gen) else { return };
+    if m.subs == 0 {
+        match msg["type"].as_str().unwrap_or("") {
+            "notify" => return ext_toast(ext, &msg),
+            "open-pane" => {
+                drop(m);
+                let mut req = json!({"cmd": "spawn", "where": "tab", "argv": msg["cmd"].clone(), "focus": false});
+                for k in ["cwd", "title"] { if let Some(v) = msg.get(k) { req[k] = v.clone(); } }
+                if let Err(e) = handle(srv, &req, Caller(None)) { proto::log(&format!("extensao {ext}: open-pane: {e}")); }
+                srv.notify();
+                return;
+            }
+            _ => {}
+        }
+    }
+    m.ext.push(ext, msg);
+    drop(m);
+    srv.notify();
+}
+
+/// Aviso de extensao como toast do Windows; os botoes voltam por duck://ext/...
+fn ext_toast(ext: &str, m: &Value) {
+    let s = |k: &str| m[k].as_str().unwrap_or("").to_string();
+    let enc = |x: &str| x.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
+    let item = s("item");
+    let urls: Vec<(String, String)> = m["actions"].as_array().into_iter().flatten()
+        .map(|a| (a["title"].as_str().unwrap_or("").to_string(), format!("duck://ext/{ext}/{}/{}", enc(a["id"].as_str().unwrap_or("")), enc(&item)))).collect();
+    crate::gui::toast_actions(&s("title"), &s("body"), &urls);
 }
 
 fn hash_v(v: &Value) -> u64 {
@@ -2676,7 +2749,7 @@ pub fn run() {
             panes: HashMap::new(), workspaces: Vec::new(), next: 1, size: (100, 30),
             clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0,
             approvals: Vec::new(), approval_seq: 0, secrets, recovered: 0, resurrect: false, light: false,
-            history: load_history(), budget_warned: false,
+            history: load_history(), budget_warned: false, ext: Default::default(), subs: 0,
         }),
         gen: Mutex::new(0),
         cv: Condvar::new(),
@@ -2690,6 +2763,7 @@ pub fn run() {
     { let s = srv.clone(); std::thread::spawn(move || autosave_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || live_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || sync_loop(s)); }
+    { let s = srv.clone(); std::thread::spawn(move || { let sink = ext_sink(&s); s.lock().ext.start_all(&sink); s.notify(); }); }
     for conn in listener.incoming().flatten() {
         let (s, t) = (srv.clone(), token.clone());
         std::thread::spawn(move || serve_conn(s, conn, t));
@@ -2785,7 +2859,7 @@ mod tests {
             panes: HashMap::new(), workspaces: vec![], next: 1, size: (10, 10), clients: HashMap::new(),
             cfg: config::parse(&t),
             clipboard: (0, String::new()), events: vec![], event_seq: 0, approvals: vec![], approval_seq: 0,
-            secrets: vec![], recovered: 0, resurrect: false, light: false, history: vec![], budget_warned: false,
+            secrets: vec![], recovered: 0, resurrect: false, light: false, history: vec![], budget_warned: false, ext: Default::default(), subs: 0,
         };
         assert!(check_scope(&m, Caller(Some(5)), "send", &json!({"pane": 9})).is_err());
         assert!(check_scope(&m, Caller(Some(5)), "read", &json!({"pane": 9})).is_ok());

@@ -78,9 +78,17 @@ shared by every OS user) and `~/.duck/extensions/<name>` (personal; same name wi
 Bundled extensions start disabled except the ones enabled in the config
 (`extensions = { github = { enabled = true } }`), so idle ones cost no memory.
 
-`command` runs with the extension folder as the working directory. Duck starts
-every installed extension when the window opens and the process ends when its
-stdin closes (the SDK handles that).
+`command` runs with the extension folder as the working directory. Extensions
+run inside the Duck server (`duckw server`), not the window: they start with the
+server, keep running while the window is closed, and end when its stdin closes
+(the SDK handles that). Each OS user has their own server, so extensions run as
+that user, with their config, secrets and logins. A window that opens receives
+the current views and status items from the server.
+
+With no window open, `notify` becomes a Windows toast (its buttons still reach
+the extension) and `open-pane` opens a background tab, so a polling extension can
+work on its own while Duck is running. Errors written to stderr go to
+`%LOCALAPPDATA%\duck\ext-host.log`.
 
 Settings come from `~/.duck.lua` and are passed in `init`:
 
@@ -147,7 +155,9 @@ run({
 ```
 
 Build with `tsc`, copy `duck-extension.json` and `dist/` to
-`~/.duck/extensions/hello/` and reopen the Duck window.
+`~/.duck/extensions/hello/` and enable it in the extensions menu (turning it
+off and on reloads it after a change). Reopening the window is not enough, since
+extensions live in the server.
 
 ## Design notes
 

@@ -1,18 +1,12 @@
-//! Extensoes: programas separados (qualquer linguagem; o SDK oficial e em
-//! TypeScript) que conversam com o Duck por JSON, uma mensagem por linha, no
-//! stdin/stdout. A extensao descreve dados (listas, detalhes, avisos) e o Duck
-//! desenha tudo no proprio visual. Protocolo: docs/EXTENSIONS.md.
-//!
-//! Descoberta: ~/.duck/extensions/<nome>/duck-extension.json
-//!   { "name": "github", "title": "GitHub", "icon": "github",
-//!     "command": ["node", "dist/index.js"] }
-//! Config opcional em ~/.duck.lua: extensions = { github = { enabled = true, ... } }
-//! (a tabela inteira vai para a extensao no "init").
+//! Extensoes na janela: so o desenho. Os processos rodam no server
+//! (src/ext.rs) e continuam com a janela fechada; as mensagens chegam pelo
+//! `subscribe` ({"t":"ext"}) e as acoes voltam pelo comando `ext-send`.
+//! Protocolo: docs/EXTENSIONS.md.
 
 use super::*;
 use super::ui::{inside, mt, uit};
 use crate::render::Shape;
-use std::io::{BufRead, Write as _};
+pub(super) use crate::ext::{catalog, ExtInfo};
 
 #[derive(Deserialize, Clone, Default)]
 pub(super) struct ExtAction { pub id: String, pub title: String, #[serde(default)] pub primary: bool }
@@ -47,46 +41,13 @@ impl ExtView { pub fn key(&self) -> String { format!("{}/{}", self.ext, self.id)
 #[derive(Clone, Default)]
 pub(super) struct ExtStatus { pub ext: String, pub id: String, pub text: String, pub color: String, pub view: String }
 
-struct ExtProc {
-    name: String, stdin: Option<std::process::ChildStdin>, _child: Option<std::process::Child>,
-    /// Roda dentro do hospedeiro compartilhado (um Node para todas).
-    hosted: bool,
-    /// Nome curto no badge da barra (manifesto "short" ou "title").
-    pub label: String,
-    /// Segredos extras que o manifesto pede ("secrets": ["jira/trabalho"]); os "<nome>/..." sempre valem.
-    secrets: Vec<String>,
-    /// "context", "paste", "clipboard".
-    permissions: Vec<String>,
+/// Extensao rodando no server (a lista vem dele na mensagem "running").
+#[derive(Deserialize, Clone, Default)]
+struct Running {
+    name: String,
+    #[serde(default)] label: String,
+    #[serde(default)] permissions: Vec<String>,
 }
-
-/// Extensao encontrada no disco (ativa ou nao).
-#[derive(Clone)]
-pub(super) struct ExtInfo {
-    pub name: String, pub title: String, pub description: String, pub version: String, pub category: String,
-    pub dir: std::path::PathBuf, pub manifest: Value,
-    /// ~/.duck/extensions (do usuario) ou da instalacao (de todos).
-    pub personal: bool,
-    /// O comando existe (ex.: dist/index.js compilado).
-    pub built: bool,
-}
-
-/// Pastas de extensoes da instalacao: `<raiz>/extensions`, subindo a partir do executavel.
-fn shared_dirs() -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        let mut d = exe.parent().map(|p| p.to_path_buf());
-        for _ in 0..4 {
-            let Some(cur) = d else { break };
-            // <raiz>/extensions (Windows, repo) ou <prefixo>/share/duck/extensions (Linux/mac: ~/.local/bin/duck).
-            let found = [cur.join("extensions"), cur.join("share").join("duck").join("extensions")].into_iter().find(|c| c.is_dir() && *c != extensions_dir());
-            if let Some(c) = found { out.push(c); break; }
-            d = cur.parent().map(|p| p.to_path_buf());
-        }
-    }
-    out
-}
-
-fn label(i: &ExtInfo) -> String { i.manifest["short"].as_str().map(String::from).unwrap_or_else(|| i.title.clone()) }
 
 /// Texto de uma linha so: mensagens com quebra de linha (Rollbar) nao invadem a linha de baixo.
 fn one_line<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -94,90 +55,42 @@ fn one_line<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> 
     Ok(s.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-fn is_node(i: &ExtInfo) -> bool { i.manifest["command"][0].as_str().is_some_and(|c| c == "node") }
-
-/// sdk/host.js da instalacao (ou do ~/.duck/extensions/sdk).
-fn host_js() -> Option<std::path::PathBuf> {
-    shared_dirs().into_iter().chain([extensions_dir()]).map(|d| d.join("sdk").join("host.js")).find(|p| p.is_file())
-}
-
-/// Todas as extensoes: as da instalacao e as pessoais (mesmo nome: a pessoal vence).
-pub(super) fn catalog() -> Vec<ExtInfo> {
-    let mut out: Vec<ExtInfo> = Vec::new();
-    let mut roots: Vec<(std::path::PathBuf, bool)> = shared_dirs().into_iter().map(|d| (d, false)).collect();
-    roots.push((extensions_dir(), true));
-    for (root, personal) in roots {
-        for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
-            let dir = e.path();
-            let Ok(text) = std::fs::read_to_string(dir.join("duck-extension.json")) else { continue };
-            let Ok(man) = serde_json::from_str::<Value>(&text) else { continue };
-            let name = man["name"].as_str().unwrap_or("").to_string();
-            if name.is_empty() { continue; }
-            let s = |k: &str| man[k].as_str().unwrap_or("").to_string();
-            // Comando "node dist/index.js": compilada se o arquivo existir.
-            let built = man["command"].as_array().map(|c| c.iter().skip(1).filter_map(|v| v.as_str()).filter(|a| a.contains('.')).all(|a| dir.join(a).exists())).unwrap_or(false);
-            let info = ExtInfo { title: if s("title").is_empty() { name.clone() } else { s("title") }, description: s("description"), version: s("version"), category: s("category"), dir, manifest: man, personal, built, name };
-            out.retain(|x| x.name != info.name);
-            out.push(info);
-        }
-    }
-    for (name, title, desc, icon) in BUILTIN {
-        if out.iter().any(|x| x.name == *name) { continue; }
-        out.push(ExtInfo { name: name.to_string(), title: title.to_string(), description: desc.to_string(), version: env!("CARGO_PKG_VERSION").into(),
-            category: "Duck".into(), dir: std::path::PathBuf::new(), manifest: json!({"builtin": true, "icon": icon}), personal: true, built: true });
-    }
-    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-    out
-}
-
-/// Extensoes internas: badge na barra desenhado pelo proprio Duck (sem processo).
-pub(super) const BUILTIN: &[(&str, &str, &str, &str)] = &[
-    ("agents", "Agentes", "Agentes do Claude/Codex: bloqueados, trabalhando e prontos; abre o painel do agente", "\u{f06a9}"),
-    ("system", "Sistema", "CPU e RAM da maquina; abre o painel com nucleos, swap e processos", "\u{f4bc}"),
-];
-
 #[derive(Default)]
 pub(super) struct Exts {
-    procs: Vec<ExtProc>,
+    running: Vec<Running>,
     pub views: Vec<ExtView>,
     pub status: Vec<ExtStatus>,
     /// Comandos da paleta: (extensao, id, titulo).
     pub commands: Vec<(String, String, String)>,
-    inbox: Arc<Mutex<Vec<(String, Value)>>>,
-    /// Hospedeiro das extensoes em Node (sdk/host.js).
-    host: Option<(Option<std::process::ChildStdin>, std::process::Child)>,
-    /// Sobe a cada reinicio: o "exited" do hospedeiro antigo nao derruba o novo.
-    host_gen: u64,
+    /// Mensagens que chegaram do server: (extensao, mensagem).
+    pub inbox: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Conexao com o server (a mesma da janela).
+    pub conn: Arc<Mutex<Option<Conn>>>,
 }
 
 impl Exts {
     pub fn view(&self, key: &str) -> Option<&ExtView> { self.views.iter().find(|v| v.key() == key) }
 
-    /// Manda so se a extensao tem a permissao.
-    pub fn send_if(&mut self, ext: &str, perm: &str, msg: Value) {
-        if self.procs.iter().any(|p| p.name == ext && p.permissions.iter().any(|x| x == perm)) { self.send(ext, msg); }
-    }
-
-    /// Manda uma mensagem para a extensao (linha JSON).
     /// Nome curto da extensao para a barra.
-    pub fn label(&self, ext: &str) -> String { self.procs.iter().find(|p| p.name == ext).map(|p| p.label.clone()).unwrap_or_else(|| ext.to_string()) }
+    pub fn label(&self, ext: &str) -> String { self.running.iter().find(|p| p.name == ext).map(|p| p.label.clone()).unwrap_or_else(|| ext.to_string()) }
 
-    pub fn send(&mut self, ext: &str, msg: Value) {
-        let Some(p) = self.procs.iter_mut().find(|p| p.name == ext) else { return };
-        if p.hosted {
-            let mut m = msg;
-            m["ext"] = json!(ext);
-            if let Some((Some(s), _)) = self.host.as_mut() {
-                if writeln!(s, "{m}").and_then(|_| s.flush()).is_err() { self.host.as_mut().unwrap().0 = None; }
-            }
-            return;
-        }
-        let ok = p.stdin.as_mut().is_some_and(|s| writeln!(s, "{msg}").and_then(|_| s.flush()).is_ok());
-        if !ok { p.stdin = None; }
+    fn has_perm(&self, ext: &str, perm: &str) -> bool { self.running.iter().any(|p| p.name == ext && p.permissions.iter().any(|x| x == perm)) }
+
+    fn is_running(&self, ext: &str) -> bool { self.running.iter().any(|p| p.name == ext) }
+
+    fn call(&self, req: Value) {
+        if let Err(e) = with_conn(&self.conn, |c| c.call(req.clone())) { gui_log(&format!("extensoes: {e}")); }
     }
-}
 
-pub(super) fn extensions_dir() -> std::path::PathBuf { config::home().join(".duck").join("extensions") }
+    /// Manda uma mensagem para a extensao (pelo server).
+    pub fn send(&mut self, ext: &str, msg: Value) { self.call(json!({"cmd": "ext-send", "ext": ext, "msg": msg})); }
+
+    /// Manda so para as extensoes com a permissao (o server confere); ext "*" = todas.
+    pub fn send_perm(&mut self, ext: &str, perm: &str, msg: Value) { self.call(json!({"cmd": "ext-send", "ext": ext, "perm": perm, "msg": msg})); }
+
+    /// Reinicia no server com a config atual (ativar/desativar/ajuste); "" = todas.
+    pub fn restart(&mut self, ext: &str) { self.call(json!({"cmd": "ext-restart", "ext": ext})); }
+}
 
 /// Icones por nome (Nerd Font embutida); qualquer outro texto e usado como esta.
 pub(super) fn icon(name: &str) -> String {
@@ -200,76 +113,7 @@ impl Gui {
             .and_then(|v| self.lua.from_value(v).ok()).filter(|v: &Value| v.is_object()).unwrap_or(json!({}))
     }
 
-    /// Ativa: a pessoal (~/.duck/extensions) vale ate ser desligada; a da
-    /// instalacao so roda depois de ligada no menu (nao gasta memoria a toa).
-    pub(super) fn ext_enabled(&self, info: &ExtInfo, settings: &Value) -> bool {
-        match settings[&info.name]["enabled"].as_bool() { Some(b) => b, None => info.personal }
-    }
-
-    /// Sobe cada extensao ativa.
-    pub(super) fn start_extensions(&mut self) {
-        let settings = self.ext_settings();
-        let mut hosted = Vec::new();
-        for info in catalog() {
-            if !(self.ext_enabled(&info, &settings) && info.built) { continue; }
-            if is_node(&info) && host_js().is_some() { hosted.push(info); } else { self.start_one(&info, &settings); }
-        }
-        self.start_host(hosted, &settings);
-    }
-
-    /// Um Node so para todas as extensoes Node ativas.
-    fn start_host(&mut self, list: Vec<ExtInfo>, settings: &Value) {
-        if list.is_empty() { return; }
-        let Some(host) = host_js() else { return };
-        let arg = json!(list.iter().map(|i| json!({"name": i.name, "dir": i.dir.display().to_string(),
-            "main": i.manifest["command"][1].as_str().unwrap_or("dist/index.js")})).collect::<Vec<_>>()).to_string();
-        let log = std::fs::File::create(crate::proto::data_dir().join("ext-host.log")).ok();
-        let mut c = std::process::Command::new("node");
-        c.arg(&host).arg(arg).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
-            .stderr(log.map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null));
-        if let Some(d) = host.parent() { c.current_dir(d); }
-        #[cfg(windows)]
-        { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); }
-        let mut child = match c.spawn() {
-            Ok(ch) => ch,
-            Err(err) => { self.flash(&format!("Extensoes: o Node nao abriu ({err})")); return; }
-        };
-        let stdout = child.stdout.take().unwrap();
-        let members: Vec<String> = list.iter().map(|i| i.name.clone()).collect();
-        self.exts.host_gen += 1;
-        let host_gen = self.exts.host_gen;
-        let (inbox, proxy) = (self.exts.inbox.clone(), self.proxy.clone());
-        std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                let Some(n) = v["ext"].as_str().map(String::from) else { continue };
-                inbox.lock().unwrap().push((n, v));
-                if proxy.send_event(UserEv::Ext).is_err() { return; }
-            }
-            for n in members { inbox.lock().unwrap().push((n, json!({"type": "exited", "host_gen": host_gen}))); }
-            let _ = proxy.send_event(UserEv::Ext);
-        });
-        self.exts.host = Some((child.stdin.take(), child));
-        for info in &list {
-            let man = &info.manifest;
-            let lst = |k: &str| man[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>();
-            self.exts.procs.push(ExtProc { name: info.name.clone(), stdin: None, _child: None, hosted: true, label: label(info), secrets: lst("secrets"), permissions: lst("permissions") });
-            let init = json!({"type": "init", "settings": settings[&info.name], "duck": {"version": env!("CARGO_PKG_VERSION"), "os": std::env::consts::OS}});
-            self.exts.send(&info.name, init);
-            if let Some(c) = self.ext_context.clone() { self.exts.send_if(&info.name, "context", c); }
-        }
-    }
-
-    /// Reinicia o hospedeiro com as extensoes Node ativas agora.
-    fn restart_host(&mut self) {
-        let hosted: Vec<String> = self.exts.procs.iter().filter(|p| p.hosted).map(|p| p.name.clone()).collect();
-        for n in &hosted { self.clear_ext(n); }
-        self.exts.procs.retain(|p| !p.hosted);
-        if let Some((stdin, mut child)) = self.exts.host.take() { drop(stdin); let _ = child.kill(); }
-        let settings = self.ext_settings();
-        let list: Vec<ExtInfo> = catalog().into_iter().filter(|i| is_node(i) && i.built && self.ext_enabled(i, &settings)).collect();
-        self.start_host(list, &settings);
-    }
+    pub(super) fn ext_enabled(&self, info: &ExtInfo, settings: &Value) -> bool { crate::ext::enabled(info, settings) }
 
     fn clear_ext(&mut self, name: &str) {
         self.exts.views.retain(|v| v.ext != name);
@@ -278,72 +122,10 @@ impl Gui {
         if self.ext_panel.as_deref().is_some_and(|k| k.starts_with(&format!("{name}/"))) { self.ext_panel = None; self.send_size(); }
     }
 
-    pub(super) fn start_one(&mut self, info: &ExtInfo, settings: &Value) {
-        let name = info.name.clone();
-        if self.exts.procs.iter().any(|p| p.name == name) { return; }
-        let man = &info.manifest;
-        let cmd: Vec<String> = man["command"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
-        let Some(prog) = cmd.first() else { return };
-        let log = std::fs::File::create(crate::proto::data_dir().join(format!("ext-{name}.log"))).ok();
-        let mut c = std::process::Command::new(prog);
-        c.args(&cmd[1..]).current_dir(&info.dir).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
-            .stderr(log.map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null));
-        #[cfg(windows)]
-        { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); }
-        let mut child = match c.spawn() {
-            Ok(ch) => ch,
-            Err(err) => { self.flash(&format!("Extensao {name}: nao abriu ({prog}: {err})")); return; }
-        };
-        let stdout = child.stdout.take().unwrap();
-        let (inbox, proxy, n) = (self.exts.inbox.clone(), self.proxy.clone(), name.clone());
-        std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                inbox.lock().unwrap().push((n.clone(), v));
-                if proxy.send_event(UserEv::Ext).is_err() { return; }
-            }
-            inbox.lock().unwrap().push((n.clone(), json!({"type": "exited"})));
-            let _ = proxy.send_event(UserEv::Ext);
-        });
-        let list = |k: &str| man[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>();
-        self.exts.procs.push(ExtProc { name: name.clone(), stdin: child.stdin.take(), _child: Some(child), hosted: false, label: label(info), secrets: list("secrets"), permissions: list("permissions") });
-        let init = json!({"type": "init", "settings": settings[&name], "duck": {"version": env!("CARGO_PKG_VERSION"), "os": std::env::consts::OS}});
-        self.exts.send(&name, init);
-        if let Some(c) = self.ext_context.clone() { self.exts.send_if(&name, "context", c); }
-    }
-
-    /// Encerra a extensao e tira tudo o que ela pos na tela.
-    pub(super) fn stop_one(&mut self, name: &str) {
-        if let Some(i) = self.exts.procs.iter().position(|p| p.name == name) {
-            if self.exts.procs[i].hosted {
-                // Dentro do hospedeiro: reinicia o hospedeiro sem ela (a config ja diz "desativada").
-                self.load_config();
-                self.restart_host();
-                return;
-            }
-            let mut p = self.exts.procs.remove(i);
-            drop(p.stdin.take());
-            if let Some(mut c) = p._child.take() { let _ = c.kill(); }
-        }
-        self.clear_ext(name);
-    }
-
+    /// Para, sobe ou reinicia no server conforme a config (ja gravada).
     pub(super) fn restart_one(&mut self, name: &str) {
-        // Config recarregada antes: as mudancas do menu entram no init.
         self.load_config();
-        let settings = self.ext_settings();
-        let Some(info) = catalog().into_iter().find(|i| i.name == name) else { return };
-        if is_node(&info) && host_js().is_some() {
-            // Some do processo proprio (se havia) e entra no hospedeiro.
-            if let Some(i) = self.exts.procs.iter().position(|p| p.name == name && !p.hosted) {
-                let mut p = self.exts.procs.remove(i);
-                if let Some(mut c) = p._child.take() { let _ = c.kill(); }
-            }
-            self.restart_host();
-            return;
-        }
-        self.stop_one(name);
-        if self.ext_enabled(&info, &settings) && info.built { self.start_one(&info, &settings); }
+        self.exts.restart(name);
     }
 
     /// Pane ativo mudou: avisa as extensoes com permissao "context".
@@ -352,14 +134,12 @@ impl Gui {
         let ctx = json!({"type": "context", "cwd": p.cwd, "pane": p.id, "domain": p.domain, "title": p.title});
         if self.ext_context.as_ref() == Some(&ctx) { return; }
         self.ext_context = Some(ctx.clone());
-        let names: Vec<String> = self.exts.procs.iter().map(|p| p.name.clone()).collect();
-        for n in names { self.exts.send_if(&n, "context", ctx.clone()); }
+        self.exts.send_perm("*", "context", ctx);
     }
 
     /// Texto copiado no Duck: para as extensoes com permissao "clipboard".
     pub(super) fn ext_clipboard(&mut self, text: &str) {
-        let names: Vec<String> = self.exts.procs.iter().map(|p| p.name.clone()).collect();
-        for n in names { self.exts.send_if(&n, "clipboard", json!({"type": "clipboard", "text": text})); }
+        self.exts.send_perm("*", "clipboard", json!({"type": "clipboard", "text": text}));
     }
 
     /// Mensagens que chegaram das extensoes.
@@ -438,20 +218,12 @@ impl Gui {
             "flash" => self.flash(&s("text")),
             "paste" => {
                 // Cola no pane ativo; texto de varias linhas ou perigoso passa pela confirmacao.
-                if !self.exts.procs.iter().any(|p| p.name == ext && p.permissions.iter().any(|x| x == "paste")) {
+                if !self.exts.has_perm(ext, "paste") {
                     gui_log(&format!("extensao {ext} tentou colar sem a permissao paste"));
                     return;
                 }
                 self.paste(s("text"), false);
                 if m["enter"] == true && self.overlay.is_none() { self.send_keys("\r"); }
-            }
-            "secret" => {
-                // So os segredos da propria extensao (ou os que o manifesto declara).
-                let name = s("name");
-                let allowed = name.starts_with(&format!("{ext}/")) || self.exts.procs.iter().any(|p| p.name == ext && p.secrets.contains(&name));
-                let value = if allowed { crate::secret::get(&name) } else { None };
-                if !allowed { gui_log(&format!("extensao {ext} pediu o segredo {name} sem permissao")); }
-                self.exts.send(ext, json!({"type": "secret", "id": m["id"], "name": name, "value": value}));
             }
             "choose" => {
                 let id = s("id");
@@ -468,11 +240,18 @@ impl Gui {
                 if self.ext_panel.as_deref() != Some(key.as_str()) { self.ext_builtin("ext_view", &[json!(key)]); }
             }
             "exited" => {
-                if m["host_gen"].as_u64().is_some_and(|g| g != self.exts.host_gen) { return; } // hospedeiro antigo (reinicio nosso)
-                self.exts.procs.retain(|p| p.name != ext);
                 self.exts.status.retain(|x| x.ext != ext);
                 for v in self.exts.views.iter_mut().filter(|v| v.ext == ext) { v.loading = false; v.error = "a extensao encerrou (veja ext-<nome>.log)".into(); }
             }
+            // Do server: janela (re)conectada, extensoes rodando, extensao parada.
+            "reset" => {
+                self.exts.views.clear();
+                self.exts.status.clear();
+                self.exts.commands.clear();
+                if self.ext_panel.take().is_some() { self.send_size(); }
+            }
+            "running" => self.exts.running = serde_json::from_value(m["list"].clone()).unwrap_or_default(),
+            "removed" => self.clear_ext(ext),
             _ => {}
         }
     }
@@ -550,7 +329,7 @@ impl Gui {
     /// Ctrl+Shift+P -> "Extensoes": todas as extensoes, ativas ou nao.
     pub(super) fn open_ext_menu(&mut self) {
         let settings = self.ext_settings();
-        let running: Vec<String> = self.exts.procs.iter().map(|p| p.name.clone()).collect();
+        let running: Vec<String> = self.exts.running.iter().map(|p| p.name.clone()).collect();
         let items: Vec<Item> = catalog().into_iter().map(|i| {
             let on = self.ext_enabled(&i, &settings);
             let state = if !i.built { "nao compilada" } else if running.contains(&i.name) { "ativa" } else if on { "ativa (parada)" } else { "desativada" };
@@ -567,7 +346,7 @@ impl Gui {
         let settings = self.ext_settings();
         let cur = &settings[name];
         let on = self.ext_enabled(&info, &settings);
-        let running = self.exts.procs.iter().any(|p| p.name == name);
+        let running = self.exts.is_running(name);
         let man = &info.manifest;
         let mut items = vec![];
         if info.manifest["builtin"] == true {
@@ -637,7 +416,7 @@ impl Gui {
                 let n = s(0);
                 // Grava antes: no hospedeiro, parar = reiniciar com a config nova.
                 match set_local_setting(&format!("extensions.{n}.enabled"), if on { "true" } else { "false" }) {
-                    Ok(_) => { if on { self.restart_one(&n); } else { self.stop_one(&n); } self.flash(&format!("{n} {}", if on { "ativada" } else { "desativada" })); }
+                    Ok(_) => { self.restart_one(&n); self.flash(&format!("{n} {}", if on { "ativada" } else { "desativada" })); }
                     Err(e) => self.flash(&e),
                 }
             }

@@ -14,6 +14,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod ext;
 pub mod gui;
 pub mod plugins;
 pub mod proto;
