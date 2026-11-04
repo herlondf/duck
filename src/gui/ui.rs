@@ -1318,6 +1318,14 @@ impl Gui {
             modal.texts.push(uit((w - hw) / 2.0 + 12.0, h - ch - 11.0, help, theme.bg, 0.85));
         }
 
+        // ---- mapa dos agentes
+        // Com algo aberto por cima (detalhe, paleta), o mapa sai: na mesma
+        // camada o texto dele ficaria por cima do painel.
+        let no_overlay = self.overlay.is_none();
+        if let Some(g) = self.graph.as_mut().filter(|_| no_overlay) {
+            super::graph::draw_graph(g, r, &mut modal, &mut self.hits, &theme, canvas, w, h, ch, rad);
+        }
+
         // ---- overlay (paleta, seletores, prompts, dialogos, previa, slider)
         if let Some(o) = &self.overlay {
             draw_overlay(r, &mut modal, &mut self.hits, o, &theme, mouse, w, h, chrome.top);
@@ -1870,6 +1878,7 @@ impl Gui {
                     self.overlay_enter(o);
                 }
             }
+            "graph_pick" => self.graph_pick(n(0) as usize),
             "grid_pick" => {
                 if let Some(id) = self.grid.as_ref().and_then(|g| g.panes.get(n(0) as usize)).map(|p| p.0) {
                     self.grid = None;

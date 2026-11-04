@@ -57,6 +57,8 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
 | `Ctrl+Alt+B` | Abas na lateral / recolher a lateral |
 | `Alt+↑↓` / `Alt+Enter` | Autocompletar: escolher / aceitar |
 | `Ctrl+Shift+A` | Agent Manager: todos os agentes em grade, ao vivo |
+| `Ctrl+Shift+U` | Mapa dos agentes: agentes, panes filhos e subagentes em árvore |
+| `Ctrl+Shift+J` | Caixa de entrada: o que espera você e os avisos que passaram |
 | `Ctrl+Shift+N` | Novo agente (perfis; opção "em worktree nova") |
 | `Ctrl+Shift+E` | Corrigir com agente o último comando que falhou (ou clique na faixa vermelha) |
 | `Ctrl+Shift+M` | Recado para o agente, entregue quando ele parar |
@@ -136,7 +138,29 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
 - **Agente em worktree:** `Ctrl+Shift+N` → "em worktree nova". O Duck cria
   `<repo>-<branch>` com a branch nova e abre o agente lá numa aba `⎇ branch`.
   Ao terminar, use a paleta → "Git: finalizar worktree" para ver o diff,
-  mesclar na branch base ou remover a worktree.
+  mesclar na branch base ou remover a worktree. Cada worktree ganha uma porta
+  própria em `DUCK_PORT` (4100, 4110...), para dois servidores de
+  desenvolvimento não brigarem. Um `.duck-worktree.json` na raiz do repo
+  prepara a cópia:
+  `{"copy": [".env"], "env": {"PORT": "{port}"}, "setup": "npm ci", "teardown": "docker compose down"}`
+  (`copy` traz arquivos fora do git; `teardown` roda antes de remover).
+- **Loop até passar:** paleta → "Loop: o agente trabalha até a verificação
+  passar". Informe o comando que verifica (`cargo test`, `npm run build`;
+  termine com `x8` para 8 voltas, o padrão é 5) e, se quiser, o pedido. Quando
+  o agente para, o Duck roda a verificação na pasta do pane (pwsh, ou bash na
+  distro do WSL). Falhou: o fim da saída volta para o agente como recado.
+  Passou ou acabaram as voltas: aviso e registro na caixa de entrada. A aba
+  mostra `⟳ 2/5`, `✓ 3/5` ou `✗ 5/5`. Quem decide que acabou é o comando, não
+  o agente. Pela CLI: `duck cli loop-start --pane N --check "cargo test" --max 5 --task "..."`,
+  `duck cli loops`, `duck cli loop-stop --pane N`.
+- **Mapa dos agentes (`Ctrl+Shift+U`):** a orquestração como árvore. Cada
+  agente, os panes que ele abriu pela API e os subagentes da sessão do Claude
+  Code (lidos de `subagents/*.meta.json`), com estado ao vivo, plano e loop.
+  Enter foca o pane; num subagente, mostra o pedido e a última resposta.
+- **Caixa de entrada (`Ctrl+Shift+J` ou o sino da barra):** primeiro os
+  agentes esperando aprovação, depois os últimos 60 avisos (extensões,
+  agentes, loops), inclusive os que chegaram com a janela fechada. O número no
+  sino são os não lidos (vermelho quando um agente espera).
 - **Agent Manager (`Ctrl+Shift+A`):** grade com a tela de cada agente
   atualizando sozinha. Setas navegam, Enter foca, Ctrl+Y aprova, Ctrl+N nega
   e M deixa recado.

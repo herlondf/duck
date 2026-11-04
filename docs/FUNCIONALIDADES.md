@@ -275,6 +275,24 @@ Navegação e paleta
 Extras desta rodada: `duck cli restart-server` (atualiza sem perder shells),
 `duck cli gui-action`, `duck url` (botões dos toasts).
 
+## Fase 10 — Orquestração e desempenho (04/11/2026)
+
+Conferido numa instância isolada (servidor e janela de teste, prints) salvo onde indicado.
+
+Orquestração
+- [x] Loop com verificador: o agente trabalha, o Duck roda a verificação quando ele para, a falha volta como recado, até passar ou acabar as voltas (`loop-start`, `loops`, `loop-stop`; aba `⟳ 2/5`)
+- [x] Mapa dos agentes (`Ctrl+Shift+U`): agentes, panes filhos e subagentes do Claude Code em árvore, ao vivo
+- [x] Caixa de entrada (`Ctrl+Shift+J`, sino na barra): agentes esperando e os últimos 60 avisos, inclusive com a janela fechada
+- [x] Worktree com porta própria (`DUCK_PORT`) e `.duck-worktree.json` (copiar, env, setup, teardown) — teste unitário; não rodei num repo real
+- [x] Rotinas adiam quando o limite de 5h do perfil passou de `uso_max` (85%) ou quando um agente seu trabalha no mesmo repositório (`ceder`) — compilado; o adiamento não foi provocado de verdade
+- [x] `duck.agents()` no SDK (permissão `agents`)
+- [~] Sessões do Claude no WSL no painel de sessões (só distros rodando; cache de 60 s) — a pasta foi lida; não retomei uma sessão por ali
+
+Desempenho
+- [x] Varredura de processos dos agentes pulada sem saída nova nem pane novo (uma por minuto no máximo)
+- [x] Janela minimizada solta textos, atlas de glifos e alvo do shader e devolve a memória: working set de 169 MB para 14 MB. A memória reservada pelo driver não muda
+- [x] Minimizar não encolhe mais os terminais para 2x2 (o Windows manda 160x28; antes tudo requebrava)
+
 ## Próximos passos sugeridos
 
 1. Rodar `install.ps1 -ClaudeHooks -Boot` e usar no dia a dia junto com o WezTerm.

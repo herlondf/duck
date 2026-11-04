@@ -343,6 +343,8 @@ pub struct Mux {
     event_seq: u64,
     /// Central de avisos: o que apareceu (extensoes, agentes), lido ou nao.
     inbox: Inbox,
+    /// Loops "ate passar": pane do agente -> verificacao e voltas.
+    loops: HashMap<Id, LoopRun>,
     approvals: Vec<Approval>,
     approval_seq: u64,
     secrets: Vec<regex::Regex>,
@@ -910,6 +912,143 @@ fn scrub(m: &Mux, text: String) -> String {
 #[derive(Default)]
 struct Inbox { items: Vec<Value>, seq: u64, read: u64 }
 
+/// Loop com verificador: o agente trabalha, para, o Duck roda a verificacao
+/// (testes, build); falhou, a saida volta para o agente; passou ou acabaram
+/// as voltas, o loop termina com aviso. Quem decide que acabou e o comando,
+/// nao o agente.
+#[derive(Clone, serde::Serialize)]
+struct LoopRun {
+    pane: Id,
+    check: String,
+    max: u32,
+    /// Verificacoes feitas.
+    iter: u32,
+    /// "agent" (esperando o agente parar), "check" (rodando a verificacao),
+    /// "passed", "failed", "stopped".
+    phase: String,
+    /// Quando o ultimo pedido foi entregue (o agente precisa parar depois disso).
+    sent_at: u64,
+    started: u64,
+    last_exit: Option<i32>,
+    last_out: String,
+}
+
+impl LoopRun {
+    fn label(&self) -> String {
+        match self.phase.as_str() {
+            "passed" => format!("✓ {}/{}", self.iter, self.max),
+            "failed" | "stopped" => format!("✗ {}/{}", self.iter, self.max),
+            _ => format!("⟳ {}/{}", self.iter + 1, self.max),
+        }
+    }
+    fn active(&self) -> bool { self.phase == "agent" || self.phase == "check" }
+}
+
+/// Roda a verificacao na pasta do pane (pwsh, ou bash dentro da distro do
+/// WSL): exit code e o fim da saida, sem cores.
+fn run_check(check: &str, cwd: &str, domain_cmd: &[String]) -> (i32, String) {
+    let wsl = domain_cmd.first().is_some_and(|c| c.to_lowercase().contains("wsl"));
+    let mut c = if wsl {
+        let mut c = std::process::Command::new(&domain_cmd[0]);
+        if let Some(i) = domain_cmd.iter().position(|a| a == "-d" || a == "--distribution") {
+            if let Some(d) = domain_cmd.get(i + 1) { c.args(["-d", d]); }
+        }
+        c.args(["--cd", cwd, "--", "bash", "-lc", check]);
+        c
+    } else {
+        let mut c = std::process::Command::new("pwsh");
+        c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", check]);
+        if std::path::Path::new(cwd).is_dir() { c.current_dir(cwd); }
+        c
+    };
+    c.stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); }
+    for k in ["CLAUDECODE", "NO_COLOR"] { c.env_remove(k); }
+    c.env("CI", "1");
+    let out = match c.output() { Ok(o) => o, Err(e) => return (-1, format!("nao rodou: {e}")) };
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07").unwrap();
+    let text = ansi.replace_all(&text, "").replace('\r', "");
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines[lines.len().saturating_sub(60)..].join("\n");
+    (out.status.code().unwrap_or(-1), tail)
+}
+
+/// Fim de um loop: aviso na caixa de entrada e, sem janela, no canto da tela.
+fn loop_finished(m: &mut Mux, l: &LoopRun) {
+    let tab = m.workspaces.iter().flat_map(|w| w.tabs.iter()).find(|t| t.all().contains(&l.pane))
+        .map(|t| if t.title.is_empty() { m.panes.get(&l.pane).map(|p| p.title.clone()).unwrap_or_default() } else { t.title.clone() }).unwrap_or_default();
+    let (title, color) = match l.phase.as_str() {
+        "passed" => (format!("Loop passou em {} volta(s)", l.iter), "done"),
+        "stopped" => ("Loop parado".to_string(), "muted"),
+        _ => (format!("Loop desistiu depois de {} volta(s)", l.iter), "blocked"),
+    };
+    let body = format!("{} · {}", l.check, tab.trim_start_matches(|c: char| !c.is_alphanumeric()));
+    m.inbox.push(json!({"kind": "agent", "pane": l.pane, "title": title, "body": body, "color": color}));
+    m.event_seq += 1;
+    let ev = json!({"event": "loop", "pane": l.pane, "phase": l.phase, "iter": l.iter, "max": l.max, "check": l.check});
+    m.events.push((m.event_seq, ev));
+    if m.events.len() > 64 { m.events.remove(0); }
+    if m.subs == 0 && l.phase != "stopped" {
+        crate::gui::toast_card(&title, &body, &[("Abrir".into(), format!("duck://focus/{}", l.pane))], Some(color));
+    }
+}
+
+/// Uma passada dos loops (thread dos agentes, a cada 2 s): agente parado
+/// depois do ultimo pedido -> roda a verificacao numa thread.
+fn loops_tick(srv: &Arc<Server>) {
+    let mut m = srv.lock();
+    if m.loops.is_empty() { return; }
+    let ids: Vec<Id> = m.loops.keys().copied().collect();
+    for id in ids {
+        let Some(p) = m.panes.get(&id) else {
+            let mut l = m.loops.remove(&id).unwrap();
+            if l.active() { l.phase = "stopped".into(); loop_finished(&mut m, &l); }
+            continue;
+        };
+        let l = &m.loops[&id];
+        if l.phase != "agent" { continue; }
+        // Parado de verdade: done/idle depois do pedido e sem saida ha 3 s.
+        let stopped = p.agent.as_ref().is_some_and(|a| (a.state == "done" || a.state == "idle") && a.since >= l.sent_at)
+            && p.last_output.elapsed() >= Duration::from_secs(3);
+        if !stopped { continue; }
+        let (check, cwd) = (l.check.clone(), p.cwd.clone());
+        let domain_cmd = m.cfg.domains.iter().find(|d| d.name == p.domain).map(|d| d.cmd.clone()).unwrap_or_default();
+        m.loops.get_mut(&id).unwrap().phase = "check".into();
+        let srv = srv.clone();
+        std::thread::spawn(move || {
+            let (code, out) = run_check(&check, &cwd, &domain_cmd);
+            let mut m = srv.lock();
+            let shown = scrub(&m, out.clone());
+            let Some(l) = m.loops.get_mut(&id) else { return };
+            if l.phase != "check" { return; } // parado no meio
+            l.iter += 1;
+            l.last_exit = Some(code);
+            l.last_out = out.clone();
+            if code == 0 {
+                l.phase = "passed".into();
+            } else if l.iter >= l.max {
+                l.phase = "failed".into();
+            } else {
+                l.phase = "agent".into();
+                l.sent_at = now_secs();
+                let msg = format!("[Loop do Duck, volta {}/{}] A verificação `{}` falhou (exit {code}). Corrija a causa e rode a verificação você mesmo antes de parar.\n\nFim da saída:\n{}",
+                    l.iter + 1, l.max, l.check, shown);
+                if let Some(p) = m.panes.get_mut(&id) {
+                    if p.agent.as_ref().is_some_and(|a| a.state == "done" || a.state == "idle") { deliver(p, &msg); } else { p.queue.push(msg); }
+                }
+            }
+            let l = m.loops[&id].clone();
+            if !l.active() { loop_finished(&mut m, &l); }
+            drop(m);
+            srv.notify();
+        });
+    }
+    drop(m);
+}
+
 impl Inbox {
     /// Guarda um aviso (os 60 ultimos). `v` tem title, body, color e o que
     /// for preciso para agir depois (ext + item + actions, ou pane).
@@ -1212,6 +1351,7 @@ fn agent_loop(srv: Arc<Server>) {
         }
         drop(m);
         if changed { srv.notify(); }
+        loops_tick(&srv);
     }
 }
 
@@ -1404,6 +1544,7 @@ fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> 
             // Progresso do plano de qualquer agente da aba (nao so do pane ativo).
             "todo": t.all().iter().filter_map(|id| m.panes.get(id)?.agent.as_ref()).find_map(|a| Some([a.todo_done?, a.todo_total?])),
             "pane": t.active, "progress": progress,
+            "loop": t.all().iter().find_map(|id| m.loops.get(id)).map(|l| l.label()).unwrap_or_default(),
             "agent": agent.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
             "profile": agent.as_ref().and_then(|a| a.config_dir.as_deref()).map(profile_name).unwrap_or_default(),
         })
@@ -1613,6 +1754,7 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
                         "agent": p.agent, "attention": p.attention, "parent": p.parent,
                         "floating": t.floating == Some(*id), "private": p.private,
                         "idle_secs": p.last_output.elapsed().as_secs(),
+                        "loop": m.loops.get(id).map(|l| l.label()),
                     }))).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
             })).collect();
@@ -2105,6 +2247,37 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             m.events.push((seq, json!({"event": "gui-action", "name": arg_str(a, "name").unwrap_or(""), "args": a.get("args").cloned().unwrap_or(json!([]))})));
             if m.events.len() > 64 { m.events.remove(0); }
             proto::ok(json!({}))
+        }
+        // Loop com verificador no pane do agente.
+        "loop-start" => {
+            let id = target(srv, m, a)?;
+            let check = arg_str(a, "check").map(str::trim).filter(|c| !c.is_empty()).ok_or("falta check (o comando que verifica, ex.: cargo test)")?.to_string();
+            let max = a.get("max").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(5).clamp(1, 50) as u32;
+            let task = arg_str(a, "task").unwrap_or("").trim().to_string();
+            let p = m.panes.get_mut(&id).ok_or("pane nao existe")?;
+            if p.agent.is_none() { return Err("o pane nao tem agente".into()); }
+            let now = now_secs();
+            // Sem tarefa: verifica ja (o agente esta parado; se nao estiver, espera ele parar).
+            let mut l = LoopRun { pane: id, check: check.clone(), max, iter: 0, phase: "agent".into(), sent_at: 0, started: now, last_exit: None, last_out: String::new() };
+            if !task.is_empty() {
+                let msg = format!("{task}\n\n[Loop do Duck] Quando você parar, o Duck roda `{check}`; se falhar, a saída volta para você (até {max} voltas). Rode a verificação antes de parar.");
+                if p.agent.as_ref().is_some_and(|a| a.state == "done" || a.state == "idle") { deliver(p, &msg); } else { p.queue.push(msg); }
+                l.sent_at = now;
+            }
+            m.loops.insert(id, l);
+            srv.notify();
+            proto::ok(json!({"pane": id, "max": max}))
+        }
+        "loop-stop" => {
+            let id = target(srv, m, a)?;
+            let Some(mut l) = m.loops.remove(&id) else { return Err("sem loop neste pane".into()) };
+            if l.active() { l.phase = "stopped".into(); loop_finished(m, &l); }
+            srv.notify();
+            proto::ok(json!({}))
+        }
+        "loops" => {
+            let list: Vec<&LoopRun> = m.loops.values().collect();
+            proto::ok(json!({"loops": list}))
         }
         // Central de avisos: lista (mais novo primeiro), marcar como lidos, limpar.
         "inbox" => {
@@ -2826,7 +2999,7 @@ pub fn run() {
     let srv = Arc::new(Server {
         mux: Mutex::new(Mux {
             panes: HashMap::new(), workspaces: Vec::new(), next: 1, size: (100, 30),
-            clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0, inbox: Inbox::default(),
+            clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0, inbox: Inbox::default(), loops: HashMap::new(),
             approvals: Vec::new(), approval_seq: 0, secrets, recovered: 0, resurrect: false, light: false,
             history: load_history(), budget_warned: false, ext: Default::default(), subs: 0,
         }),
@@ -2852,6 +3025,17 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loop_label_and_check() {
+        let mut l = LoopRun { pane: 1, check: "x".into(), max: 5, iter: 0, phase: "agent".into(), sent_at: 0, started: 0, last_exit: None, last_out: String::new() };
+        assert_eq!(l.label(), "⟳ 1/5");
+        l.iter = 2; l.phase = "passed".into();
+        assert_eq!(l.label(), "✓ 2/5");
+        assert!(!l.active());
+        let (code, out) = run_check("Write-Output ok; exit 3", ".", &[]);
+        assert_eq!((code, out.trim()), (3, "ok"));
+    }
 
     #[test]
     fn layout_split_remove_adjust() {
@@ -2937,7 +3121,7 @@ mod tests {
         let m = Mux {
             panes: HashMap::new(), workspaces: vec![], next: 1, size: (10, 10), clients: HashMap::new(),
             cfg: config::parse(&t),
-            clipboard: (0, String::new()), events: vec![], event_seq: 0, inbox: Inbox::default(), approvals: vec![], approval_seq: 0,
+            clipboard: (0, String::new()), events: vec![], event_seq: 0, inbox: Inbox::default(), loops: HashMap::new(), approvals: vec![], approval_seq: 0,
             secrets: vec![], recovered: 0, resurrect: false, light: false, history: vec![], budget_warned: false, ext: Default::default(), subs: 0,
         };
         assert!(check_scope(&m, Caller(Some(5)), "send", &json!({"pane": 9})).is_err());

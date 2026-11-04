@@ -25,6 +25,7 @@ use crate::proto::Conn;
 use crate::render::{lin, Layer, Quad, Renderer, TextItem};
 
 mod ext;
+mod graph;
 mod ui;
 use ui::{Ac, AgentPanel, Card, Composer, Hit};
 
@@ -39,6 +40,8 @@ struct TabInfo {
     #[serde(default)] pane: u64,
     #[serde(default)] progress: Option<(u8, u8)>,
     #[serde(default)] profile: String,
+    /// Loop com verificador na aba: "⟳ 2/5", "✓ 3/5", "✗ 5/5".
+    #[serde(default, rename = "loop")] looping: String,
 }
 
 /// Trecho de texto: coluna, texto, fg, bg, flags e link OSC 8 opcional.
@@ -373,6 +376,7 @@ pub struct Gui {
     plugins: Vec<crate::plugins::Plugin>,
     /// Agent Manager em grade (Ctrl+Shift+A).
     grid: Option<Grid>,
+    graph: Option<graph::Graph>,
     /// Comentarios da revisao de codigo ainda nao enviados.
     review: Vec<String>,
     /// Historico para a sugestao inline (comandos, mais recente primeiro).
@@ -426,6 +430,8 @@ pub struct Gui {
     started: Instant,
     /// Ultimo toast por pane (no maximo um por minuto).
     toasted: HashMap<u64, Instant>,
+    /// Ultima verificacao usada num loop (sugerida no proximo).
+    last_loop_check: String,
     /// Apresentacao ao abrir a janela (o pato).
     splash: Option<Instant>,
     /// Painel lateral do sistema (clique em CPU/RAM na barra).
@@ -459,14 +465,14 @@ impl Gui {
             clip_seq: 0, font_delta: 0.0, focused: true, message: None, origin: (0.0, 0.0),
             startup, light: false, bell_until: HashMap::new(), asked: HashSet::new(), shown_notices: HashSet::new(),
             last_draw: Instant::now(), redraw_at: None, quick, quick_visible: !quick, plugins: Vec::new(),
-            grid: None, review: Vec::new(), hist_cache: (Instant::now() - Duration::from_secs(60), Vec::new()), ghost: None,
+            grid: None, graph: None, review: Vec::new(), hist_cache: (Instant::now() - Duration::from_secs(60), Vec::new()), ghost: None,
             branches: HashMap::new(),
             hits: vec![], tab_rects: vec![], tab_row: (0.0, 0.0), sidebar_collapsed: false, focus_mode: false, agent_panel: None,
             cards: vec![], card_seq: 0, rect_anim: HashMap::new(), prev_rects: HashMap::new(), ghosts: vec![], anim_tab_key: String::new(),
             ws_anim: None, cursor_anim: None, cursor_shown: [0.0, 0.0], last_key: Instant::now(), tab_hover: None, tab_preview: None,
             tab_drag: None, badge_drag: None, badge_rects: vec![], ext_order: vec![], div_drag: None, title_click: Instant::now() - Duration::from_secs(5), resize_edge: None,
             collapsed: HashMap::new(), pinned: HashMap::new(), search_hits: None, composer: None, ac: None, ac_dismissed: String::new(),
-            usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
+            usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), last_loop_check: String::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
         };
         g.load_config();
         g
@@ -485,7 +491,7 @@ impl Gui {
         if let Some(e) = err { self.flash(&e); }
         self.keys = parse_bindings(&lua, t.get("keys").ok());
         // Atalhos novos com padrao (a config do usuario pode sobrescrever).
-        let defaults: [(&str, &str, &str, Vec<Value>); 25] = [
+        let defaults: [(&str, &str, &str, Vec<Value>); 26] = [
             ("w", "CTRL|SHIFT", "close_tab", vec![]),
             ("i", "CTRL|SHIFT", "agent_panel", vec![]),
             ("j", "CTRL|SHIFT", "inbox", vec![]),
@@ -496,6 +502,7 @@ impl Gui {
             ("home", "CTRL|SHIFT", "home", vec![]),
             ("e", "CTRL|SHIFT", "fix_with_agent", vec![]),
             ("a", "CTRL|SHIFT", "agent_grid", vec![]),
+            ("u", "CTRL|SHIFT", "agent_graph", vec![]),
             ("r", "CTRL|SHIFT", "history", vec![]),
             ("n", "CTRL|SHIFT", "agent_new", vec![]),
             ("m", "CTRL|SHIFT", "queue_message", vec![]),
@@ -750,6 +757,39 @@ impl Gui {
             "split" => self.cmd(json!({"cmd": "spawn", "where": if s(0).is_empty() { "right".into() } else { s(0) },
                 "pane": ap, "domain": args.get(1).cloned().unwrap_or(Value::Null)})),
             "new_tab" => self.cmd(json!({"cmd": "spawn", "where": "tab", "domain": args.first().cloned().unwrap_or(Value::Null)})),
+            "loop_prompt" => {
+                let ap = self.frame.active_pane;
+                let pane = if self.frame.panes.iter().any(|p| p.id == ap && !p.agent.is_empty()) { Some(ap) } else { self.agent_in_tab() };
+                let Some(pane) = pane else { return self.flash("Nenhum agente nesta aba para o loop") };
+                let last = self.last_loop_check.clone();
+                self.overlay = Some(Overlay::prompt("Loop: comando que verifica (ex.: cargo test; termine com x8 para 8 voltas, padrão 5)", &last, "loop_task", vec![json!(pane)]));
+            }
+            "loop_task" => {
+                let check = s(1).trim().to_string();
+                if check.is_empty() { return; }
+                self.last_loop_check = check.clone();
+                self.overlay = Some(Overlay::prompt("Loop: pedido para o agente (vazio = só verificar agora)", "", "loop_start", vec![args[0].clone(), json!(check)]));
+            }
+            "loop_start" => {
+                let mut check = s(1).trim().to_string();
+                let mut max = 5u64;
+                if let Some(c) = regex::Regex::new(r"\s+[x×](\d+)$").unwrap().captures(&check) {
+                    max = c[1].parse().unwrap_or(5);
+                    check.truncate(c.get(0).unwrap().start());
+                }
+                match self.call(json!({"cmd": "loop-start", "pane": n(0, 0), "check": check, "max": max, "task": s(2)})) {
+                    Ok(_) => self.flash(&format!("Loop ligado: `{check}` até passar (máximo {max} voltas)")),
+                    Err(e) => self.flash(&e),
+                }
+            }
+            "loop_stop" => {
+                let ap = self.frame.active_pane;
+                let pane = if self.frame.panes.iter().any(|p| p.id == ap && !p.agent.is_empty()) { Some(ap) } else { self.agent_in_tab() };
+                match self.call(json!({"cmd": "loop-stop", "pane": pane.unwrap_or(ap)})) {
+                    Ok(_) => self.flash("Loop parado"),
+                    Err(e) => self.flash(&e),
+                }
+            }
             "spawn" => {
                 // {where, cmd={...}|"linha", domain, cwd, title}; no protocolo o argv e "argv".
                 let mut req = json!({"cmd": "spawn", "pane": ap});
@@ -967,6 +1007,7 @@ impl Gui {
             "agent_worktree_go" => self.agent_worktree(n(0, 0) as usize, s(1)),
             "worktree_finish" => self.worktree_finish(),
             "agent_grid" => self.open_grid(),
+            "agent_graph" => self.open_graph(),
             "queue_message" => {
                 let target = args.first().and_then(|v| v.as_u64()).unwrap_or(ap);
                 self.overlay = Some(Overlay::prompt("Recado para o agente (entregue quando ele parar)", "", "queue_send", vec![json!(target)]));
@@ -1135,6 +1176,8 @@ impl Gui {
             b("Barra lateral de abas: recolher/abrir", "toggle_sidebar", vec![]),
             b("Agentes: painel lateral do agente (plano, tokens)", "agent_panel", vec![]),
             b("Caixa de entrada: o que espera você e os avisos que passaram", "inbox", vec![]),
+            b("Loop: o agente trabalha até a verificação passar (testes, build)", "loop_prompt", vec![]),
+            b("Loop: parar o loop do agente", "loop_stop", vec![]),
             b("Agentes: linha do tempo da sessao", "agent_timeline", vec![]),
             b("Editor de comando (varias linhas, Ctrl+Z)", "composer", vec![]),
             b("Galeria de temas (previa ao vivo)", "theme_gallery", vec![]),
@@ -1145,6 +1188,7 @@ impl Gui {
             b("Agentes: corrigir com agente o ultimo comando que falhou", "fix_with_agent", vec![]),
             b("Agentes: novo agente (perfis; opcao em worktree)", "agent_new", vec![]),
             b("Agentes: Agent Manager em grade", "agent_grid", vec![]),
+            b("Agentes: mapa da orquestração (agentes, panes filhos e subagentes)", "agent_graph", vec![]),
             b("Agentes: recado na fila (entregue quando o agente parar)", "queue_message", vec![]),
             b("Agentes: bifurcar a sessao do agente num pane novo", "fork_agent", vec![]),
             b("Agentes: revisar o diff e comentar para o agente", "review", vec![]),
@@ -1730,6 +1774,7 @@ impl Gui {
         self.last_key = Instant::now();
         if self.composer.is_some() && self.overlay.is_none() { return self.composer_key(&ev); }
         if self.grid.is_some() && self.overlay.is_none() { return self.grid_key(&ev); }
+        if self.graph.is_some() && self.overlay.is_none() { return self.graph_key(&ev); }
         if self.hints.is_some() { return self.hints_key(&ev); }
         if self.overlay.is_some() { return self.overlay_key(&ev); }
         if self.copy.is_some() { return self.copy_key(&ev); }
@@ -1944,6 +1989,7 @@ impl Gui {
             self.ext_context_tick();
         }
         if self.grid.is_some() { self.refresh_grid(); }
+        if self.graph.is_some() { self.refresh_graph(); }
         if self.agent_panel.is_some() { self.refresh_agent_panel(false); }
         for ev in events { self.on_event(ev); }
         self.redraw();
@@ -1959,6 +2005,15 @@ impl Gui {
         let pane = ev["pane"].as_u64().unwrap_or(0);
         let title = ev["title"].as_str().unwrap_or("").trim_start_matches(|c: char| !c.is_alphanumeric()).to_string();
         let what = if title.is_empty() { ev["cwd"].as_str().unwrap_or("").to_string() } else { title };
+        if name == "loop" {
+            let msg = match ev["phase"].as_str().unwrap_or("") {
+                "passed" => format!("Loop passou em {} volta(s): {}", ev["iter"], ev["check"].as_str().unwrap_or("")),
+                "stopped" => "Loop parado".to_string(),
+                _ => format!("Loop desistiu depois de {} volta(s): {}", ev["iter"], ev["check"].as_str().unwrap_or("")),
+            };
+            self.flash(&msg);
+            if !self.focused && ev["phase"] != "stopped" { toast_actions(&msg, "", &[("Abrir".into(), format!("duck://focus/{pane}"))]); }
+        }
         if name == "budget" { self.flash(&format!("Orcamento de tokens estourado: {} tokens", ev["tokens"])); }
         if name == "gui-action" {
             // --args '["right"]' (JSON) ou um texto so.
@@ -2076,7 +2131,8 @@ impl Gui {
             })).ok()?;
             f.call::<String>(arg).ok()
         }).unwrap_or_else(|| if t.title.is_empty() { t.pane_title.clone() } else { t.title.clone() });
-        title.chars().take(60).collect::<String>().trim().to_string()
+        let title = title.chars().take(60).collect::<String>().trim().to_string();
+        if t.looping.is_empty() { title } else { format!("{title} {}", t.looping) }
     }
 
     /// Cor da aba: manual > perfil do dominio > regra da config.
@@ -2694,6 +2750,7 @@ impl Gui {
             }
             UserEv::Tick => {
                 if self.grid.is_some() { self.refresh_grid(); }
+                if self.graph.is_some() { self.refresh_graph(); }
                 if self.agent_panel.is_some() { self.refresh_agent_panel(false); }
                 self.redraw()
             }
@@ -2721,12 +2778,17 @@ impl Gui {
         match ev {
             WindowEvent::CloseRequested => if self.quick { self.toggle_quick() } else { el.exit() },
             WindowEvent::Resized(s) => {
+                // Minimizada o Windows manda 160x28 (ou 0x0): os terminais nao
+                // encolhem (senao tudo requebra) e a memoria da GPU e solta.
+                let minimized = s.width == 0 || s.height == 0 || self.r.as_ref().is_some_and(|r| r.window.is_minimized() == Some(true));
                 if let Some(r) = self.r.as_mut() {
                     r.resize(s.width, s.height);
-                    if s.width == 0 || s.height == 0 { r.hibernate(); }
+                    if minimized { r.hibernate(); }
                 }
-                self.send_size();
-                self.save_geometry();
+                if !minimized {
+                    self.send_size();
+                    self.save_geometry();
+                }
             }
             WindowEvent::Moved(_) => self.save_geometry(),
             WindowEvent::CursorLeft { .. } => { self.tab_hover = None; self.resize_edge = None; self.redraw(); }
@@ -2779,6 +2841,13 @@ pub fn run(startup: Vec<Value>, quick: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_line_sets_port_env_and_setup() {
+        let wt: WorktreeCfg = serde_json::from_str(r#"{"setup": "npm ci", "env": {"PORT": "{port}", "BAD-KEY": "x", "NAME": "o'k"}}"#).unwrap();
+        assert_eq!(wt.command(4120, "claude"), "$env:DUCK_PORT='4120'; $env:NAME='o''k'; $env:PORT='4120'; npm ci; claude");
+        assert_eq!(WorktreeCfg::default().command(4100, "claude"), "$env:DUCK_PORT='4100'; claude");
+    }
 
     #[test]
     fn fuzzy_ignora_acento() {

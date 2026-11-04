@@ -71,7 +71,9 @@ enable/disable, configure and add accounts without editing Lua by hand:
     whenever the active pane changes (to act on the pane's folder/repository);
   - `paste`: may send `{"type":"paste","text","enter"}` to paste into the active pane
     (multi-line or dangerous text still goes through Duck's confirmation);
-  - `clipboard`: receives `{"type":"clipboard","text"}` when the user copies inside Duck.
+  - `clipboard`: receives `{"type":"clipboard","text"}` when the user copies inside Duck;
+  - `agents`: may ask for the open agent panes with `duck.agents()` (pane, tab,
+    folder, state `working`/`blocked`/`done`/`idle`, session). Private panes are left out.
 
 Extensions live in two places: `<duck>/extensions/<name>` (next to the installation,
 shared by every OS user) and `~/.duck/extensions/<name>` (personal; same name wins).
