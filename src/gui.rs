@@ -2222,7 +2222,17 @@ fn open_url(url: &str) {
 pub fn toast(title: &str, msg: &str) { toast_actions(title, msg, &[]) }
 
 /// Toast com botoes: cada botao abre uma URL duck:// (duck url ...).
-pub fn toast_actions(title: &str, msg: &str, actions: &[(String, String)]) {
+pub fn toast_actions(title: &str, msg: &str, actions: &[(String, String)]) { toast_card(title, msg, actions, None) }
+
+/// Aviso no canto da tela com o tema do Duck (cor da barra lateral opcional).
+/// Em tela cheia, ou sem o duckw, cai no toast nativo do Windows.
+pub fn toast_card(title: &str, msg: &str, actions: &[(String, String)], color: Option<&str>) {
+    let note = json!({"title": title, "body": msg, "color": color, "actions": actions.iter().map(|(l, u)| json!([l, u])).collect::<Vec<_>>()});
+    if crate::toast::show(&note) { return; }
+    native_toast(title, msg, actions)
+}
+
+fn native_toast(title: &str, msg: &str, actions: &[(String, String)]) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

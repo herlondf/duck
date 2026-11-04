@@ -194,7 +194,7 @@ impl Gui {
                 } else {
                     let enc = |x: &str| x.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
                     let urls = acts.iter().map(|(id, t)| (t.clone(), format!("duck://ext/{ext}/{}/{}", enc(id), enc(&item)))).collect::<Vec<_>>();
-                    toast_actions(&s("title"), &s("body"), &urls);
+                    crate::gui::toast_card(&s("title"), &s("body"), &urls, m["color"].as_str());
                 }
             }
             "detail" => {

@@ -85,8 +85,8 @@ server, keep running while the window is closed, and end when its stdin closes
 that user, with their config, secrets and logins. A window that opens receives
 the current views and status items from the server.
 
-With no window open, `notify` becomes a Windows toast (its buttons still reach
-the extension) and `open-pane` opens a background tab, so a polling extension can
+With no window open, `notify` shows as a Duck card in the corner of the screen,
+with the theme from the config (its buttons still reach the extension) and `open-pane` opens a background tab, so a polling extension can
 work on its own while Duck is running. Errors written to stderr go to
 `%LOCALAPPDATA%\duck\ext-host.log`.
 
@@ -116,7 +116,7 @@ extensions = {
 | `register` | `views: [{id, title, icon}]`, `commands: [{id, title}]` | views get a title-bar icon and a palette entry; commands go to the palette |
 | `view` | `id`, `sections: [{title, items}]`, `loading?`, `error?`, `title?` | content of a view (side panel) |
 | `status` | `id`, `text`, `color?`, `view?` | title-bar item; clicking opens `view`; empty `text` removes it |
-| `notify` | `title`, `body?`, `item?`, `actions?`, `color?`, `seconds?` | a card in Duck when the window is focused, otherwise a Windows toast with the same buttons |
+| `notify` | `title`, `body?`, `item?`, `actions?`, `color?`, `seconds?` | a card in Duck when the window is focused, otherwise the same card in the corner of the screen (Windows toast during full screen or presentations) |
 | `detail` | `title`, `subtitle?`, `body`, `item?`, `actions?` | floating panel with scrollable text and buttons (first button is the primary one) |
 | `prompt` | `id`, `title`, `value?` | asks for a line of text, answered with `input` |
 | `show-view` | `id` | opens one of your views in the side panel |

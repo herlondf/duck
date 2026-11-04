@@ -2687,14 +2687,14 @@ fn ext_incoming(srv: &Arc<Server>, ext: &str, msg: Value, gen: u64) {
     srv.notify();
 }
 
-/// Aviso de extensao como toast do Windows; os botoes voltam por duck://ext/...
+/// Aviso de extensao no canto da tela (cartao do Duck); os botoes voltam por duck://ext/...
 fn ext_toast(ext: &str, m: &Value) {
     let s = |k: &str| m[k].as_str().unwrap_or("").to_string();
     let enc = |x: &str| x.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
     let item = s("item");
     let urls: Vec<(String, String)> = m["actions"].as_array().into_iter().flatten()
         .map(|a| (a["title"].as_str().unwrap_or("").to_string(), format!("duck://ext/{ext}/{}/{}", enc(a["id"].as_str().unwrap_or("")), enc(&item)))).collect();
-    crate::gui::toast_actions(&s("title"), &s("body"), &urls);
+    crate::gui::toast_card(&s("title"), &s("body"), &urls, m["color"].as_str());
 }
 
 fn hash_v(v: &Value) -> u64 {
