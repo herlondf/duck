@@ -93,12 +93,11 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
 
 ## Visual (rodada de UI/UX)
 
-- **Barra de titulo propria:** inicio, abas em pilula, o sino da caixa de
-  entrada (fixo ao lado do minimizar, com o numero de nao lidos) e os botoes
-  da janela. Arraste a area vazia para mover; duplo clique maximiza; as
+- **Barra de titulo propria:** inicio, chip do workspace, abas em pilula, o
+  sino da caixa de entrada (fixo ao lado do minimizar, do mesmo tamanho, com
+  o numero de nao lidos) e os botoes da janela. Arraste a area vazia para mover; duplo clique maximiza; as
   bordas redimensionam.
-- **Rodape:** o workspace (clique troca), o status da config (funcao
-  `status`) e um badge por extensao (sistema, agentes, Azure, Jira...).
+- **Rodape:** o status da config (funcao `status`) e um badge por extensao (sistema, agentes, Azure, Jira...).
   Clique abre o painel; arrastar reordena. `ui = { footer = false }` esconde.
 - **Barra de atalhos:** abaixo do rodape, os atalhos principais com as teclas
   (clique tambem funciona). Troque a lista em `shortcuts` e esconda com

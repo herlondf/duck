@@ -298,7 +298,7 @@ Desempenho
 Conferido numa instância isolada com prints; o Azure contra a org real (só leitura).
 
 - [x] Sino da caixa de entrada só como ícone, fixo ao lado do minimizar (número de não lidos; vermelho quando um agente espera)
-- [x] Rodapé com o workspace, o status e os badges das extensões (arrastar reordena); em cima ficam só início, abas e sino (`ui.footer`)
+- [x] Rodapé com o status e os badges das extensões (arrastar reordena); em cima ficam início, workspace, abas e sino (`ui.footer`)
 - [x] Barra de atalhos abaixo do rodapé, clicável, configurável em `shortcuts` (`ui.shortcuts`)
 - [x] Menus por assunto (`Ctrl+Shift+1..4`: orquestração, extensões, janela, configuração) e todos os atalhos (`Ctrl+Shift+/`); `menus` cria ou muda
 - [x] Avisos sempre pelo cartão do Duck no canto da tela: agentes (também com a janela em foco, se o pane não está à vista), extensões e loops; saíram os cartões de dentro da janela

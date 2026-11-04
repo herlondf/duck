@@ -83,23 +83,29 @@ fn pane_icon(domain: &str, wsl: bool) -> &'static str {
     if wsl { "\u{f17c}" } else if !domain.is_empty() { "\u{f0c2}" } else { "\u{e795}" }
 }
 
-/// Sino da caixa de entrada: icone e, com avisos nao lidos, o numero numa bolinha
-/// (vermelha quando um agente espera por voce).
+/// Sino da caixa de entrada: icone centralizado e, com avisos nao lidos, o
+/// numero numa bolinha no canto do icone (vermelha quando um agente espera).
+/// `flat`: na barra de titulo, igual aos botoes da janela (altura toda, sem cantos).
 #[allow(clippy::too_many_arguments)]
-fn draw_bell(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, theme: &Theme, mouse: (f32, f32), br: [f32; 4], n: u64, blocked: bool) {
+fn draw_bell(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, theme: &Theme, mouse: (f32, f32), br: [f32; 4], n: u64, blocked: bool, flat: bool) {
     let hv = inside(br, mouse);
-    if hv { l.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(mix(theme.tab_bar, theme.fg, 0.12), 1.0), 6.0)); }
-    let (cw, ch) = (r.cell_w, r.cell_h);
+    if hv { l.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(mix(theme.tab_bar, theme.fg, 0.12), 1.0), if flat { 0.0 } else { 6.0 })); }
+    let ch = r.cell_h;
+    let size = 0.85;
+    let icon = super::ext::icon("bell");
+    let gw = r.measure(&icon, false, size);
+    // O glifo da Nerd Font fica alto na celula: desce um pouco para alinhar com os botoes.
+    let (gx, gy) = (br[0] + (br[2] - gw) / 2.0, br[1] + (br[3] - ch * size) / 2.0 + ch * 0.12);
     let c = if blocked { theme.blocked } else if n > 0 || hv { theme.fg } else { theme.muted };
-    l.texts.push(TextItem { size: 0.9, ..mt(br[0] + (br[2] - cw * 0.9) / 2.0, br[1] + (br[3] - ch * 0.9) / 2.0, &super::ext::icon("bell"), c) });
+    l.texts.push(TextItem { size, ..mt(gx, gy, &icon, c) });
     if n > 0 {
         let t = if n > 99 { "99+".to_string() } else { n.to_string() };
         let tw = r.measure(&t, true, 0.6);
         let dh = ch * 0.6 + 3.0;
         let dw = (tw + 8.0).max(dh);
-        let (dx, dy) = (br[0] + br[2] / 2.0 + 1.0, br[1] - 2.0);
+        let (dx, dy) = (gx + gw * 1.05, gy - dh * 0.3);
         l.shapes.push(Shape::rect(dx, dy, dw, dh, lin(if blocked { theme.blocked } else { theme.accent }, 1.0), dh / 2.0));
-        l.texts.push(TextItem { bold: true, ..uit(dx + (dw - tw) / 2.0, dy + 1.5, &t, theme.bg, 0.6) });
+        l.texts.push(TextItem { bold: true, ..uit(dx + (dw - tw) / 2.0, dy + (dh - ch * 0.6) / 2.0, &t, theme.bg, 0.6) });
     }
     hits.push(Hit { r: br, action: Action::Builtin("inbox".into(), vec![]) });
 }
@@ -807,8 +813,18 @@ impl Gui {
                 if hv { base.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(mix(theme.tab_bar, theme.fg, 0.12), 1.0), 6.0)); }
                 base.texts.push(TextItem { size: 0.9, ..txt(x + (bw - cw * 0.9) / 2.0, (bar_h - ch * 0.9) / 2.0, "\u{f015}", if hv { theme.fg } else { theme.muted }) });
                 self.hits.push(Hit { r: br, action: Action::Builtin("home".into(), vec![]) });
-                x += bw + 6.0;
+                x += bw + 4.0;
             }
+            // Chip do workspace (troca de workspace).
+            let wsz = 0.85;
+            let ww = r.measure(&ws_name, true, wsz) + 34.0;
+            let wr = [x, 7.0, ww, bar_h - 14.0];
+            let hv = inside(wr, mouse);
+            base.shapes.push(Shape::rect(wr[0], wr[1], wr[2], wr[3], lin(mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }), 1.0), 7.0));
+            base.texts.push(TextItem { size: 0.85, ..txt(x + 8.0, (bar_h - ch * 0.85) / 2.0, "\u{f009}", theme.accent) });
+            base.texts.push(uit(x + 24.0, (bar_h - ch * wsz) / 2.0, &ws_name, theme.fg, wsz));
+            self.hits.push(Hit { r: wr, action: Action::Builtin("workspace_switch".into(), vec![]) });
+            x += ww + 8.0;
             let mut rx = w;
             if custom {
                 for (glyph, act) in [("✕", "win_close"), (if maximized { "❐" } else { "☐" }, "win_max"), ("─", "win_min")] {
@@ -824,9 +840,9 @@ impl Gui {
             }
             // Sino da caixa de entrada: fixo ao lado do minimizar.
             if inbox_on {
-                let bw = 38.0;
-                rx -= bw + 4.0;
-                draw_bell(r, &mut base, &mut self.hits, &theme, mouse, [rx, 7.0, bw, bar_h - 14.0], inbox_n as u64, inbox_blocked);
+                let bw = 46.0;
+                rx -= bw;
+                draw_bell(r, &mut base, &mut self.hits, &theme, mouse, [rx, 0.0, bw, bar_h], inbox_n as u64, inbox_blocked, true);
             }
             let mut tabs_end = x;
             if tab_bar == "top" && !self.focus_mode {
@@ -863,23 +879,25 @@ impl Gui {
         if fh > 0.0 {
             let (py, ph) = (foot_y + 4.0, fh - 8.0);
             let cy = |size: f32| foot_y + (fh - ch * size) / 2.0;
-            // Workspace (troca de workspace).
+            // Sem barra de titulo, o workspace vem para o rodape.
             let mut x = 8.0;
-            let wsz = 0.78;
-            let ww = r.measure(&ws_name, true, wsz) + 30.0;
-            let wr = [x, py, ww, ph];
-            let hv = inside(wr, mouse);
-            base.shapes.push(Shape::rect(wr[0], wr[1], wr[2], wr[3], lin(mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }), 1.0), ph / 2.0));
-            base.texts.push(TextItem { size: 0.78, ..txt(x + 8.0, cy(0.78), "\u{f009}", theme.accent) });
-            base.texts.push(uit(x + 22.0, cy(wsz), &ws_name, theme.fg, wsz));
-            self.hits.push(Hit { r: wr, action: Action::Builtin("workspace_switch".into(), vec![]) });
-            x += ww + 10.0;
+            if chrome.top == 0.0 {
+                let wsz = 0.78;
+                let ww = r.measure(&ws_name, true, wsz) + 30.0;
+                let wr = [x, py, ww, ph];
+                let hv = inside(wr, mouse);
+                base.shapes.push(Shape::rect(wr[0], wr[1], wr[2], wr[3], lin(mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }), 1.0), ph / 2.0));
+                base.texts.push(TextItem { size: 0.78, ..txt(x + 8.0, cy(0.78), "\u{f009}", theme.accent) });
+                base.texts.push(uit(x + 22.0, cy(wsz), &ws_name, theme.fg, wsz));
+                self.hits.push(Hit { r: wr, action: Action::Builtin("workspace_switch".into(), vec![]) });
+                x += ww + 10.0;
+            }
             let mut rx = w - 6.0;
             // Sem barra de titulo (barra nativa e abas fora do topo): o sino vem para ca.
             if inbox_on && chrome.top == 0.0 {
                 let bw = 36.0;
                 rx -= bw;
-                draw_bell(r, &mut base, &mut self.hits, &theme, mouse, [rx, py, bw, ph], inbox_n as u64, inbox_blocked);
+                draw_bell(r, &mut base, &mut self.hits, &theme, mouse, [rx, py, bw, ph], inbox_n as u64, inbox_blocked, false);
                 rx -= 4.0;
             }
             // Extensoes: um badge por extensao (icone, nome e contadores).
