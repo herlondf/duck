@@ -277,7 +277,55 @@ pub fn doctor() -> i32 {
     println!("{}WSL: {}", ok(!wsl.is_empty()), if wsl.is_empty() { "nenhuma distro" } else { &wsl });
     let script = crate::proto::data_dir().join("shell").join("duck.sh");
     println!("    shell integration bash/zsh: no ~/.bashrc do WSL ponha  . {}", to_wsl_path(&script.to_string_lossy()));
+    doctor_extensions();
     0
+}
+
+/// Extensoes: Node no PATH, quais estao ligadas, compiladas e com os tokens
+/// das contas configuradas (segredo que falta = a extensao fica sem dados).
+fn doctor_extensions() {
+    let ok = |b: bool| if b { "ok " } else { "!! " };
+    let node = std::process::Command::new(if cfg!(windows) { "node.exe" } else { "node" }).arg("--version").output().ok()
+        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let settings = crate::ext::settings();
+    let all: Vec<crate::ext::ExtInfo> = crate::ext::catalog().into_iter().filter(|i| !i.manifest["builtin"].as_bool().unwrap_or(false)).collect();
+    let on: Vec<&crate::ext::ExtInfo> = all.iter().filter(|i| crate::ext::enabled(i, &settings)).collect();
+    println!("extensoes: {} de {} ligadas (Ctrl+Shift+P > Extensoes liga, configura e pede os tokens)", on.len(), all.len());
+    if !on.is_empty() {
+        println!("{}node {}", ok(node.is_some()), node.as_deref().unwrap_or("nao encontrado: winget install OpenJS.NodeJS.LTS"));
+    }
+    for i in on {
+        let mut problems: Vec<String> = Vec::new();
+        if !i.built { problems.push("nao compilada (install.ps1 -SkipBuild -Extensions)".into()); }
+        for name in missing_secrets(i, &settings[&i.name]) {
+            problems.push(format!("falta o token {name} (echo <token> | duck secret set {name})"));
+        }
+        if problems.is_empty() { println!("ok  {}", i.name); } else { println!("!!  {}: {}", i.name, problems.join("; ")); }
+    }
+}
+
+/// Segredos esperados pela config da extensao e que nao estao gravados.
+/// Contas do manifesto ("accounts": {key, secret: "x/{name}"}) ou, sem isso,
+/// listas de tabelas com `name` (ex.: azure orgs): `secret` da tabela ou "<ext>/<name>".
+fn missing_secrets(i: &crate::ext::ExtInfo, cfg: &Value) -> Vec<String> {
+    let mut want: Vec<String> = Vec::new();
+    let acc = &i.manifest["accounts"];
+    if let (Some(key), Some(pat)) = (acc["key"].as_str(), acc["secret"].as_str()) {
+        for a in cfg[key].as_array().into_iter().flatten() {
+            let mut name = pat.to_string();
+            for (k, v) in a.as_object().into_iter().flatten() {
+                if let Some(v) = v.as_str() { name = name.replace(&format!("{{{k}}}"), v); }
+            }
+            if !name.contains('{') { want.push(name); }
+        }
+    } else if acc.is_null() {
+        for v in cfg.as_object().into_iter().flatten().filter_map(|(_, v)| v.as_array()) {
+            for a in v.iter().filter(|a| a["name"].is_string() && a["url"].is_string()) {
+                want.push(a["secret"].as_str().map(String::from).unwrap_or_else(|| format!("{}/{}", i.name, a["name"].as_str().unwrap_or(""))));
+            }
+        }
+    }
+    want.into_iter().filter(|n| crate::secret::get(n).is_none()).collect()
 }
 
 fn to_wsl_path(p: &str) -> String {

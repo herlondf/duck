@@ -22,13 +22,21 @@ fazendo.
   workspaces, abas e divisões depois de reiniciar a máquina, e **retoma as
   conversas do Claude Code** que estavam abertas (`claude --resume`).
 - **Sabe dos agentes.** Cada aba mostra se o agente está trabalhando, pedindo
-  aprovação ou se terminou. Aprove ou negue por um cartão ou pela notificação
-  do Windows, sem trocar de aba. Painel lateral com o plano do agente, tokens
-  de contexto e custo; linha do tempo da sessão; recados entregues quando o
-  agente para; "corrigir com agente" manda o comando que falhou e a saída.
+  aprovação ou se terminou. Aprove ou negue pelo aviso no canto da tela, sem
+  trocar de aba. Painel lateral com o plano do agente, tokens de contexto e
+  custo; linha do tempo da sessão; recados entregues quando o agente para;
+  "corrigir com agente" manda o comando que falhou e a saída.
+- **Orquestra agentes.** Loop até passar (o Duck roda os testes quando o
+  agente para e devolve a falha para ele, até passar); mapa dos agentes, dos
+  panes que eles abriram e dos subagentes; caixa de entrada com o que espera
+  você; agente em worktree nova com porta própria; Rotinas que mandam pedidos
+  ao Claude Code em horários marcados.
 - **Blocos de comando.** Com a shell integration (OSC 133), cada comando vira
   um cartão com exit code e duração, botões de copiar, re-executar, recolher e
   fixar, e um minimapa que marca as falhas.
+- **Fácil de achar.** Menus por assunto (`Ctrl+Shift+1..4`: orquestração,
+  extensões, janela, configuração) e uma barra com os atalhos principais;
+  tudo personalizável.
 - **Cara própria.** Barra de título própria, abas em pílula (ou na lateral),
   panes como cartões arredondados, cursor suave, paleta que também busca abas,
   sessões, histórico e arquivos, 22 temas embutidos mais um gerado do papel de
@@ -43,17 +51,20 @@ fazendo.
 ## Instalação
 
 Precisa do [Rust](https://rustup.rs) (stable). O primeiro build leva uns 5
-minutos.
+minutos. O **[playbook](docs/PLAYBOOK.pt-BR.md)** tem o passo a passo
+completo: pré-requisitos, conferência, cada extensão e as rotinas.
 
 ### Windows 10/11
 
 ```powershell
-winget install Rustlang.Rustup        # precisa também do MSVC Build Tools
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install OpenJS.NodeJS.LTS      # para as extensões
 git clone https://github.com/herlondf/duck.git
 cd duck
-pwsh -File .\install.ps1               # compila, PATH, ~/.duck.lua, atalho no menu Iniciar
-pwsh -File .\install.ps1 -Boot         # + abre no logon restaurando o último checkpoint
-pwsh -File .\install.ps1 -ClaudeHooks  # + estado exato dos agentes pelos hooks do Claude Code
+pwsh -File .\install.ps1 -All         # tudo: compila, PATH, ~/.duck.lua, menu Iniciar, abre no logon,
+                                      # hooks e statusline do Claude Code, extensões compiladas
+pwsh -File .\install.ps1              # só o terminal (as opções avulsas: -Boot, -ClaudeHooks, -Extensions)
 ```
 
 ### Linux
@@ -63,7 +74,7 @@ curl https://sh.rustup.rs -sSf | sh
 sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
 git clone https://github.com/herlondf/duck.git && cd duck
 ./install.sh                 # compila, ~/.local/bin, ~/.duck.lua, atalho no menu de apps
-./install.sh --boot --claude-hooks
+./install.sh --all           # + abre no login, hooks do Claude Code, extensões
 ```
 
 ### macOS
@@ -74,8 +85,9 @@ git clone https://github.com/herlondf/duck.git && cd duck
 ./install.sh                 # compila, ~/.local/bin, ~/Applications/Duck.app
 ```
 
-Depois rode `duck` (abre a janela) ou `duck doctor` (confere config, server,
-hooks e shell integration).
+Depois rode `duck` (abre a janela) ou `duck doctor`, que confere config,
+server, hooks, shell integration e as extensões ligadas (compiladas? falta
+token?). Cada problema vem com o comando que resolve.
 
 **Estado por sistema:** o Windows é o de uso diário. No Linux o projeto
 compila e passa nos testes, mas foi pouco usado na prática. O macOS ainda não
@@ -87,6 +99,10 @@ Windows.
 | Atalho | Ação |
 |---|---|
 | `Ctrl+Shift+P` | Paleta (comandos, abas, sessões, histórico, arquivos) |
+| `Ctrl+Shift+1` / `2` / `3` / `4` | Menus: orquestração / extensões / janela / configuração |
+| `Ctrl+Shift+/` | Todos os atalhos |
+| `Ctrl+Shift+J` | Caixa de entrada (o sino ao lado do minimizar) |
+| `Ctrl+Shift+U` | Mapa dos agentes |
 | `Ctrl+Shift+Home` | Início: projetos recentes, sessões do Claude, ações |
 | `Alt+\` / `Alt+-` | Dividir à direita / abaixo |
 | `Ctrl+Shift+T` / `Ctrl+Shift+W` | Nova aba / fechar aba |
@@ -98,9 +114,10 @@ Windows.
 | `Ctrl+Shift+Enter` | Editor de comando em várias linhas (desfazer, seleção) |
 | `Ctrl+,` | Configurações: temas, sliders, shaders, fontes |
 
-Clique em CPU/RAM na barra de título para abrir o painel do sistema (uso por
-núcleo, memória, processos que mais gastam). Tudo se configura em
-`~/.duck.lua`; veja o [duck.example.lua](duck.example.lua).
+Embaixo ficam um badge por extensão (Sistema, Agentes, Azure…; clique abre o
+painel) e a barra com os atalhos principais. Tudo se configura em
+`~/.duck.lua`; veja o [duck.example.lua](duck.example.lua), que traz exemplos
+comentados de todas as extensões.
 
 ## Extensões
 
@@ -120,9 +137,12 @@ terminal, e uma extensão desligada não gasta memória.
 | Agentes | **Rotinas** (pedidos ao Claude Code em horários marcados, com cron ou a cada N minutos, usando o login do plano; o resultado vira aviso e fica no histórico) |
 | Outras | **Google Play** (releases e avaliações, com resposta), **Home Assistant** (luzes, interruptores, cortinas, avisos) |
 
-Compile com `install.ps1 -Extensions` (ou `./install.sh --extensions`). Elas
-começam desligadas; ligue em `Ctrl+Shift+P` → "Extensões", onde também ficam
-as configurações e as contas de cada uma.
+Compile com `install.ps1 -Extensions` (ou `-All`). Elas começam desligadas;
+ligue em `Ctrl+Shift+2` → "Extensões", onde também ficam as configurações e as
+contas de cada uma. O [playbook](docs/PLAYBOOK.pt-BR.md#4-receitas-por-extensão)
+tem uma receita para cada: onde gerar o token, o que pôr na config e como
+conferir. As [Rotinas](docs/PLAYBOOK.pt-BR.md#5-rotinas) também estão lá, com
+a resposta falada numa Echo ou no celular pelo Home Assistant.
 
 ### Contas e segredos
 
@@ -179,8 +199,11 @@ Linux/macOS, o Ghostty, o kitty e o Alacritty estão mais maduros lá.
 
 ## Documentação
 
+- [Playbook de instalação e configuração](docs/PLAYBOOK.pt-BR.md): passo a
+  passo da instalação, de cada extensão e das rotinas, e problemas comuns.
 - [Manual completo](docs/MANUAL.pt-BR.md): todos os atalhos, a CLI, os
   recursos de agente, segurança, persistência e a arquitetura.
+- [Criar extensões](docs/EXTENSIONS.md) (em inglês).
 - [Lista de funcionalidades e status](docs/FUNCIONALIDADES.md) e as
   [notas de pesquisa](docs/PESQUISA.md) que guiaram o projeto.
 

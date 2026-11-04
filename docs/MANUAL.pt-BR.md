@@ -16,6 +16,8 @@ Warp, Ghostty, kitty, Zellij, Wave e Kiro.
 - Agentes controlam o terminal pela CLI ou por **MCP**.
 
 Roadmap e status: [FUNCIONALIDADES.md](FUNCIONALIDADES.md).
+Instalar e configurar passo a passo (extensões, rotinas, problemas comuns):
+[PLAYBOOK.pt-BR.md](PLAYBOOK.pt-BR.md).
 
 ## Instalar
 
@@ -285,7 +287,7 @@ Para usar por MCP no Claude Code: `claude mcp add duck -- D:\Tools\Duck\bin\duck
 
 ## Personalização (`~/.duck.lua`)
 
-`duck init` cria o arquivo a partir de [`duck.example.lua`](duck.example.lua),
+`duck init` cria o arquivo a partir de [`duck.example.lua`](../duck.example.lua),
 a referência comentada. Salvar recarrega na hora. Ajustes da máquina e a tela
 de configurações (`Ctrl+,`) gravam em `~/.duck-local.lua`.
 

@@ -6,6 +6,7 @@
 #   ./install.sh --claude-hooks  also register `duck hook` in ~/.claude*/settings.json
 #   ./install.sh --skip-build    reuse target/release
 #   ./install.sh --extensions    build the bundled extensions (Node 18+); enable them in Ctrl+Shift+P
+#   ./install.sh --all           same as --boot --claude-hooks --extensions
 #
 # Nothing outside your home directory is changed. / Nada fora do seu home e alterado.
 set -euo pipefail
@@ -21,7 +22,8 @@ for a in "$@"; do
     --claude-hooks) hooks=1 ;;
     --skip-build) build=0 ;;
     --extensions) exts=1 ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    --all) boot=1; hooks=1; exts=1 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     *) say "opcao desconhecida: $a" "unknown option: $a"; exit 2 ;;
   esac
 done
@@ -125,3 +127,4 @@ if [ "$exts" = 1 ]; then
 fi
 
 say "Pronto. Abra pelo menu de aplicativos (Duck) ou rode: duck" "Done. Open Duck from your app menu or run: duck"
+say "Confira com: duck doctor (config, server, hooks, extensoes e tokens que faltam). Passo a passo: docs/PLAYBOOK.pt-BR.md" "Check with: duck doctor (config, server, hooks, extensions and missing tokens). Step by step: docs/PLAYBOOK.md"

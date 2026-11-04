@@ -13,18 +13,27 @@
   -ClaudeHooks   register `duck hook` in ~/.claude*/settings.json (backup in settings.json.bak-duck)
   -SkipBuild     reuse target\release / usa o binario ja compilado
   -Extensions    build the bundled extensions (Node 18+); enable them in Ctrl+Shift+P / compila as extensoes; ative no Ctrl+Shift+P
+  -All           same as -Boot -ClaudeHooks -Extensions / tudo acima
 .EXAMPLE
-  pwsh -File .\install.ps1 -Boot -ClaudeHooks
+  pwsh -File .\install.ps1 -All
 #>
-param([switch] $Boot, [switch] $ClaudeHooks, [switch] $SkipBuild, [switch] $Extensions)
+param([switch] $Boot, [switch] $ClaudeHooks, [switch] $SkipBuild, [switch] $Extensions, [switch] $All)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $pt = (Get-UICulture).Name -like 'pt*'
 function Say([string] $ptText, [string] $enText, [string] $color = 'Green') { Write-Host ($pt ? $ptText : $enText) -ForegroundColor $color }
+if ($All) { $Boot = $true; $ClaudeHooks = $true; $Extensions = $true }
 
 if (-not $SkipBuild) {
   $cargo = (Get-Command cargo -ErrorAction SilentlyContinue)?.Source ?? "$env:USERPROFILE\.cargo\bin\cargo.exe"
   if (-not (Test-Path $cargo)) { throw ($pt ? 'Rust nao encontrado: winget install Rustlang.Rustup' : 'Rust not found: winget install Rustlang.Rustup') }
+  # O Rust no Windows usa o linker do Visual Studio (MSVC Build Tools).
+  $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+  $vc = (Test-Path $vswhere) -and (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+  if (-not $vc) {
+    $cmd = 'winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"'
+    throw ($pt ? "MSVC Build Tools nao encontrado (o Rust precisa do linker). Instale com:`n  $cmd" : "MSVC Build Tools not found (Rust needs its linker). Install with:`n  $cmd")
+  }
   Say 'Compilando (release, ~5 min na primeira vez)...' 'Building (release, ~5 min the first time)...' Cyan
   & $cargo build --release --manifest-path "$root\Cargo.toml"
   if ($LASTEXITCODE) { throw 'cargo build failed' }
@@ -59,10 +68,23 @@ Say "Atalho: $lnk" "Shortcut: $lnk"
 
 if ($Boot) { & $exe install }
 
+Copy-Item "$root\extensions\claude-usage\statusline.ps1" "$bin\duck-statusline.ps1" -Force
+
 if ($ClaudeHooks) {
   Get-ChildItem $env:USERPROFILE -Directory -Force -Filter '.claude*' |
     Where-Object { Test-Path (Join-Path $_.FullName 'settings.json') } |
-    ForEach-Object { & $exe install --hooks (Join-Path $_.FullName 'settings.json') }
+    ForEach-Object {
+      $settings = Join-Path $_.FullName 'settings.json'
+      & $exe install --hooks $settings
+      # Statusline do Duck (uso de 5h/7d para a extensao Uso do Claude e as
+      # Rotinas) so onde ainda nao ha nenhuma: a sua, se existir, fica.
+      $j = Get-Content $settings -Raw | ConvertFrom-Json -AsHashtable
+      if (-not $j.ContainsKey('statusLine')) {
+        $j['statusLine'] = [ordered]@{ type = 'command'; command = "pwsh -NoProfile -File `"$bin\duck-statusline.ps1`""; padding = 0 }
+        $j | ConvertTo-Json -Depth 32 | Set-Content $settings -Encoding utf8NoBOM
+        Say "Statusline do Duck em $settings" "Duck statusline in $settings"
+      }
+    }
 }
 
 if ($Extensions) {
@@ -89,3 +111,5 @@ if (Get-Process duckw -ErrorAction SilentlyContinue) {
 }
 
 Say "`nPronto. Abra pelo menu Iniciar (Duck) ou rode: duck" "`nDone. Open Duck from the Start menu or run: duck"
+Say 'Confira a instalacao com: duck doctor  (config, server, hooks, extensoes e tokens que faltam)' 'Check the install with: duck doctor  (config, server, hooks, extensions and missing tokens)' Cyan
+Say 'Passo a passo das extensoes e rotinas: docs/PLAYBOOK.pt-BR.md' 'Step by step for extensions and routines: docs/PLAYBOOK.md' Cyan

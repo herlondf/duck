@@ -662,7 +662,12 @@ mod tests {
             agents = { working = 1, blocked = 0, done = 0, idle = 0 }, ports = { 3000, 5173 }, tokens = 12345, mode = nil }"#).eval().unwrap();
         let segs: Table = t.get::<mlua::Function>("status").unwrap().call(info).unwrap();
         let joined: String = segs.sequence_values::<Table>().flatten().map(|s| s.get::<String>("text").unwrap()).collect();
-        assert!(joined.contains("3000 5173") && !joined.contains("tok"), "{joined}");
+        // Portas e tokens sairam da barra (extensao Portas, badges); sem modo, nada.
+        assert!(joined.is_empty(), "{joined}");
+        let info: Table = lua.load(r#"return { workspace = 'w', agents = {}, mode = 'copia' }"#).eval().unwrap();
+        let segs: Table = t.get::<mlua::Function>("status").unwrap().call(info).unwrap();
+        let joined: String = segs.sequence_values::<Table>().flatten().map(|s| s.get::<String>("text").unwrap()).collect();
+        assert!(joined.contains("COPIA"), "{joined}");
         let tab: Table = lua.load(r#"return { title = '', pane_title = 'pwsh', cwd = 'D:/projetos/app', branch = 'feat-x' }"#).eval().unwrap();
         let title: String = t.get::<mlua::Function>("tab_title").unwrap().call(tab).unwrap();
         assert_eq!(title, "app ⎇ feat-x");

@@ -22,10 +22,18 @@ doing.
   tabs and splits after a reboot, and **resumes the Claude Code conversations**
   that were open (`claude --resume`).
 - **Agent aware.** Each tab shows whether its agent is working, waiting for
-  your approval or done. Approve or deny from a card or from a Windows
-  notification without switching tabs. Side panel with the agent's plan,
+  your approval or done. Approve or deny from the notice in the corner of the
+  screen without switching tabs. Side panel with the agent's plan,
   context tokens and cost; timeline of the session; message queue delivered
   when the agent stops; "fix with agent" sends a failed command and its output.
+- **Orchestrates agents.** Loop until a check passes (Duck runs your tests
+  when the agent stops and sends the failure back until it passes); a map of
+  agents, the panes they opened and their subagents; an inbox of what is
+  waiting for you; an agent in a fresh worktree with its own port; Routines
+  that send requests to Claude Code on a schedule.
+- **Easy to find.** Topic menus (`Ctrl+Shift+1..4`: orchestration,
+  extensions, window, settings) and a bar with the main shortcuts; all
+  customizable.
 - **Command blocks.** With shell integration (OSC 133), every command becomes a
   card with exit code and duration, copy/re-run/collapse/pin buttons, and a
   minimap that marks failures.
@@ -42,17 +50,20 @@ doing.
 ## Install
 
 You need [Rust](https://rustup.rs) (stable). The first build takes about 5
-minutes.
+minutes. The **[playbook](docs/PLAYBOOK.md)** has the full step by step:
+prerequisites, checks, every extension and routines.
 
 ### Windows 10/11
 
 ```powershell
-winget install Rustlang.Rustup        # also needs the MSVC Build Tools
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install OpenJS.NodeJS.LTS      # for extensions
 git clone https://github.com/herlondf/duck.git
 cd duck
-pwsh -File .\install.ps1               # build, PATH, ~/.duck.lua, Start menu shortcut
-pwsh -File .\install.ps1 -Boot         # + open at logon restoring the last checkpoint
-pwsh -File .\install.ps1 -ClaudeHooks  # + exact agent state via Claude Code hooks
+pwsh -File .\install.ps1 -All         # everything: build, PATH, ~/.duck.lua, Start menu, open at logon,
+                                      # Claude Code hooks and statusline, extensions built
+pwsh -File .\install.ps1              # just the terminal (single options: -Boot, -ClaudeHooks, -Extensions)
 ```
 
 ### Linux
@@ -62,7 +73,7 @@ curl https://sh.rustup.rs -sSf | sh
 sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
 git clone https://github.com/herlondf/duck.git && cd duck
 ./install.sh                 # build, ~/.local/bin, ~/.duck.lua, app menu entry
-./install.sh --boot --claude-hooks
+./install.sh --all           # + open at login, Claude Code hooks, extensions
 ```
 
 ### macOS
@@ -73,8 +84,9 @@ git clone https://github.com/herlondf/duck.git && cd duck
 ./install.sh                 # build, ~/.local/bin, ~/Applications/Duck.app
 ```
 
-Then run `duck` (opens the window) or `duck doctor` (checks config, server,
-hooks and shell integration).
+Then run `duck` (opens the window) or `duck doctor`, which checks config,
+server, hooks, shell integration and the enabled extensions (built? token
+missing?). Each problem comes with the command that fixes it.
 
 **Platform status:** Windows is the daily driver. Linux builds and passes the
 test suite, but has had little interactive use. macOS is untested. The global
@@ -85,6 +97,10 @@ quick-terminal hotkey and Mica/Acrylic are Windows-only.
 | Key | Action |
 |---|---|
 | `Ctrl+Shift+P` | Command palette (commands, tabs, sessions, history, files) |
+| `Ctrl+Shift+1` / `2` / `3` / `4` | Menus: orchestration / extensions / window / settings |
+| `Ctrl+Shift+/` | Every shortcut |
+| `Ctrl+Shift+J` | Inbox (the bell next to minimize) |
+| `Ctrl+Shift+U` | Agent map |
 | `Ctrl+Shift+Home` | Home: recent projects, Claude sessions, actions |
 | `Alt+\` / `Alt+-` | Split right / down |
 | `Ctrl+Shift+T` / `Ctrl+Shift+W` | New tab / close tab |
@@ -96,9 +112,10 @@ quick-terminal hotkey and Mica/Acrylic are Windows-only.
 | `Ctrl+Shift+Enter` | Multi-line command editor (undo, selection) |
 | `Ctrl+,` | Settings: themes, sliders, shaders, fonts |
 
-Click CPU/RAM in the title bar for a system panel (per-core usage, memory,
-top processes). Everything is configurable in `~/.duck.lua`; see
-[duck.example.lua](duck.example.lua).
+At the bottom there is one badge per extension (System, Agents, Azure…;
+click opens the panel) and a bar with the main shortcuts. Everything is
+configurable in `~/.duck.lua`; see [duck.example.lua](duck.example.lua), which
+has commented examples for every extension. The interface is in Portuguese.
 
 ## Extensions
 
@@ -111,16 +128,19 @@ terminal down, and an extension that is turned off costs no memory.
 
 | Area | Extensions |
 |---|---|
-| Code | **GitHub** (notifications, review requests, PRs, issues; every `gh auth login` account), **Azure DevOps** (PRs and builds), **Git** (branch, changes, worktrees and stashes of the active pane) |
+| Code | **GitHub** (notifications, review requests, PRs, issues; every `gh auth login` account), **Azure DevOps** (PRs, builds and what is deployed in each environment: classic releases per environment or pipelines per branch, configurable per project), **Git** (branch, changes, worktrees and stashes of the active pane) |
 | Issues and errors | **Jira** (Server/DC and Cloud), **Rollbar** (active errors, resolve, mute), **Grafana** (LogQL queries on Loki, alert when a count goes up) |
 | Infrastructure | **Containers** (Docker and Podman, also inside WSL), **Database** (saved Postgres and Redis queries, read-only by default), **Ports** (listening TCP ports and their process) |
 | Daily use | **Calendar** (Google/Outlook via iCal URL, reminders and Join button), **Notes** (per project and global), **Snippets** (command snippets and clipboard history), **Claude usage** (5h/7d limits and cost per Claude Code profile) |
 | Agents | **Routines** (requests to Claude Code on a schedule, cron or every N minutes, using the plan's login; the answer becomes a notification and is kept in a history) |
 | Others | **Google Play** (releases and reviews, reply to reviews), **Home Assistant** (lights, switches, covers, alerts) |
 
-Build them with `install.ps1 -Extensions` (or `./install.sh --extensions`).
-They start turned off; turn them on in `Ctrl+Shift+P` → "Extensões", where you
-also change their settings and add accounts.
+Build them with `install.ps1 -Extensions` (or `-All`). They start turned
+off; turn them on in `Ctrl+Shift+2` → "Extensões", where you also change their
+settings and add accounts. The [playbook](docs/PLAYBOOK.md#4-recipes-per-extension)
+has a recipe for each: where to create the token, what goes in the config and
+how to check it. [Routines](docs/PLAYBOOK.md#5-routines) are there too,
+including spoken answers on an Echo or a phone push through Home Assistant.
 
 ### Accounts and secrets
 
@@ -176,8 +196,11 @@ on Linux/macOS, Ghostty, kitty and Alacritty are more mature there.
 
 ## Documentation
 
+- [Install and configuration playbook](docs/PLAYBOOK.md): step by step for
+  installing, every extension and routines, plus troubleshooting.
 - [Full manual (Portuguese)](docs/MANUAL.pt-BR.md): every key, the CLI, the
   agent features, security, persistence and the architecture.
+- [Writing extensions](docs/EXTENSIONS.md).
 - [Feature list and status](docs/FUNCIONALIDADES.md) and the
   [research notes](docs/PESQUISA.md) that shaped the design.
 

@@ -199,6 +199,60 @@ return {
     { label = 'Checkpoint: restaurar sessoes', action = A('checkpoint_restore') },
   },
 
+  ------------------------------------------------------------------ atalhos e menus
+  -- Barra de atalhos (embaixo, abaixo dos badges): rotulo + acao; a tecla
+  -- mostrada e a que estiver ligada a acao em `keys`. ui = { shortcuts = false } esconde.
+  -- shortcuts = {
+  --   { label = 'Paleta',       action = A('palette') },
+  --   { label = 'Orquestração', action = A('menu', 'orquestracao') },
+  --   { label = 'Extensões',    action = A('menu', 'extensoes') },
+  --   { label = 'Janela',       action = A('menu', 'janela') },
+  --   { label = 'Configuração', action = A('menu', 'config') },
+  --   { label = 'Novo agente',  action = A('agent_new') },
+  --   { label = 'Avisos',       action = A('inbox') },
+  --   { label = 'Todos os atalhos', action = A('menu', 'atalhos') },
+  -- },
+  -- Menus por assunto (Ctrl+Shift+1..4): a paleta filtrada pelos prefixos do
+  -- rotulo (ou da dica) dos comandos, sem acento nem caixa. Mude ou crie:
+  -- menus = {
+  --   deploy = { title = 'Deploy', match = { 'Azure', 'Git:' } },
+  -- },
+
+  ------------------------------------------------------------------ extensoes
+  -- Ligue e configure em Ctrl+Shift+2 (ou Ctrl+Shift+P > Extensoes), que grava
+  -- em ~/.duck-local.lua, ou aqui. Tokens NUNCA vao neste arquivo:
+  --   echo <token> | duck secret set <extensao>/<conta>
+  -- `duck doctor` mostra as ligadas que estao sem compilar ou sem token.
+  -- Passo a passo de cada uma: docs/PLAYBOOK.pt-BR.md
+  -- extensions = {
+  --   github = { enabled = true },          -- contas: as do `gh auth login`
+  --   git = { enabled = true },             -- repo do pane ativo
+  --   azure = { enabled = true, orgs = {    -- token: azure/empresa (PAT: Code, Build e Release Read)
+  --     { name = 'empresa', url = 'https://dev.azure.com/empresa', project = 'proj',
+  --       releases = {
+  --         { name = 'API', definition = 'api-cd', stages = { 'develop=Dev', 'tst=Tst', 'master=Prod' } },
+  --         { name = 'Portal', pipeline = 'portal-ci', branches = { 'develop', 'master' } },
+  --       } },
+  --   } },
+  --   jira = { enabled = true, accounts = {  -- token: jira/trabalho
+  --     { name = 'trabalho', url = 'https://jira.empresa.com' },                                  -- Server/DC: PAT
+  --     -- { name = 'cloud', url = 'https://x.atlassian.net', type = 'cloud', email = 'eu@x.com' }, -- Cloud: API token
+  --   } },
+  --   grafana = { enabled = true, accounts = {  -- token: grafana/empresa = 'usuario:senha'
+  --     { name = 'empresa', url = 'https://grafana.empresa.com', datasource_uid = 'uid-do-loki' },
+  --   }, queries = { 'Erros API={service_name="api"} |= "ERROR"' } },
+  --   rollbar = { enabled = true, accounts = { { name = 'app' } } },   -- token: rollbar/app
+  --   calendar = { enabled = true, accounts = { { name = 'trabalho' } } }, -- token: calendar/trabalho = URL .ics secreta
+  --   homeassistant = { enabled = true, accounts = { { name = 'casa', url = 'http://homeassistant.local:8123' } } },
+  --   containers = { enabled = true, engines = { 'docker' } },   -- ou o nome da distro do WSL com podman
+  --   database = { enabled = true, accounts = { { name = 'local', kind = 'postgres', database = 'app', user = 'postgres' } } },
+  --   ports = { enabled = true },
+  --   notes = { enabled = true },
+  --   snippets = { enabled = true },
+  --   ['claude-usage'] = { enabled = true },
+  --   rotinas = { enabled = true },          -- tarefas em ~/.duck/rotinas/*.md
+  -- },
+
   ------------------------------------------------------------------ barra
   -- Desenha o lado direito da barra. info: workspace, cpu, ram, ram_total,
   -- time, agents = {working=, blocked=, done=, idle=}, title, cwd, mode.
