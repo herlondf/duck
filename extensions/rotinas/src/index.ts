@@ -42,10 +42,18 @@ type Task = {
   notify: boolean;
   catchup: boolean;
   enabled: boolean;
+  /** Echo do Home Assistant que le a resposta (escritorio, cozinha, todas...). */
+  speak?: string;
+  /** Push no celular pelo Home Assistant. */
+  phone: boolean;
+  /** Fala tambem entre 22h e 7h (senao vira so push). */
+  speakNight: boolean;
+  /** Tamanho maximo do texto falado. */
+  speakMax: number;
   error?: string;
 };
 
-type Run = { task: string; title: string; at: number; ms: number; ok: boolean; text: string; error?: string; sessionId?: string; file?: string; quiet?: boolean };
+type Run = { task: string; title: string; at: number; ms: number; ok: boolean; text: string; error?: string; sessionId?: string; file?: string; quiet?: boolean; sent?: string; sendError?: string };
 type State = { last: Record<string, number>; paused: Record<string, boolean>; runs: Run[] };
 
 let tasks: Task[] = [];
@@ -53,6 +61,53 @@ let state: State = { last: {}, paused: {}, runs: [] };
 let queue: string[] = [];
 let running: string | null = null;
 let filesSig = "";
+/** Enderecos do Home Assistant, na ordem (local primeiro, tunel depois). */
+let haUrls: string[] = [];
+
+// ---------------------------------------------------------------- Home Assistant
+
+/** Texto para ser lido em voz alta: sem markdown, links nem quebras, cortado numa frase. */
+function speakable(text: string, max: number): string {
+  let s = text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[*_`#>|]/g, "")
+    .replace(/^\s*[-•]\s+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (s.length <= max) return s;
+  s = s.slice(0, max);
+  const cut = Math.max(s.lastIndexOf(". "), s.lastIndexOf("! "), s.lastIndexOf("? "));
+  return cut > max * 0.5 ? s.slice(0, cut + 1) : s.replace(/\s+\S*$/, "") + "…";
+}
+
+function night(): boolean { const h = new Date().getHours(); return h >= 22 || h < 7; }
+
+/** Manda pelo webhook de avisos do HA ({mensagem, canal, echo, titulo}). Devolve o canal usado. */
+async function sendHa(t: Task, text: string): Promise<string | null> {
+  let canal: "echo" | "celular" | "ambos" | null = null;
+  if (t.speak && (t.speakNight || !night())) canal = t.phone ? "ambos" : "echo";
+  else if (t.speak || t.phone) canal = "celular";
+  if (!canal) return null;
+  const id = await duck.secret("rotinas/ha-webhook");
+  if (!id) throw new Error("sem o webhook: echo <id> | duck secret set rotinas/ha-webhook");
+  if (!haUrls.length) throw new Error("configure ha_urls nas configuracoes da extensao Rotinas");
+  const body = JSON.stringify({ mensagem: speakable(text, t.speakMax), canal, echo: t.speak || "escritorio", titulo: t.title });
+  let last = "";
+  for (const base of haUrls) {
+    try {
+      const r = await fetch(`${base.replace(/\/+$/, "")}/api/webhook/${id}`, {
+        method: "POST", headers: { "content-type": "application/json; charset=utf-8" }, body, signal: AbortSignal.timeout(8000),
+      });
+      if (r.ok) return canal === "celular" ? "celular" : `${canal} (${t.speak})`;
+      last = `${new URL(base).host}: HTTP ${r.status}`;
+    } catch (e) {
+      last = `${(() => { try { return new URL(base).host; } catch { return base; } })()}: ${(e as Error).message}`;
+    }
+  }
+  throw new Error(`Home Assistant não respondeu (${last})`);
+}
 
 // ---------------------------------------------------------------- cron
 
@@ -149,6 +204,10 @@ function parseTask(file: string): Task {
     notify: bool("notify", true),
     catchup: bool("catchup", false),
     enabled: bool("enabled", true),
+    speak: head.falar || undefined,
+    phone: bool("celular", false),
+    speakNight: bool("falar_noite", false),
+    speakMax: Math.min(600, Number(head.falar_max) || 250),
   };
   try {
     if (!m) throw new Error("falta o cabecalho entre linhas ---");
@@ -236,6 +295,7 @@ async function pump(): Promise<void> {
       maxTurns: t.maxTurns,
       system: "Voce esta rodando sozinho, pelas rotinas do Duck: ninguem vai responder perguntas nem aprovar nada. " +
         "Faca o que der com as ferramentas liberadas e responda em portugues, direto e curto, porque a resposta vira um aviso na tela." +
+        (t.speak ? ` A resposta sera lida em voz alta numa Echo: no maximo ${t.speakMax} caracteres, frases curtas e naturais, sem markdown, listas, links, emojis ou codigo.` : "") +
         (t.quiet ? ` Se nao houver nada que precise de atencao, responda apenas: ${t.quiet}` : ""),
     });
   } catch (e) {
@@ -243,11 +303,15 @@ async function pump(): Promise<void> {
   }
   const run: Run = { task: id, title: t.title, at: started, ms: Date.now() - started, ok: r.ok, text: r.text, error: r.error, sessionId: r.sessionId };
   run.quiet = r.ok && !!t.quiet && r.text.trim().toUpperCase().startsWith(t.quiet.toUpperCase());
+  if (r.ok && !run.quiet && r.text.trim()) {
+    try { run.sent = (await sendHa(t, r.text)) ?? undefined; }
+    catch (e) { run.sendError = (e as Error).message; duck.log(`${id}: aviso pelo HA falhou: ${run.sendError}`); }
+  }
   try {
     const dir = path.join(HIST, id);
     fs.mkdirSync(dir, { recursive: true });
     run.file = path.join(dir, new Date(started).toISOString().replace(/[:.]/g, "-") + ".md");
-    fs.writeFileSync(run.file, `# ${t.title}\n\n${new Date(started).toLocaleString("pt-BR")} · ${Math.round(run.ms / 1000)}s · ${r.ok ? "ok" : `erro: ${r.error}`}\n\n${r.text}\n`);
+    fs.writeFileSync(run.file, `# ${t.title}\n\n${new Date(started).toLocaleString("pt-BR")} · ${Math.round(run.ms / 1000)}s · ${r.ok ? "ok" : `erro: ${r.error}`}${run.sent ? ` · enviado: ${run.sent}` : ""}${run.sendError ? ` · aviso falhou: ${run.sendError}` : ""}\n\n${r.text}\n`);
   } catch { /* sem historico em disco, segue */ }
   state.runs.unshift(run);
   state.runs = state.runs.slice(0, 30);
@@ -308,6 +372,7 @@ function render(): void {
       actions: [
         { id: "run", title: "Rodar agora", primary: true },
         { id: "edit", title: "Editar" },
+        ...(t.speak || t.phone ? [{ id: "test-send", title: t.speak ? "Testar fala" : "Testar push" }] : []),
         ...(t.enabled && !t.error ? [{ id: paused ? "resume-task" : "pause", title: paused ? "Retomar" : "Pausar" }] : []),
       ],
     };
@@ -316,9 +381,9 @@ function render(): void {
   const runs: Item[] = state.runs.slice(0, 15).map((r) => ({
     id: `${r.task}|${r.at}`,
     title: r.title,
-    subtitle: `${ago(r.at)} · ${Math.round(r.ms / 1000)}s · ${r.ok ? (r.quiet ? "nada a relatar" : r.text.replace(/\s+/g, " ").slice(0, 120)) : r.error}`,
-    icon: r.ok ? "check" : "x",
-    color: r.ok ? (r.quiet ? "muted" : "done") : "blocked",
+    subtitle: `${ago(r.at)} · ${Math.round(r.ms / 1000)}s · ${r.sendError ? `aviso falhou: ${r.sendError} · ` : r.sent ? `${r.sent} · ` : ""}${r.ok ? (r.quiet ? "nada a relatar" : r.text.replace(/\s+/g, " ").slice(0, 120)) : r.error}`,
+    icon: r.ok ? (r.sendError ? "warning" : "check") : "x",
+    color: r.ok ? (r.sendError ? "blocked" : r.quiet ? "muted" : "done") : "blocked",
     actions: [{ id: "show", title: "Ver", primary: true }, ...(r.sessionId ? [{ id: "resume", title: "Continuar no Claude" }] : [])],
   }));
   const sections: Section[] = [{ title: "Rotinas", items }];
@@ -349,6 +414,8 @@ cron: 0 8 * * 1-5
 # tools: WebSearch, WebFetch, Read, Bash(gh issue list:*)
 # cwd: ~/projetos/repo
 # quiet: OK           (resposta que começa com isto não vira aviso)
+# falar: escritorio   (Echo que lê a resposta pelo Home Assistant; entre 22h e 7h vira push)
+# celular: true       (push no celular pelo Home Assistant)
 enabled: false
 ---
 Escreva aqui o pedido, como escreveria para o Claude Code.
@@ -358,7 +425,9 @@ Escreva aqui o pedido, como escreveria para o Claude Code.
 }
 
 run({
-  init() {
+  init(m) {
+    const s = (m.settings ?? {}) as { ha_urls?: string | string[] };
+    haUrls = (Array.isArray(s.ha_urls) ? s.ha_urls : String(s.ha_urls ?? "").split(",")).map((u) => String(u).trim()).filter((u) => /^https?:\/\//.test(u));
     duck.register([{ id: "rotinas", title: "Rotinas", icon: "clock" }], [
       { id: "new", title: "Rotinas: nova rotina" },
       { id: "folder", title: "Rotinas: abrir pasta" },
@@ -379,6 +448,7 @@ run({
     if (m.action === "refresh") { filesSig = ""; scan(); return render(); }
     if (m.action === "new") return newTask();
     if (m.action === "folder") return duck.openUrl(DIR);
+    scan(); // arquivo criado/editado agora ainda nao entrou no tick
     const t = tasks.find((x) => x.id === m.item);
     if (m.action === "run" && t) {
       if (t.error) return duck.flash(`Arquivo com erro: ${t.error}`);
@@ -389,6 +459,11 @@ run({
       return render();
     }
     if (m.action === "edit" && t) return duck.openUrl(t.file);
+    if (m.action === "test-send" && t) {
+      // Fala de teste mesmo de noite: foi pedida agora.
+      return void sendHa({ ...t, speakNight: true }, `Teste da rotina ${t.title}. Se você está ouvindo isto, o aviso funciona.`)
+        .then((c) => duck.flash(`Enviado: ${c}`), (e) => duck.flash(`Falhou: ${(e as Error).message}`));
+    }
     if (m.action === "pause" && t) { state.paused[t.id] = true; saveState(); return render(); }
     if (m.action === "resume-task" && t) {
       // Retomar conta de agora: nao dispara o que passou enquanto estava pausada.
@@ -399,7 +474,8 @@ run({
     if (m.action === "show") {
       return duck.detail({
         title: r.title,
-        subtitle: `${new Date(r.at).toLocaleString("pt-BR")} · ${Math.round(r.ms / 1000)}s`,
+        subtitle: `${new Date(r.at).toLocaleString("pt-BR")} · ${Math.round(r.ms / 1000)}s` +
+          (r.sent ? ` · enviado: ${r.sent}` : "") + (r.sendError ? ` · aviso falhou: ${r.sendError}` : ""),
         body: r.ok ? r.text || "(sem texto)" : `Falhou: ${r.error}\n\n${r.text}`,
         item: m.item,
         actions: [...(r.sessionId ? [{ id: "resume", title: "Continuar no Claude" }] : []), ...(r.file ? [{ id: "file", title: "Abrir arquivo" }] : [])],
