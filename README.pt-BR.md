@@ -113,7 +113,7 @@ terminal, e uma extensão desligada não gasta memória.
 
 | Área | Extensões |
 |---|---|
-| Código | **GitHub** (notificações, revisões pedidas, PRs, issues; todas as contas do `gh auth login`), **Azure DevOps** (PRs e builds), **Git** (branch, mudanças, worktrees e stashes do pane ativo) |
+| Código | **GitHub** (notificações, revisões pedidas, PRs, issues; todas as contas do `gh auth login`), **Azure DevOps** (PRs, builds e o que está publicado em cada ambiente: releases clássicas por ambiente ou pipelines por branch, configuráveis por projeto), **Git** (branch, mudanças, worktrees e stashes do pane ativo) |
 | Tarefas e erros | **Jira** (Server/DC e Cloud), **Rollbar** (erros ativos, resolver, silenciar), **Grafana** (consultas LogQL no Loki, aviso quando a contagem sobe) |
 | Infraestrutura | **Containers** (Docker e Podman, também dentro do WSL), **Banco de dados** (consultas salvas em Postgres e Redis, só leitura por padrão), **Portas** (portas TCP abertas e o processo de cada uma) |
 | Dia a dia | **Agenda** (Google/Outlook por URL iCal, lembretes e botão Entrar), **Notas** (por projeto e geral), **Snippets** (trechos de comando e histórico do que foi copiado), **Uso do Claude** (limites de 5h/7d e custo por perfil do Claude Code) |

@@ -991,7 +991,8 @@ fn loop_finished(m: &mut Mux, l: &LoopRun) {
     let ev = json!({"event": "loop", "pane": l.pane, "phase": l.phase, "iter": l.iter, "max": l.max, "check": l.check});
     m.events.push((m.event_seq, ev));
     if m.events.len() > 64 { m.events.remove(0); }
-    if m.subs == 0 && l.phase != "stopped" {
+    // O aviso sai sempre pelo cartao do Duck no canto da tela.
+    if l.phase != "stopped" {
         crate::gui::toast_card(&title, &body, &[("Abrir".into(), format!("duck://focus/{}", l.pane))], Some(color));
     }
 }
@@ -2914,11 +2915,17 @@ fn ext_incoming(srv: &Arc<Server>, ext: &str, msg: Value, gen: u64) {
         return;
     }
     let Some(msg) = m.ext.incoming(ext, msg, gen) else { return };
+    // Aviso de extensao: vai para a caixa de entrada e sai sempre pelo cartao
+    // do Duck no canto da tela (com ou sem janela; a janela so ve o numero no sino).
     if msg["type"] == "notify" {
         m.inbox.push(json!({
             "kind": "ext", "ext": ext, "title": msg["title"], "body": msg["body"], "color": msg["color"],
             "item": msg["item"], "actions": msg["actions"],
         }));
+        drop(m);
+        ext_toast(ext, &msg);
+        srv.notify();
+        return;
     }
     if m.subs == 0 {
         match msg["type"].as_str().unwrap_or("") {

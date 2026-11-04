@@ -27,7 +27,7 @@ use crate::render::{lin, Layer, Quad, Renderer, TextItem};
 mod ext;
 mod graph;
 mod ui;
-use ui::{Ac, AgentPanel, Card, Composer, Hit};
+use ui::{Ac, AgentPanel, Composer, Hit};
 
 // ------------------------------------------------------------------ frame
 
@@ -392,8 +392,6 @@ pub struct Gui {
     sidebar_collapsed: bool,
     focus_mode: bool,
     agent_panel: Option<AgentPanel>,
-    cards: Vec<Card>,
-    card_seq: u64,
     /// Animacao do cartao do pane: (de, para, inicio, nascendo).
     rect_anim: HashMap<u64, ([f32; 4], [f32; 4], Instant, bool)>,
     prev_rects: HashMap<u64, [f32; 4]>,
@@ -410,6 +408,12 @@ pub struct Gui {
     badge_drag: Option<(String, f32, bool)>,
     /// Badges do ultimo quadro: (x0, x1, nome, acao do clique).
     badge_rects: Vec<(f32, f32, String, Action)>,
+    /// (y, altura) da linha dos badges (rodape).
+    badge_row: (f32, f32),
+    /// Barra de atalhos: (rotulo, acao); a tecla vem do atalho ligado a acao.
+    shortcuts: Vec<(String, Action)>,
+    /// Menus por assunto (orquestracao, extensoes...): a paleta filtrada.
+    menus: Vec<Menu>,
     /// Ordem dos badges (config ext_order).
     ext_order: Vec<String>,
     div_drag: Option<(u64, bool, f32)>,
@@ -449,6 +453,41 @@ pub struct Gui {
     ext_context: Option<Value>,
 }
 
+/// Menu por assunto: a paleta so com os comandos cujo rotulo (ou dica) comeca
+/// com um dos prefixos. Config `menus = { nome = { title = '...', match = {...} } }`.
+#[derive(Clone)]
+struct Menu { name: String, title: String, matches: Vec<String> }
+
+/// Menus de fabrica; a config sobrescreve pelo nome ou cria outros.
+fn default_menus() -> Vec<Menu> {
+    let m = |name: &str, title: &str, matches: &[&str]| Menu { name: name.into(), title: title.into(), matches: matches.iter().map(|s| s.to_string()).collect() };
+    vec![
+        m("orquestracao", "Orquestração: agentes, loop, mapa, caixa de entrada", &["Agentes:", "Loop:", "Caixa de entrada", "Git:", "Checkpoint:"]),
+        m("extensoes", "Extensões: painéis e comandos", &["Extensões", "extensao ·"]),
+        m("janela", "Janela: abas, panes e workspaces", &["Dividir", "Fechar", "Zoom", "Pane", "Nova aba", "Novo pane", "Renomear", "Cor da aba", "Mover", "Redimensionar",
+            "Broadcast", "Trocar de workspace", "Criar/ir", "Salvar workspace", "Restaurar workspace", "Apagar estado", "Modo foco", "Barra lateral", "Layout:", "Inicio:"]),
+        m("config", "Configuração", &["Configuracoes", "Galeria de temas", "Tema a partir", "Fonte", "Recarregar config", "Reiniciar server", "Encerrar server", "Desanexar"]),
+    ]
+}
+
+/// Barra de atalhos de fabrica (config `shortcuts` troca).
+fn default_shortcuts() -> Vec<(String, Action)> {
+    let b = |l: &str, a: &str, args: Vec<Value>| (l.to_string(), Action::Builtin(a.into(), args));
+    vec![
+        b("Paleta", "palette", vec![]),
+        b("Orquestração", "menu", vec![json!("orquestracao")]),
+        b("Extensões", "menu", vec![json!("extensoes")]),
+        b("Janela", "menu", vec![json!("janela")]),
+        b("Configuração", "menu", vec![json!("config")]),
+        b("Novo agente", "agent_new", vec![]),
+        b("Avisos", "inbox", vec![]),
+        b("Todos os atalhos", "menu", vec![json!("atalhos")]),
+    ]
+}
+
+/// Para comparar rotulos sem acento nem caixa ("Extensões" = "extensoes").
+fn fold_str(s: &str) -> String { s.chars().map(|c| fold(c.to_lowercase().next().unwrap_or(c))).collect() }
+
 struct Grid { panes: Vec<(u64, String, String)>, sel: usize, texts: HashMap<u64, String>, fetched: Instant }
 
 impl Gui {
@@ -468,9 +507,9 @@ impl Gui {
             grid: None, graph: None, review: Vec::new(), hist_cache: (Instant::now() - Duration::from_secs(60), Vec::new()), ghost: None,
             branches: HashMap::new(),
             hits: vec![], tab_rects: vec![], tab_row: (0.0, 0.0), sidebar_collapsed: false, focus_mode: false, agent_panel: None,
-            cards: vec![], card_seq: 0, rect_anim: HashMap::new(), prev_rects: HashMap::new(), ghosts: vec![], anim_tab_key: String::new(),
+            rect_anim: HashMap::new(), prev_rects: HashMap::new(), ghosts: vec![], anim_tab_key: String::new(),
             ws_anim: None, cursor_anim: None, cursor_shown: [0.0, 0.0], last_key: Instant::now(), tab_hover: None, tab_preview: None,
-            tab_drag: None, badge_drag: None, badge_rects: vec![], ext_order: vec![], div_drag: None, title_click: Instant::now() - Duration::from_secs(5), resize_edge: None,
+            tab_drag: None, badge_drag: None, badge_rects: vec![], badge_row: (0.0, 0.0), shortcuts: vec![], menus: vec![], ext_order: vec![], div_drag: None, title_click: Instant::now() - Duration::from_secs(5), resize_edge: None,
             collapsed: HashMap::new(), pinned: HashMap::new(), search_hits: None, composer: None, ac: None, ac_dismissed: String::new(),
             usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), last_loop_check: String::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
         };
@@ -491,7 +530,13 @@ impl Gui {
         if let Some(e) = err { self.flash(&e); }
         self.keys = parse_bindings(&lua, t.get("keys").ok());
         // Atalhos novos com padrao (a config do usuario pode sobrescrever).
-        let defaults: [(&str, &str, &str, Vec<Value>); 26] = [
+        let defaults: [(&str, &str, &str, Vec<Value>); 32] = [
+            ("p", "CTRL|SHIFT", "palette", vec![]),
+            ("1", "CTRL|SHIFT", "menu", vec![json!("orquestracao")]),
+            ("2", "CTRL|SHIFT", "menu", vec![json!("extensoes")]),
+            ("3", "CTRL|SHIFT", "menu", vec![json!("janela")]),
+            ("4", "CTRL|SHIFT", "menu", vec![json!("config")]),
+            ("/", "CTRL|SHIFT", "menu", vec![json!("atalhos")]),
             ("w", "CTRL|SHIFT", "close_tab", vec![]),
             ("i", "CTRL|SHIFT", "agent_panel", vec![]),
             ("j", "CTRL|SHIFT", "inbox", vec![]),
@@ -531,6 +576,25 @@ impl Gui {
                 self.tables.insert(name, parse_bindings(&lua, Some(list)));
             }
         }
+        // Menus por assunto e barra de atalhos.
+        self.menus = default_menus();
+        if let Ok(mt) = t.get::<Table>("menus") {
+            for (name, e) in mt.pairs::<String, Table>().flatten() {
+                let title: String = e.get("title").unwrap_or_else(|_| name.clone());
+                let matches: Vec<String> = e.get("match").unwrap_or_default();
+                match self.menus.iter_mut().find(|m| m.name == name) {
+                    Some(m) => { m.title = title; if !matches.is_empty() { m.matches = matches; } }
+                    None => self.menus.push(Menu { name, title, matches }),
+                }
+            }
+        }
+        self.shortcuts = match t.get::<Table>("shortcuts") {
+            Ok(list) => list.sequence_values::<Table>().flatten().filter_map(|e| {
+                let label: String = e.get("label").unwrap_or_default();
+                e.get::<LuaValue>("action").ok().and_then(|a| lua_action(&lua, a)).map(|a| (label, a))
+            }).collect(),
+            Err(_) => default_shortcuts(),
+        };
         self.palette_extra.clear();
         if let Ok(p) = t.get::<Table>("palette") {
             for e in p.sequence_values::<Table>().flatten() {
@@ -754,6 +818,7 @@ impl Gui {
         let ap = self.frame.active_pane;
         match name {
             "palette" => self.open_palette(),
+            "menu" => { let n = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string(); self.open_menu(&n); }
             "split" => self.cmd(json!({"cmd": "spawn", "where": if s(0).is_empty() { "right".into() } else { s(0) },
                 "pane": ap, "domain": args.get(1).cloned().unwrap_or(Value::Null)})),
             "new_tab" => self.cmd(json!({"cmd": "spawn", "where": "tab", "domain": args.first().cloned().unwrap_or(Value::Null)})),
@@ -1126,6 +1191,45 @@ impl Gui {
     }
 
     fn open_palette(&mut self) {
+        let items = self.palette_items(true);
+        let mut o = Overlay::list("Paleta: comandos, abas, sessoes, historico e arquivos", items);
+        o.palette = true;
+        self.overlay = Some(o);
+    }
+
+    /// Menu por assunto: a paleta filtrada pelos prefixos do menu. "atalhos"
+    /// lista todos os atalhos de teclado ligados.
+    fn open_menu(&mut self, name: &str) {
+        if name == "atalhos" { return self.open_shortcuts(); }
+        let Some(m) = self.menus.iter().find(|m| m.name == name).cloned() else { return self.flash(&format!("Menu {name} nao existe (config menus)")) };
+        let pats: Vec<String> = m.matches.iter().map(|p| fold_str(p)).collect();
+        let items: Vec<Item> = self.palette_items(false).into_iter()
+            .filter(|i| { let (l, h) = (fold_str(&i.label), fold_str(&i.hint)); pats.iter().any(|p| l.starts_with(p.as_str()) || h.starts_with(p.as_str())) })
+            .collect();
+        let mut o = Overlay::list(&m.title, items);
+        o.palette = true;
+        self.overlay = Some(o);
+    }
+
+    /// Todos os atalhos ligados, com o nome do comando da paleta quando houver.
+    fn open_shortcuts(&mut self) {
+        let names: Vec<Item> = self.palette_items(false);
+        let mut items: Vec<Item> = Vec::new();
+        for b in self.keys.clone() {
+            let Action::Builtin(n, args) = &b.action else { continue };
+            let hint = self.hint_for(n, args.first().and_then(|v| v.as_str()));
+            if hint.is_empty() || items.iter().any(|i| i.hint == hint) { continue; }
+            let label = names.iter().find(|i| matches!(&i.action, Action::Builtin(a, x) if a == n && x == args)).map(|i| i.label.clone())
+                .unwrap_or_else(|| n.replace('_', " "));
+            items.push(Item { label, hint, action: b.action.clone(), pane: None });
+        }
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        let mut o = Overlay::list("Atalhos (troque em keys no ~/.duck.lua)", items);
+        o.palette = true;
+        self.overlay = Some(o);
+    }
+
+    fn palette_items(&mut self, full: bool) -> Vec<Item> {
         let b = |label: &str, action: &str, args: Vec<Value>| (label.to_string(), action.to_string(), args);
         let mut defs = vec![
             b("Dividir pane a direita", "split", vec![json!("right")]),
@@ -1183,6 +1287,11 @@ impl Gui {
             b("Galeria de temas (previa ao vivo)", "theme_gallery", vec![]),
             b("Tema a partir do papel de parede", "wallpaper_theme", vec![]),
             b("Extensões: ativar, configurar, contas e tokens", "extensions", vec![]),
+            b("Menu: orquestração", "menu", vec![json!("orquestracao")]),
+            b("Menu: extensões", "menu", vec![json!("extensoes")]),
+            b("Menu: janela (abas, panes, workspaces)", "menu", vec![json!("janela")]),
+            b("Menu: configuração", "menu", vec![json!("config")]),
+            b("Menu: todos os atalhos", "menu", vec![json!("atalhos")]),
         ];
         defs.extend([
             b("Agentes: corrigir com agente o ultimo comando que falhou", "fix_with_agent", vec![]),
@@ -1211,11 +1320,9 @@ impl Gui {
             Item::new(label, hint, &action, args)
         }).collect();
         items.extend(self.palette_extra.iter().cloned());
-        self.palette_more(&mut items);
+        if full { self.palette_more(&mut items); }
         self.ext_palette(&mut items);
-        let mut o = Overlay::list("Paleta: comandos, abas, sessoes, historico e arquivos", items);
-        o.palette = true;
-        self.overlay = Some(o);
+        items
     }
 
     fn open_settings(&mut self) {
@@ -2011,8 +2118,8 @@ impl Gui {
                 "stopped" => "Loop parado".to_string(),
                 _ => format!("Loop desistiu depois de {} volta(s): {}", ev["iter"], ev["check"].as_str().unwrap_or("")),
             };
+            // O aviso do Windows sai do server (com ou sem janela); aqui so o recado.
             self.flash(&msg);
-            if !self.focused && ev["phase"] != "stopped" { toast_actions(&msg, "", &[("Abrir".into(), format!("duck://focus/{pane}"))]); }
         }
         if name == "budget" { self.flash(&format!("Orcamento de tokens estourado: {} tokens", ev["tokens"])); }
         if name == "gui-action" {
@@ -2030,18 +2137,27 @@ impl Gui {
             if pane != 0 { self.cmd(json!({"cmd": "focus", "pane": pane})); }
             if let Some(r) = &self.r { r.window.set_minimized(false); r.window.focus_window(); }
         }
-        // Janela em foco: cartao dentro do Duck. Fora de foco: so o toast do Windows.
-        if name == "attention" && self.focused && pane != self.frame.active_pane { self.agent_card(pane, ev["state"].as_str().unwrap_or(""), &what); }
+        // Avisos sempre pelo cartao do Duck no canto da tela (fora da janela).
+        // Agente: so quando voce nao esta olhando para ele (janela sem foco ou
+        // outro pane ativo). O quick terminal nao avisa (a janela principal avisa).
         let quiet = self.toasted.get(&pane).is_some_and(|t| t.elapsed() < Duration::from_secs(60)) && name == "attention";
-        if self.cfg.notify && !self.focused && !quiet {
+        let unseen = !self.focused || (name == "attention" && pane != self.frame.active_pane);
+        if self.cfg.notify && unseen && !quiet && !self.quick {
             if name == "attention" { self.toasted.insert(pane, Instant::now()); }
             match name.as_str() {
                 "attention" => {
-                    let state = match ev["state"].as_str().unwrap_or("") { "blocked" => "precisa de voce", "done" => "terminou", _ => "chamou" };
+                    let state = match ev["state"].as_str().unwrap_or("") { "blocked" => "pede aprovacao", "done" => "terminou", _ => "chamou" };
+                    // A pergunta que o agente fez (ultima linha com '?').
+                    let q = if ev["state"] == "blocked" {
+                        self.call(json!({"cmd": "read", "pane": pane, "lines": 20})).ok()
+                            .and_then(|r| r["text"].as_str().and_then(|t| t.lines().rev().find(|l| l.contains('?')).map(|l| l.trim().chars().take(120).collect::<String>())))
+                    } else { None };
                     let acts: Vec<(String, String)> = if ev["state"] == "blocked" {
                         vec![("Aprovar".into(), format!("duck://approve/{pane}")), ("Negar".into(), format!("duck://deny/{pane}")), ("Abrir".into(), format!("duck://focus/{pane}"))]
                     } else { vec![("Abrir".into(), format!("duck://focus/{pane}"))] };
-                    toast_actions(&format!("Agente {state}"), &format!("{what} · {}", self.pane_place(pane)), &acts);
+                    let place = format!("{what} · {}", self.pane_place(pane));
+                    let body = match q { Some(q) => format!("{q}\n{place}"), None => place };
+                    toast_card(&format!("Agente {state}"), &body, &acts, Some(if ev["state"] == "blocked" { "working" } else { "done" }));
                     if let Some(r) = &self.r { r.window.request_user_attention(Some(UserAttentionType::Informational)); }
                 }
                 "budget" => toast("Orcamento de tokens", &format!("Os agentes ja gastaram {} tokens nesta rodada", ev["tokens"])),
@@ -2089,7 +2205,8 @@ impl Gui {
         drop(st);
         let theme = self.theme();
         let f = self.cfg_table.as_ref().and_then(|t| t.get::<Function>("status").ok());
-        let Some(f) = f else { return vec![(format!(" {} ", self.frame.workspace), theme.accent)] };
+        // Sem funcao status: nada (o workspace ja aparece no rodape).
+        let Some(f) = f else { return vec![] };
         let arg = to_lua(&self.lua, &info).unwrap_or(LuaValue::Nil);
         match f.call::<LuaValue>(arg).and_then(|v| self.lua.from_value::<Value>(v)) {
             Ok(Value::Array(segs)) => segs.into_iter().map(|s| match s {

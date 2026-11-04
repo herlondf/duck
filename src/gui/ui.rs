@@ -11,12 +11,12 @@ use super::*;
 use crate::render::Shape;
 use winit::window::ResizeDirection;
 
-pub(super) struct Chrome { pub top: f32, pub bottom: f32, pub left: f32, pub right: f32, pub bar_h: f32, pub margin: f32 }
+/// `bottom` soma, de cima para baixo: abas embaixo (`tabs_h`), rodape dos
+/// badges (`foot_h`) e barra de atalhos (`keys_h`).
+pub(super) struct Chrome { pub top: f32, pub bottom: f32, pub left: f32, pub right: f32, pub bar_h: f32, pub margin: f32, pub tabs_h: f32, pub foot_h: f32, pub keys_h: f32 }
 
 #[derive(Clone)]
 pub(super) struct Hit { pub r: [f32; 4], pub action: Action }
-
-pub(super) struct Card { pub id: u64, pub title: String, pub body: String, pub color: Rgb, pub buttons: Vec<(String, String, Vec<Value>)>, pub until: Instant }
 
 pub(super) struct AgentPanel {
     pub pane: u64, pub name: String, pub profile: String, pub state: String,
@@ -81,6 +81,27 @@ fn draw_avatar(r: &mut Renderer, l: &mut Layer, x: f32, y: f32, d: f32, color: R
 /// Icone do pane pelo dominio (Nerd Font embutida).
 fn pane_icon(domain: &str, wsl: bool) -> &'static str {
     if wsl { "\u{f17c}" } else if !domain.is_empty() { "\u{f0c2}" } else { "\u{e795}" }
+}
+
+/// Sino da caixa de entrada: icone e, com avisos nao lidos, o numero numa bolinha
+/// (vermelha quando um agente espera por voce).
+#[allow(clippy::too_many_arguments)]
+fn draw_bell(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, theme: &Theme, mouse: (f32, f32), br: [f32; 4], n: u64, blocked: bool) {
+    let hv = inside(br, mouse);
+    if hv { l.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(mix(theme.tab_bar, theme.fg, 0.12), 1.0), 6.0)); }
+    let (cw, ch) = (r.cell_w, r.cell_h);
+    let c = if blocked { theme.blocked } else if n > 0 || hv { theme.fg } else { theme.muted };
+    l.texts.push(TextItem { size: 0.9, ..mt(br[0] + (br[2] - cw * 0.9) / 2.0, br[1] + (br[3] - ch * 0.9) / 2.0, &super::ext::icon("bell"), c) });
+    if n > 0 {
+        let t = if n > 99 { "99+".to_string() } else { n.to_string() };
+        let tw = r.measure(&t, true, 0.6);
+        let dh = ch * 0.6 + 3.0;
+        let dw = (tw + 8.0).max(dh);
+        let (dx, dy) = (br[0] + br[2] / 2.0 + 1.0, br[1] - 2.0);
+        l.shapes.push(Shape::rect(dx, dy, dw, dh, lin(if blocked { theme.blocked } else { theme.accent }, 1.0), dh / 2.0));
+        l.texts.push(TextItem { bold: true, ..uit(dx + (dw - tw) / 2.0, dy + 1.5, &t, theme.bg, 0.6) });
+    }
+    hits.push(Hit { r: br, action: Action::Builtin("inbox".into(), vec![]) });
 }
 
 fn is_shortcut(h: &str) -> bool { ["Ctrl+", "Alt+", "Shift+", "Win+"].iter().any(|k| h.contains(k)) }
@@ -156,11 +177,14 @@ impl Gui {
         let ch = self.r.as_ref().map(|r| r.cell_h).unwrap_or(16.0);
         let bar_h = (ch + 16.0).max(32.0).round();
         let margin = if self.cfg.ui.cards { 8.0 } else { self.cfg.padding };
-        if self.focus_mode { return Chrome { top: 0.0, bottom: 0.0, left: 0.0, right: 0.0, bar_h, margin }; }
+        if self.focus_mode { return Chrome { top: 0.0, bottom: 0.0, left: 0.0, right: 0.0, bar_h, margin, tabs_h: 0.0, foot_h: 0.0, keys_h: 0.0 }; }
         let tb = self.cfg.tab_bar.as_str();
+        let tabs_h = if tb == "bottom" { bar_h } else { 0.0 };
+        let foot_h = if self.cfg.ui.footer && !self.quick { (ch + 10.0).max(28.0).round() } else { 0.0 };
+        let keys_h = if self.cfg.ui.shortcuts && !self.quick && !self.shortcuts.is_empty() { (ch * 0.8 + 10.0).max(22.0).round() } else { 0.0 };
         Chrome {
             top: if tb == "top" || self.custom_titlebar() { bar_h } else { 0.0 },
-            bottom: if tb == "bottom" { bar_h } else { 0.0 },
+            bottom: tabs_h + foot_h + keys_h, tabs_h, foot_h, keys_h,
             left: if tb == "left" { if self.sidebar_collapsed { 52.0 } else { self.cfg.ui.sidebar_width } } else { 0.0 },
             right: if self.ext_panel.is_some() || self.agent_panel.is_some() || self.sys_panel { self.ext_w } else { 0.0 },
             bar_h, margin,
@@ -268,13 +292,14 @@ impl Gui {
                 .filter(|(k, _)| g(k) > 0).map(|(k, t)| (format!("{} {t}", g(k)), k.to_string())).collect();
             ext_badges.push(("duck:agent_panel".into(), "\u{f06a9}".into(), "Agentes".into(), chips));
         }
-        if builtin_on("inbox") {
-            let n = self.frame.inbox_unread;
-            let blocked = self.frame.agents.get("blocked").copied().unwrap_or(0);
-            let mut chips = Vec::new();
-            if n > 0 { chips.push((n.to_string(), if blocked > 0 { "blocked".to_string() } else { "accent".to_string() })); }
-            ext_badges.push(("duck:inbox".into(), "bell".into(), "Avisos".into(), chips));
-        }
+        // A caixa de entrada nao e badge: o sino fica fixo ao lado do minimizar.
+        let inbox_on = builtin_on("inbox");
+        let inbox_n = self.frame.inbox_unread;
+        let inbox_blocked = self.frame.agents.get("blocked").copied().unwrap_or(0) > 0;
+        let shortcut_items: Vec<(String, String, Action)> = self.shortcuts.iter().map(|(label, a)| {
+            let hint = match a { Action::Builtin(n, args) => self.hint_for(n, args.first().and_then(|v| v.as_str())), _ => String::new() };
+            (label.clone(), hint, a.clone())
+        }).collect();
         for v in &self.exts.views {
             if ext_badges.iter().any(|b| b.0.starts_with(&format!("{}/", v.ext))) { continue; }
             let label = self.exts.label(&v.ext);
@@ -310,7 +335,6 @@ impl Gui {
         let mut pulse = false;
         self.hits.clear();
         self.tab_rects.clear();
-        self.cards.retain(|c| c.until > now);
         let r = self.r.as_mut().unwrap();
         let maximized = r.window.is_maximized();
         let (cw, ch) = (r.cell_w, r.cell_h);
@@ -770,7 +794,7 @@ impl Gui {
             }
         }
 
-        // ---- barra de titulo + abas
+        // ---- barra de titulo: inicio, abas, sino e botoes da janela
         let bar_h = chrome.bar_h;
         let ctx = TabCtx { theme: &theme, mouse, t: t_now, drag: self.tab_drag };
         if chrome.top > 0.0 {
@@ -783,18 +807,8 @@ impl Gui {
                 if hv { base.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(mix(theme.tab_bar, theme.fg, 0.12), 1.0), 6.0)); }
                 base.texts.push(TextItem { size: 0.9, ..txt(x + (bw - cw * 0.9) / 2.0, (bar_h - ch * 0.9) / 2.0, "\u{f015}", if hv { theme.fg } else { theme.muted }) });
                 self.hits.push(Hit { r: br, action: Action::Builtin("home".into(), vec![]) });
-                x += bw + 4.0;
+                x += bw + 6.0;
             }
-            // Chip do workspace (troca de workspace).
-            let wsz = 0.85;
-            let ww = r.measure(&ws_name, true, wsz) + 34.0;
-            let wr = [x, 7.0, ww, bar_h - 14.0];
-            let hv = inside(wr, mouse);
-            base.shapes.push(Shape::rect(wr[0], wr[1], wr[2], wr[3], lin(mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }), 1.0), 7.0));
-            base.texts.push(TextItem { size: 0.85, ..txt(x + 8.0, (bar_h - ch * 0.85) / 2.0, "\u{f009}", theme.accent) });
-            base.texts.push(uit(x + 24.0, (bar_h - ch * wsz) / 2.0, &ws_name, theme.fg, wsz));
-            self.hits.push(Hit { r: wr, action: Action::Builtin("workspace_switch".into(), vec![]) });
-            x += ww + 8.0;
             let mut rx = w;
             if custom {
                 for (glyph, act) in [("✕", "win_close"), (if maximized { "❐" } else { "☐" }, "win_max"), ("─", "win_min")] {
@@ -808,21 +822,81 @@ impl Gui {
                     self.hits.push(Hit { r: br, action: Action::Builtin(act.into(), vec![]) });
                 }
             }
+            // Sino da caixa de entrada: fixo ao lado do minimizar.
+            if inbox_on {
+                let bw = 38.0;
+                rx -= bw + 4.0;
+                draw_bell(r, &mut base, &mut self.hits, &theme, mouse, [rx, 7.0, bw, bar_h - 14.0], inbox_n as u64, inbox_blocked);
+            }
+            let mut tabs_end = x;
+            if tab_bar == "top" && !self.focus_mode {
+                self.tab_row = (0.0, bar_h);
+                let (end, pl) = tabs_row(r, &mut base, &mut self.hits, &mut self.tab_rects, x, 0.0, rx - 60.0, bar_h, &tab_labels, &ctx);
+                tabs_end = end;
+                pulse |= pl;
+            }
+            if tabs_end == x {
+                // Sem abas no topo: titulo do pane ativo no espaco livre.
+                let title = self.frame.panes.iter().find(|p| p.id == active).map(|p| p.title.clone()).unwrap_or_default();
+                let tw = r.measure(&title, true, 0.9);
+                let free = (x, rx - 20.0);
+                let tx = ((free.0 + free.1 - tw) / 2.0).max(free.0);
+                base.texts.push(TextItem { clip_right: Some(free.1), ..uit(tx, (bar_h - ch * 0.9) / 2.0, &title, theme.muted, 0.9) });
+            }
+        }
+        // ---- embaixo: abas (se a barra for embaixo), rodape dos badges e barra de atalhos
+        let tabs_y = h - chrome.bottom;
+        if chrome.tabs_h > 0.0 {
+            base.shapes.push(Shape::rect(0.0, tabs_y, w, chrome.tabs_h, lin(theme.tab_bar, alpha), 0.0));
+            self.tab_row = (tabs_y, bar_h);
+            let (_, pl) = tabs_row(r, &mut base, &mut self.hits, &mut self.tab_rects, 8.0, tabs_y, w - 8.0, bar_h, &tab_labels, &ctx);
+            pulse |= pl;
+        }
+        let foot_y = tabs_y + chrome.tabs_h;
+        let fh = chrome.foot_h;
+        self.badge_row = (foot_y, fh);
+        self.badge_rects.clear();
+        if fh + chrome.keys_h > 0.0 {
+            base.shapes.push(Shape::rect(0.0, foot_y, w, fh + chrome.keys_h, lin(theme.tab_bar, alpha), 0.0));
+            if chrome.tabs_h == 0.0 { base.quads.push(Quad { x: 0.0, y: foot_y, w, h: 1.0, color: lin(theme.border, 0.6) }); }
+        }
+        if fh > 0.0 {
+            let (py, ph) = (foot_y + 4.0, fh - 8.0);
+            let cy = |size: f32| foot_y + (fh - ch * size) / 2.0;
+            // Workspace (troca de workspace).
+            let mut x = 8.0;
+            let wsz = 0.78;
+            let ww = r.measure(&ws_name, true, wsz) + 30.0;
+            let wr = [x, py, ww, ph];
+            let hv = inside(wr, mouse);
+            base.shapes.push(Shape::rect(wr[0], wr[1], wr[2], wr[3], lin(mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }), 1.0), ph / 2.0));
+            base.texts.push(TextItem { size: 0.78, ..txt(x + 8.0, cy(0.78), "\u{f009}", theme.accent) });
+            base.texts.push(uit(x + 22.0, cy(wsz), &ws_name, theme.fg, wsz));
+            self.hits.push(Hit { r: wr, action: Action::Builtin("workspace_switch".into(), vec![]) });
+            x += ww + 10.0;
+            let mut rx = w - 6.0;
+            // Sem barra de titulo (barra nativa e abas fora do topo): o sino vem para ca.
+            if inbox_on && chrome.top == 0.0 {
+                let bw = 36.0;
+                rx -= bw;
+                draw_bell(r, &mut base, &mut self.hits, &theme, mouse, [rx, py, bw, ph], inbox_n as u64, inbox_blocked);
+                rx -= 4.0;
+            }
             // Extensoes: um badge por extensao (icone, nome e contadores).
             // Sem espaco (janela estreita): so icone + contador; o nome fica para quando couber.
-            let (ls, cs) = (0.78, 0.74);
+            let (ls, cs) = (0.76, 0.72);
             let width = |r: &mut Renderer, label: &str, chips: &[(String, String)], named: bool| 8.0 + cw * 0.9 + 5.0
                 + if named { r.measure(label, true, ls) } else { 0.0 } + chips.iter().map(|c| r.measure(&c.0, true, cs) + 14.0).sum::<f32>() + 8.0 + 4.0;
             let full: f32 = ext_badges.iter().map(|b| width(r, &b.2, &b.3, true)).sum();
-            let named = full <= (rx - x - 360.0).max(0.0);
-            self.badge_rects.clear();
+            let named = full <= (rx - x - 220.0).max(0.0);
             let dragging = self.badge_drag.as_ref().filter(|d| d.2).map(|d| d.0.clone());
             for (key, icon, label, chips) in ext_badges.iter().rev() {
                 let chip_w: Vec<f32> = chips.iter().map(|c| r.measure(&c.0, true, cs) + 10.0).collect();
                 let label = if named { label.as_str() } else { "" };
                 let bw = width(r, label, chips, named) - 4.0;
+                if rx - bw - 4.0 < x { break; }
                 rx -= bw + 4.0;
-                let br = [rx, 8.0, bw, bar_h - 16.0];
+                let br = [rx, py, bw, ph];
                 let open = match key.strip_prefix("duck:") {
                     Some("sys_panel") => sys_open,
                     Some("agent_panel") => agent_open,
@@ -831,75 +905,76 @@ impl Gui {
                 };
                 let hv = inside(br, mouse);
                 base.shapes.push(Shape::rect(br[0], br[1], br[2], br[3],
-                    lin(if open { theme.accent } else { mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }) }, if open { 0.3 } else { 1.0 }), (bar_h - 16.0) / 2.0));
+                    lin(if open { theme.accent } else { mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }) }, if open { 0.3 } else { 1.0 }), ph / 2.0));
                 let mut bx = rx + 8.0;
-                base.texts.push(TextItem { size: 0.85, ..txt(bx, (bar_h - ch * 0.85) / 2.0, &super::ext::icon(icon), if open || hv { theme.fg } else { theme.muted }) });
+                base.texts.push(TextItem { size: 0.82, ..txt(bx, cy(0.82), &super::ext::icon(icon), if open || hv { theme.fg } else { theme.muted }) });
                 bx += cw * 0.9 + 5.0;
                 if named {
-                    base.texts.push(uit(bx, (bar_h - ch * ls) / 2.0, label, if open || hv { theme.fg } else { theme.muted }, ls));
+                    base.texts.push(uit(bx, cy(ls), label, if open || hv { theme.fg } else { theme.muted }, ls));
                     bx += r.measure(label, true, ls) + 4.0;
                 }
-                for ((t, color), w) in chips.iter().zip(&chip_w) {
+                for ((t, color), cwid) in chips.iter().zip(&chip_w) {
                     let c = if color.is_empty() { theme.accent } else { theme.named(color) };
-                    let chh = ch * 0.95;
-                    base.shapes.push(Shape::rect(bx, (bar_h - chh) / 2.0, *w, chh, lin(c, 0.22), chh / 2.0));
-                    base.texts.push(uit(bx + 5.0, (bar_h - ch * cs) / 2.0, t, c, cs));
-                    bx += w + 4.0;
+                    let chh = (ch * 0.9).min(ph - 4.0);
+                    base.shapes.push(Shape::rect(bx, foot_y + (fh - chh) / 2.0, *cwid, chh, lin(c, 0.22), chh / 2.0));
+                    base.texts.push(uit(bx + 5.0, cy(cs), t, c, cs));
+                    bx += cwid + 4.0;
                 }
                 let action = match key.strip_prefix("duck:") {
                     Some(a) => Action::Builtin(a.into(), vec![]),
                     None => Action::Builtin("ext_view".into(), vec![json!(key)]),
                 };
                 if dragging.as_deref() == Some(badge_name(key)) {
-                    base.shapes.push(Shape::ring(br[0], br[1], br[2], br[3], lin(theme.accent, 1.0), (bar_h - 16.0) / 2.0, 1.5));
+                    base.shapes.push(Shape::ring(br[0], br[1], br[2], br[3], lin(theme.accent, 1.0), ph / 2.0, 1.5));
                 }
                 // O clique e tratado pelo arrasto (press + release): sem Hit aqui.
                 self.badge_rects.push((br[0], br[0] + br[2], badge_name(key).to_string(), action));
             }
-            // Abas primeiro; o status fica com o que sobrar (cortado pela esquerda).
-            let ssz = 0.85;
-            let mut tabs_end = x;
-            if tab_bar == "top" && !self.focus_mode {
-                self.tab_row = (0.0, bar_h);
-                let (end, pl) = tabs_row(r, &mut base, &mut self.hits, &mut self.tab_rects, x, 0.0, rx - 60.0, bar_h, &tab_labels, &ctx);
-                tabs_end = end;
-                pulse |= pl;
-            }
-            let room = rx - tabs_end - 14.0;
-            let status_w: f32 = status.iter().map(|(s, _)| s.chars().count() as f32 * cw * ssz).sum::<f32>().min(room * 0.6);
-            if tabs_end == x {
-                // Sem abas no topo: titulo do pane ativo no espaco livre.
-                let title = self.frame.panes.iter().find(|p| p.id == active).map(|p| p.title.clone()).unwrap_or_default();
-                let tw = r.measure(&title, true, 0.9);
-                let free = (x, rx - status_w - 20.0);
-                let tx = ((free.0 + free.1 - tw) / 2.0).max(free.0);
-                base.texts.push(TextItem { clip_right: Some(free.1), ..uit(tx, (bar_h - ch * 0.9) / 2.0, &title, theme.muted, 0.9) });
-                tabs_end = rx - status_w - 14.0;
-            }
-            let room = rx - tabs_end - 14.0;
+            // Status da config (funcao `status`) no meio; corta pela esquerda se faltar espaco.
+            let ssz = 0.8;
+            let room = rx - x - 12.0;
             let mut segs: Vec<&(String, Rgb)> = status.iter().collect();
             while segs.len() > 1 && segs.iter().map(|(s, _)| s.chars().count() as f32 * cw * ssz).sum::<f32>() > room { segs.remove(0); }
-            let total: f32 = segs.iter().map(|(s, _)| s.chars().count() as f32 * cw * ssz).sum();
-            let mut sx = (rx - total - 10.0).max(tabs_end + 4.0);
+            let mut sx = x;
             for (s, c) in segs {
                 let sw = s.chars().count() as f32 * cw * ssz;
-                // CPU/RAM abre o painel do sistema.
                 if s.contains("CPU") || s.contains("RAM") {
-                    let hr = [sx, 7.0, sw, bar_h - 14.0];
+                    let hr = [sx, py, sw, ph];
                     let on = inside(hr, mouse) || self.sys_panel;
                     if on { base.shapes.push(Shape::rect(hr[0], hr[1], hr[2], hr[3], lin(mix(theme.tab_bar, theme.fg, if self.sys_panel { 0.12 } else { 0.08 }), 1.0), 6.0)); }
                     self.hits.push(Hit { r: hr, action: Action::Builtin("sys_panel".into(), vec![]) });
                 }
-                base.texts.push(TextItem { size: ssz, clip_right: Some(rx - 4.0), ..txt(sx, (bar_h - ch * ssz) / 2.0, s, *c) });
+                base.texts.push(TextItem { size: ssz, clip_right: Some(rx - 6.0), ..txt(sx, cy(ssz), s, *c) });
                 sx += sw;
             }
         }
-        if chrome.bottom > 0.0 {
-            let by = h - chrome.bottom;
-            base.shapes.push(Shape::rect(0.0, by, w, chrome.bottom, lin(theme.tab_bar, alpha), 0.0));
-            self.tab_row = (by, bar_h);
-            let (_, pl) = tabs_row(r, &mut base, &mut self.hits, &mut self.tab_rects, 8.0, by, w - 8.0, bar_h, &tab_labels, &ctx);
-            pulse |= pl;
+        // Barra de atalhos: os principais, com as teclas (config `shortcuts`).
+        if chrome.keys_h > 0.0 {
+            let (ky, kh) = (foot_y + fh, chrome.keys_h);
+            if fh > 0.0 { base.quads.push(Quad { x: 8.0, y: ky, w: w - 16.0, h: 1.0, color: lin(theme.border, 0.35) }); }
+            let (ks, ls) = (0.68, 0.74);
+            let cap_h = (kh - 8.0).max(12.0);
+            let mut x = 10.0;
+            for (label, hint, action) in &shortcut_items {
+                let caps: Vec<&str> = if hint.is_empty() { vec![] } else { hint.split('+').collect() };
+                let cap_w: Vec<f32> = caps.iter().map(|p| r.measure(p, true, ks) + 8.0).collect();
+                let caps_total: f32 = cap_w.iter().map(|c| c + 2.0).sum();
+                let lw = r.measure(label, true, ls);
+                let iw = caps_total + 4.0 + lw;
+                if x + iw > w - 8.0 { break; }
+                let ir = [x - 5.0, ky + 2.0, iw + 10.0, kh - 4.0];
+                let hv = inside(ir, mouse);
+                if hv { base.shapes.push(Shape::rect(ir[0], ir[1], ir[2], ir[3], lin(mix(theme.tab_bar, theme.fg, 0.10), 1.0), 5.0)); }
+                let mut cx = x;
+                for (p, pw) in caps.iter().zip(&cap_w) {
+                    base.shapes.push(Shape::rect(cx, ky + (kh - cap_h) / 2.0, *pw, cap_h, lin(mix(theme.tab_bar, theme.fg, 0.13), 1.0), 4.0));
+                    base.texts.push(uit(cx + 4.0, ky + (kh - ch * ks) / 2.0, p, theme.fg, ks));
+                    cx += pw + 2.0;
+                }
+                base.texts.push(uit(cx + 4.0, ky + (kh - ch * ls) / 2.0, label, if hv { theme.fg } else { theme.muted }, ls));
+                self.hits.push(Hit { r: ir, action: action.clone() });
+                x += iw + 18.0;
+            }
         }
         // Prévia da aba sob o mouse.
         if let (Some((idx, lines)), Some((_, _, _))) = (&self.tab_preview, self.tab_hover.map(|t| (t.0, 0, 0))) {
@@ -923,7 +998,7 @@ impl Gui {
             let from = self.badge_rects.iter().find(|b| &b.2 == name).map(|b| b.0);
             if let (Some(fx), Some(t)) = (from, self.badge_rects.iter().find(|b| mouse.0 >= b.0 && mouse.0 < b.1 && &b.2 != name)) {
                 let bx = if t.0 > fx { t.1 + 1.0 } else { t.0 - 3.0 };
-                base.shapes.push(Shape::rect(bx, 8.0, 2.0, chrome.bar_h - 16.0, lin(theme.accent, 1.0), 1.0));
+                base.shapes.push(Shape::rect(bx, self.badge_row.0 + 4.0, 2.0, self.badge_row.1 - 8.0, lin(theme.accent, 1.0), 1.0));
             }
         }
         // Arrastando aba: marca onde ela vai cair.
@@ -1242,38 +1317,6 @@ impl Gui {
             }
         }
 
-        // ---- cartoes de aviso (agente pede aprovacao, terminou...)
-        let mut cy = h - chrome.bottom - 12.0;
-        for c in self.cards.iter().rev().take(4) {
-            let (cwid, chh) = (360.0_f32.min(w - 24.0), 104.0);
-            cy -= chh;
-            let cx = w - chrome.right - cwid - 12.0;
-            modal.shapes.push(Shape::shadow(cx, cy + 4.0, cwid, chh, [0.0, 0.0, 0.0, 0.5], 12.0, 14.0));
-            modal.shapes.push(Shape::rect(cx, cy, cwid, chh, lin(mix(theme.tab_bar, theme.fg, 0.05), 1.0), 12.0));
-            modal.shapes.push(Shape::rect(cx, cy + 12.0, 4.0, chh - 24.0, lin(c.color, 1.0), 2.0));
-            modal.texts.push(TextItem { bold: true, clip_right: Some(cx + cwid - 30.0), ..uit(cx + 16.0, cy + 10.0, &c.title, theme.fg, 0.95) });
-            modal.texts.push(TextItem { clip_right: Some(cx + cwid - 12.0), ..uit(cx + 16.0, cy + 12.0 + ch, &c.body, theme.muted, 0.85) });
-            let xr = [cx + cwid - 28.0, cy + 8.0, 20.0, 20.0];
-            modal.texts.push(uit(xr[0] + 4.0, xr[1], "✕", if inside(xr, mouse) { theme.fg } else { theme.muted }, 0.8));
-            self.hits.push(Hit { r: xr, action: Action::Builtin("card_close".into(), vec![json!(c.id)]) });
-            let mut bx = cx + cwid - 12.0;
-            for (k, (label, act, args)) in c.buttons.iter().enumerate().rev() {
-                let bw = r.measure(label, true, 0.85) + 22.0;
-                bx -= bw;
-                let br = [bx, cy + chh - 38.0, bw, 28.0];
-                let hv = inside(br, mouse);
-                let primary = k == 0;
-                let bg = if primary { c.color } else { mix(theme.tab_bar, theme.fg, 0.12) };
-                modal.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(if hv { mix(bg, theme.fg, 0.15) } else { bg }, 1.0), 7.0));
-                modal.texts.push(uit(bx + 11.0, br[1] + (28.0 - ch * 0.85) / 2.0, label, if primary { theme.bg } else { theme.fg }, 0.85));
-                let mut a = vec![json!(c.id), json!(act)];
-                a.extend(args.iter().cloned());
-                self.hits.push(Hit { r: br, action: Action::Builtin("card".into(), a) });
-                bx -= 6.0;
-            }
-            cy -= 10.0;
-        }
-
         // ---- mensagem curta (erro de config, "copiado"...)
         if let Some((msg, at)) = &self.message {
             if at.elapsed() < Duration::from_secs(if self.cfg_error.as_deref() == Some(msg.as_str()) { 15 } else { 4 }) {
@@ -1377,10 +1420,10 @@ impl Gui {
         }
         r.draw(clear, &[base, flt, over, modal]);
         if r.animated() { r.window.request_redraw(); }
-        // Proximo quadro: animacao (60 fps), pulso/piscar (15 fps) ou fim de um cartao.
+        // Proximo quadro: animacao (60 fps) ou pulso/piscar (15 fps).
         let next = if animating { Some(now + Duration::from_millis(16)) }
             else if pulse || blinking { Some(now + Duration::from_millis(66)) }
-            else { self.cards.iter().map(|c| c.until).min() };
+            else { None };
         if let Some(t) = next { self.redraw_at = Some(self.redraw_at.map_or(t, |x| x.min(t))); }
     }
 
@@ -1411,7 +1454,7 @@ impl Gui {
                 }
             }
             // Badge de extensao: clique abre; segurar e arrastar reordena.
-            if self.overlay.is_none() && button == MouseButton::Left && y < self.chrome().top {
+            if self.overlay.is_none() && button == MouseButton::Left && y >= self.badge_row.0 && y < self.badge_row.0 + self.badge_row.1 {
                 if let Some(b) = self.badge_rects.iter().find(|b| x >= b.0 && x < b.1) {
                     self.badge_drag = Some((b.2.clone(), x, false));
                     return;
@@ -1634,7 +1677,7 @@ impl Gui {
         }
         let ctrl = self.mods.control_key();
         let c = self.chrome();
-        let over_hit = self.hits.iter().any(|hh| inside(hh.r, (x, y))) || (y < c.top && self.badge_rects.iter().any(|b| x >= b.0 && x < b.1));
+        let over_hit = self.hits.iter().any(|hh| inside(hh.r, (x, y))) || (y >= self.badge_row.0 && y < self.badge_row.0 + self.badge_row.1 && self.badge_rects.iter().any(|b| x >= b.0 && x < b.1));
         let icon = match self.resize_edge {
             Some(ResizeDirection::West | ResizeDirection::East) => CursorIcon::EwResize,
             Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
@@ -1858,13 +1901,6 @@ impl Gui {
                 let abs = (frac * (hist + rows) as f64) as i64;
                 self.cmd(json!({"cmd": "goto-line", "pane": pane, "line": abs - hist}));
             }
-            "card" => {
-                let id = n(0) as u64;
-                self.cards.retain(|c| c.id != id);
-                let act = s(1);
-                if !act.is_empty() { self.builtin(&act, &args[2..]); }
-            }
-            "card_close" => { let id = n(0) as u64; self.cards.retain(|c| c.id != id); }
             "send_pane" => self.cmd(json!({"cmd": "send", "pane": n(0), "text": s(1)})),
             "search_prev" => self.search_step(1),
             "goto_tab" => {
@@ -2042,29 +2078,6 @@ impl Gui {
             session_tokens: a["session_tokens"].as_u64(), plan, fetched: Instant::now(),
             todo: a["todo_done"].as_u64().zip(a["todo_total"].as_u64()),
         });
-    }
-
-    /// Cartao quando um agente fora de vista pede aprovacao ou termina.
-    pub(super) fn agent_card(&mut self, pane: u64, state: &str, what: &str) {
-        let theme = self.theme().clone();
-        self.card_seq += 1;
-        let id = self.card_seq;
-        let (title, color, buttons, secs) = match state {
-            "blocked" => {
-                let q = self.call(json!({"cmd": "read", "pane": pane, "lines": 20})).ok()
-                    .and_then(|r| r["text"].as_str().and_then(|t| t.lines().rev().find(|l| l.contains('?')).map(|l| l.trim().to_string())));
-                (format!("Agente pede aprovacao{}", q.map(|q| format!(": {q}")).unwrap_or_default()), theme.working, vec![
-                    ("Aprovar".to_string(), "send_pane".to_string(), vec![json!(pane), json!("1")]),
-                    ("Negar".to_string(), "send_pane".to_string(), vec![json!(pane), json!("\x1b")]),
-                    ("Abrir".to_string(), "focus_pane".to_string(), vec![json!(pane)]),
-                ], 120)
-            }
-            "done" => ("Agente terminou".to_string(), theme.done, vec![("Abrir".to_string(), "focus_pane".to_string(), vec![json!(pane)])], 12),
-            _ => return,
-        };
-        self.cards.retain(|c| !c.buttons.iter().any(|b| b.2.first() == Some(&json!(pane))));
-        self.cards.push(Card { id, title, body: format!("{what} · {}", self.pane_place(pane)), color, buttons, until: Instant::now() + Duration::from_secs(secs) });
-        self.redraw();
     }
 
     /// Linha do tempo da sessao do agente: pedidos, ferramentas, arquivos, erros.

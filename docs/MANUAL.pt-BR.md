@@ -40,6 +40,11 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
 | Atalho | Ação |
 |---|---|
 | `Ctrl+Shift+P` | Paleta de comandos (busca fuzzy, mostra o atalho de cada ação) |
+| `Ctrl+Shift+1` | Menu Orquestração: agentes, loop, mapa, caixa de entrada, worktree |
+| `Ctrl+Shift+2` | Menu Extensões: painéis e comandos das extensões |
+| `Ctrl+Shift+3` | Menu Janela: abas, panes e workspaces |
+| `Ctrl+Shift+4` | Menu Configuração |
+| `Ctrl+Shift+/` | Todos os atalhos ligados, com o nome de cada comando |
 | `Ctrl+,` | Configurações (tema, fonte, opacidade, segurança…) |
 | `Alt+\` / `Alt+-` | Dividir à direita / abaixo |
 | `Alt+W` / `Alt+Z` | Fechar pane / zoom do pane |
@@ -88,9 +93,33 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
 
 ## Visual (rodada de UI/UX)
 
-- **Barra de titulo propria:** abas em pilula, chip do workspace, inicio,
-  painel do agente e os botoes da janela na mesma faixa. Arraste a area
-  vazia para mover; duplo clique maximiza; as bordas redimensionam.
+- **Barra de titulo propria:** inicio, abas em pilula, o sino da caixa de
+  entrada (fixo ao lado do minimizar, com o numero de nao lidos) e os botoes
+  da janela. Arraste a area vazia para mover; duplo clique maximiza; as
+  bordas redimensionam.
+- **Rodape:** o workspace (clique troca), o status da config (funcao
+  `status`) e um badge por extensao (sistema, agentes, Azure, Jira...).
+  Clique abre o painel; arrastar reordena. `ui = { footer = false }` esconde.
+- **Barra de atalhos:** abaixo do rodape, os atalhos principais com as teclas
+  (clique tambem funciona). Troque a lista em `shortcuts` e esconda com
+  `ui = { shortcuts = false }`. Os menus por assunto (`Ctrl+Shift+1..4`) sao a
+  paleta filtrada; mude ou crie menus em `menus`:
+  ```lua
+  shortcuts = {
+    { label = 'Paleta', action = A('palette') },
+    { label = 'Orquestração', action = A('menu', 'orquestracao') },
+    { label = 'Deploy', action = A('menu', 'deploy') },
+  },
+  menus = {
+    -- prefixos do rotulo (ou da dica) dos comandos da paleta, sem acento/caixa
+    deploy = { title = 'Deploy', match = { 'Azure', 'Git:' } },
+  },
+  ```
+- **Avisos:** sempre pelo cartao do Duck no canto da tela (fora da janela),
+  com os botoes (Aprovar/Negar/Abrir, acoes da extensao). Agente avisa quando
+  voce nao esta olhando para ele (janela sem foco ou outro pane ativo);
+  extensoes e loops avisam sempre. Em tela cheia vira o toast nativo do
+  Windows. Tudo fica tambem na caixa de entrada.
 - **Abas:** icone do processo (pwsh, WSL, SSH) ou avatar do perfil do agente;
   ponto pulsando enquanto o agente trabalha, ambar quando pede aprovacao,
   ✓ quando termina; barra de progresso (plano do agente ou OSC 9;4); ✕ no
@@ -108,9 +137,9 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
 - **Minimapa:** a barra de rolagem mostra cada comando (verde ok, vermelho
   falhou) e as ocorrencias da busca; clique pula para o ponto.
 - **Agentes:** painel lateral (`Ctrl+Shift+I`) com plano, tokens e custo;
-  linha do tempo da sessao (`Ctrl+Shift+Y`); cartao com Aprovar/Negar/Abrir
-  quando um agente fora de vista pede algo; toast do Windows com os mesmos
-  botoes (protocolo `duck://`).
+  linha do tempo da sessao (`Ctrl+Shift+Y`); aviso no canto da tela com
+  Aprovar/Negar/Abrir quando um agente fora de vista pede algo (protocolo
+  `duck://`).
 - **Digitacao:** editor de comando (`Ctrl+Shift+Enter`: varias linhas,
   selecao, Ctrl+Z/Y); popup de autocompletar (`Alt+↑↓` escolhe, `Alt+Enter`
   aceita); realce do comando; cursor que desliza.
@@ -157,7 +186,7 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
   agente, os panes que ele abriu pela API e os subagentes da sessão do Claude
   Code (lidos de `subagents/*.meta.json`), com estado ao vivo, plano e loop.
   Enter foca o pane; num subagente, mostra o pedido e a última resposta.
-- **Caixa de entrada (`Ctrl+Shift+J` ou o sino da barra):** primeiro os
+- **Caixa de entrada (`Ctrl+Shift+J` ou o sino ao lado do minimizar):** primeiro os
   agentes esperando aprovação, depois os últimos 60 avisos (extensões,
   agentes, loops), inclusive os que chegaram com a janela fechada. O número no
   sino são os não lidos (vermelho quando um agente espera).

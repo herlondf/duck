@@ -297,6 +297,10 @@ pub struct Ui {
     pub sidebar_width: f32,
     /// Cores de avatar por perfil de agente: { trabalho = '#f38ba8' }.
     pub agent_colors: HashMap<String, Rgb>,
+    /// Barra de rodape com os badges (sistema, agentes, extensoes) e o status.
+    pub footer: bool,
+    /// Barra de atalhos abaixo do rodape (lista em `shortcuts`).
+    pub shortcuts: bool,
 }
 
 pub fn home() -> PathBuf {
@@ -561,6 +565,8 @@ fn parse_ui(u: Option<Table>) -> Ui {
         sidebar_width: n(&u, "sidebar_width", 230.0) as f32,
         agent_colors: u.get::<Table>("agent_colors").map(|c| c.pairs::<String, String>().flatten()
             .filter_map(|(k, v)| Some((k, Rgb::parse(&v)?))).collect()).unwrap_or_default(),
+        footer: b("footer", true),
+        shortcuts: b("shortcuts", true),
     }
 }
 

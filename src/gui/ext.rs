@@ -181,22 +181,8 @@ impl Gui {
                 match self.exts.status.iter_mut().find(|x| x.ext == ext && x.id == id) { Some(x) => *x = st, None => self.exts.status.push(st) }
                 self.exts.status.retain(|x| !x.text.is_empty());
             }
-            "notify" => {
-                let theme = self.theme().clone();
-                let item = s("item");
-                let acts: Vec<(String, String)> = m["actions"].as_array().into_iter().flatten()
-                    .map(|a| (a["id"].as_str().unwrap_or("").to_string(), a["title"].as_str().unwrap_or("").to_string())).collect();
-                if self.focused {
-                    self.card_seq += 1;
-                    let buttons = acts.iter().map(|(id, t)| (t.clone(), "ext_action".to_string(), vec![json!(ext), json!(id), json!(item)])).collect();
-                    let color = if m["color"].is_string() { theme.named(&s("color")) } else { theme.accent };
-                    self.cards.push(Card { id: self.card_seq, title: s("title"), body: s("body"), color, buttons, until: Instant::now() + Duration::from_secs(m["seconds"].as_u64().unwrap_or(15)) });
-                } else {
-                    let enc = |x: &str| x.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
-                    let urls = acts.iter().map(|(id, t)| (t.clone(), format!("duck://ext/{ext}/{}/{}", enc(id), enc(&item)))).collect::<Vec<_>>();
-                    crate::gui::toast_card(&s("title"), &s("body"), &urls, m["color"].as_str());
-                }
-            }
+            // Avisos saem do server direto para o cartao no canto da tela.
+            "notify" => {}
             "detail" => {
                 let actions = m["actions"].as_array().into_iter().flatten().map(|a| (
                     a["id"].as_str().unwrap_or("").to_string(), a["title"].as_str().unwrap_or("").to_string(),

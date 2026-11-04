@@ -293,6 +293,17 @@ Desempenho
 - [x] Janela minimizada solta textos, atlas de glifos e alvo do shader e devolve a memória: working set de 169 MB para 14 MB. A memória reservada pelo driver não muda
 - [x] Minimizar não encolhe mais os terminais para 2x2 (o Windows manda 160x28; antes tudo requebrava)
 
+## Fase 11 — Barras, menus, avisos e releases do Azure (04/11/2026)
+
+Conferido numa instância isolada com prints; o Azure contra a org real (só leitura).
+
+- [x] Sino da caixa de entrada só como ícone, fixo ao lado do minimizar (número de não lidos; vermelho quando um agente espera)
+- [x] Rodapé com o workspace, o status e os badges das extensões (arrastar reordena); em cima ficam só início, abas e sino (`ui.footer`)
+- [x] Barra de atalhos abaixo do rodapé, clicável, configurável em `shortcuts` (`ui.shortcuts`)
+- [x] Menus por assunto (`Ctrl+Shift+1..4`: orquestração, extensões, janela, configuração) e todos os atalhos (`Ctrl+Shift+/`); `menus` cria ou muda
+- [x] Avisos sempre pelo cartão do Duck no canto da tela: agentes (também com a janela em foco, se o pane não está à vista), extensões e loops; saíram os cartões de dentro da janela
+- [x] Azure: releases por projeto, configuráveis (`releases`): release clássica por ambiente (`stages`, `rotulo=Ambiente`) ou pipeline por branch (`branches`); release, build, branch, quando e quem; histórico dos últimos 15; aviso quando um deploy termina; badge com deploy que falhou; comando que lista as definições e os ambientes
+
 ## Próximos passos sugeridos
 
 1. Rodar `install.ps1 -ClaudeHooks -Boot` e usar no dia a dia junto com o WezTerm.
