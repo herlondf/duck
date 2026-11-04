@@ -1,0 +1,9 @@
+{
+  "name": "rotinas",
+  "title": "Rotinas",
+  "icon": "clock",
+  "version": "0.1.0",
+  "category": "Agentes",
+  "description": "Pedidos ao Claude Code em horários marcados (cron ou a cada N minutos), rodando enquanto o Duck estiver aberto, com aviso do resultado. Uma rotina por arquivo em ~/.duck/rotinas/*.md",
+  "command": ["node", "dist/index.js"]
+}

@@ -117,6 +117,7 @@ terminal, e uma extensão desligada não gasta memória.
 | Tarefas e erros | **Jira** (Server/DC e Cloud), **Rollbar** (erros ativos, resolver, silenciar), **Grafana** (consultas LogQL no Loki, aviso quando a contagem sobe) |
 | Infraestrutura | **Containers** (Docker e Podman, também dentro do WSL), **Banco de dados** (consultas salvas em Postgres e Redis, só leitura por padrão), **Portas** (portas TCP abertas e o processo de cada uma) |
 | Dia a dia | **Agenda** (Google/Outlook por URL iCal, lembretes e botão Entrar), **Notas** (por projeto e geral), **Snippets** (trechos de comando e histórico do que foi copiado), **Uso do Claude** (limites de 5h/7d e custo por perfil do Claude Code) |
+| Agentes | **Rotinas** (pedidos ao Claude Code em horários marcados, com cron ou a cada N minutos, usando o login do plano; o resultado vira aviso e fica no histórico) |
 | Outras | **Google Play** (releases e avaliações, com resposta), **Home Assistant** (luzes, interruptores, cortinas, avisos) |
 
 Compile com `install.ps1 -Extensions` (ou `./install.sh --extensions`). Elas

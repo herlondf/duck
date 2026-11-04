@@ -115,6 +115,7 @@ terminal down, and an extension that is turned off costs no memory.
 | Issues and errors | **Jira** (Server/DC and Cloud), **Rollbar** (active errors, resolve, mute), **Grafana** (LogQL queries on Loki, alert when a count goes up) |
 | Infrastructure | **Containers** (Docker and Podman, also inside WSL), **Database** (saved Postgres and Redis queries, read-only by default), **Ports** (listening TCP ports and their process) |
 | Daily use | **Calendar** (Google/Outlook via iCal URL, reminders and Join button), **Notes** (per project and global), **Snippets** (command snippets and clipboard history), **Claude usage** (5h/7d limits and cost per Claude Code profile) |
+| Agents | **Routines** (requests to Claude Code on a schedule, cron or every N minutes, using the plan's login; the answer becomes a notification and is kept in a history) |
 | Others | **Google Play** (releases and reviews, reply to reviews), **Home Assistant** (lights, switches, covers, alerts) |
 
 Build them with `install.ps1 -Extensions` (or `./install.sh --extensions`).
