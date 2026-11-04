@@ -248,14 +248,27 @@ config. Nos exemplos, troque os nomes de conta e as URLs pelos seus.
   azure = { enabled = true, orgs = {
     { name = 'empresa', url = 'https://dev.azure.com/empresa', project = 'proj',
       releases = {
-        -- Release clássica: o último deploy de cada ambiente.
-        -- 'rotulo=Ambiente' troca o nome mostrado (o ambiente é o nome no Azure).
-        { name = 'API', definition = 'api-cd', stages = { 'develop=Dev', 'tst=Tst', 'master=Prod' } },
+        -- Todos os projetos de uma vez: cada release clássica com deploy nos
+        -- últimos 30 dias vira uma linha "develop ✓ #12 · tst ✓ #13 · master ✗ #14".
+        { auto = true, branches = { 'develop', 'tst', 'master' } },
+        -- Um projeto só: o último deploy de cada ambiente.
+        -- 'rotulo=Ambiente' troca o nome mostrado; 'Prd|Prod' aceita qualquer um.
+        { name = 'API', definition = 'api-cd', stages = { 'develop=Dev', 'tst=Tst', 'master=Prd|Prod' } },
         -- Pipeline YAML ou CI: o último build de cada branch.
         { name = 'Portal', pipeline = 'portal-ci', branches = { 'develop', 'tst', 'master' } },
       } },
   } },
   ```
+  - **Modo automático (`auto = true`):** não precisa listar projeto nenhum.
+    O ambiente de cada branch sai do filtro de branch do gatilho do próprio
+    ambiente (o Dev que publica `develop`); sem filtro, pelo nome (develop →
+    Dev, tst → Tst/QA/Hml, master → Prd/Prod). Filtros: `path = 'backend'`
+    (pasta das releases), `match = 'api'` e `exclude = 'legado'`
+    (expressões no nome), `days = 30` (janela) e `name = 'Releases'` (título
+    da seção). Pode ter mais de um, cada um com seus filtros e nome.
+  - Projeto com deploy que falhou ou esperando aprovação fica no topo. A
+    linha abre o detalhe com os 5 últimos deploys de cada ambiente.
+  - `notify = false` num item de `releases` desliga os avisos só dele.
   - Org antiga (`https://empresa.visualstudio.com`) também funciona.
   - Cada release aceita `project = '...'` quando estiver em outro projeto.
   - `release_notify = false` na org desliga o aviso de deploy terminado.
@@ -264,7 +277,8 @@ config. Nos exemplos, troque os nomes de conta e as URLs pelos seus.
   configurar)". Lista as definições e os ambientes de cada uma, com um trecho
   pronto para copiar. Um ambiente digitado errado aparece no painel com os
   nomes que existem.
-- **No painel:** cada linha abre a release no navegador. "Historico" mostra os
+- **No painel:** no modo automático, cada linha abre o detalhe do projeto;
+  nos itens configurados um a um, cada linha abre a release no navegador. "Historico" mostra os
   15 últimos deploys do ambiente. O badge do rodapé mostra quantos deploys
   falharam.
 

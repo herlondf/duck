@@ -54,7 +54,7 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
 | `Alt+F` | Pane flutuante (abre/esconde; continua rodando escondido) |
 | `Alt+←↑→↓` | Focar pane vizinho |
 | `Alt+P` | Modo redimensionar (`h/j/k/l` ou setas, `Esc` sai) |
-| `Alt+R` | Renomear aba |
+| `Alt+R` | Renomear aba (nome fixo: o título que o agente põe no terminal não muda mais a aba; vazio volta ao automático) |
 | `Alt+A` | Painel de agentes (`Enter` foca, `Ctrl+Y` aprova, `Ctrl+N` nega) |
 | `Ctrl+Shift+H` | Sessões do Claude para retomar (todos os perfis) |
 | `Ctrl+Shift+I` / `Ctrl+Shift+Y` | Painel do agente / linha do tempo da sessão |

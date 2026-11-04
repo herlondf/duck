@@ -872,8 +872,11 @@ impl Gui {
             "close_tab" => for id in self.frame.panes.iter().map(|p| p.id).collect::<Vec<_>>() { self.cmd(json!({"cmd": "close", "pane": id})) },
             "zoom" => self.cmd(json!({"cmd": "zoom"})),
             "rename_tab" => {
-                let cur = self.frame.tabs.iter().find(|t| t.active).map(|t| t.title.clone()).unwrap_or_default();
-                self.overlay = Some(Overlay::prompt("Novo nome da aba (nome|subtitulo; vazio volta ao automatico)", &cur, "rename_tab_to", vec![]));
+                // Sem nome fixo ainda: comeca com o que a aba mostra agora (Enter ja fixa).
+                let cur = self.frame.tabs.iter().find(|t| t.active)
+                    .map(|t| if t.title.is_empty() { self.tab_label(t, "").trim_start_matches(|c: char| !c.is_alphanumeric()).to_string() } else { t.title.clone() })
+                    .unwrap_or_default();
+                self.overlay = Some(Overlay::prompt("Nome fixo da aba: o agente nao muda mais (nome|subtitulo; vazio volta ao automatico)", &cur, "rename_tab_to", vec![]));
             }
             "rename_tab_to" => self.cmd(json!({"cmd": "rename-tab", "title": s(0)})),
             "tab_color" => {
@@ -2055,7 +2058,9 @@ impl Gui {
                 self.clip_seq = f.clipboard.0;
             }
             for p in &f.panes { if p.bell && self.cfg.visual_bell { self.bell_until.insert(p.id, Instant::now() + Duration::from_millis(220)); self.tick_in(Duration::from_millis(240)); } }
-            let title = f.panes.iter().find(|p| p.id == f.active_pane).map(|p| p.title.clone()).unwrap_or_default();
+            // Aba com nome fixo: ele vale tambem na barra de tarefas e no Alt+Tab.
+            let title = f.tabs.iter().find(|t| t.active).map(|t| t.title.split('|').next().unwrap_or("").trim().to_string()).filter(|t| !t.is_empty())
+                .or_else(|| f.panes.iter().find(|p| p.id == f.active_pane).map(|p| p.title.clone())).unwrap_or_default();
             if let Some(r) = &self.r {
                 r.window.set_title(&if title.is_empty() { format!("Duck · {}", f.workspace) } else { format!("{title} · Duck") });
             }
@@ -2155,7 +2160,8 @@ impl Gui {
                     let acts: Vec<(String, String)> = if ev["state"] == "blocked" {
                         vec![("Aprovar".into(), format!("duck://approve/{pane}")), ("Negar".into(), format!("duck://deny/{pane}")), ("Abrir".into(), format!("duck://focus/{pane}"))]
                     } else { vec![("Abrir".into(), format!("duck://focus/{pane}"))] };
-                    let place = format!("{what} · {}", self.pane_place(pane));
+                    // A aba primeiro: e o nome que voce deu (o titulo do agente muda o tempo todo).
+                    let place = format!("{} · {what}", self.pane_place(pane));
                     let body = match q { Some(q) => format!("{q}\n{place}"), None => place };
                     toast_card(&format!("Agente {state}"), &body, &acts, Some(if ev["state"] == "blocked" { "working" } else { "done" }));
                     if let Some(r) = &self.r { r.window.request_user_attention(Some(UserAttentionType::Informational)); }

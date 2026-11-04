@@ -252,14 +252,28 @@ config. In the examples, replace account names and URLs with yours.
   azure = { enabled = true, orgs = {
     { name = 'company', url = 'https://dev.azure.com/company', project = 'proj',
       releases = {
-        -- Classic release: the latest deploy of each environment.
-        -- 'label=Environment' renames what is shown (Environment is the name in Azure).
-        { name = 'API', definition = 'api-cd', stages = { 'develop=Dev', 'tst=Tst', 'master=Prod' } },
+        -- Every project at once: each classic release deployed in the last
+        -- 30 days becomes a line "develop ✓ #12 · tst ✓ #13 · master ✗ #14".
+        { auto = true, branches = { 'develop', 'tst', 'master' } },
+        -- A single project: the latest deploy of each environment.
+        -- 'label=Environment' renames what is shown; 'Prd|Prod' takes either.
+        { name = 'API', definition = 'api-cd', stages = { 'develop=Dev', 'tst=Tst', 'master=Prd|Prod' } },
         -- YAML or CI pipeline: the latest build of each branch.
         { name = 'Portal', pipeline = 'portal-ci', branches = { 'develop', 'tst', 'master' } },
       } },
   } },
   ```
+  - **Automatic mode (`auto = true`):** no need to list any project. The
+    environment for each branch comes from the branch filter on the
+    environment's own trigger (the Dev that deploys `develop`); without a
+    filter, from the name (develop → Dev, tst → Tst/QA/Hml, master →
+    Prd/Prod). Filters: `path = 'backend'` (release folder), `match =
+    'api'` and `exclude = 'legacy'` (patterns on the name), `days = 30`
+    (window) and `name = 'Releases'` (section title). You can have more than
+    one, each with its own filters and name.
+  - Projects with a failed deploy or waiting for approval stay on top. A line
+    opens the detail with the last 5 deploys of each environment.
+  - `notify = false` on a `releases` item turns off notices for that item only.
   - Older orgs (`https://company.visualstudio.com`) work too.
   - Each release takes `project = '...'` when it lives in another project.
   - `release_notify = false` on the org turns off the "deploy finished" notice.
@@ -268,7 +282,8 @@ config. In the examples, replace account names and URLs with yours.
   configurar)" (release definitions, to configure). It lists the definitions
   and the environments of each, with a snippet ready to copy. A mistyped
   environment shows in the panel together with the names that exist.
-- **In the panel:** each line opens the release in the browser. "Historico"
+- **In the panel:** in automatic mode each line opens the project detail; for
+  items configured one by one, each line opens the release in the browser. "Historico"
   (history) shows the last 15 deploys of the environment. The footer badge
   counts failed deploys.
 

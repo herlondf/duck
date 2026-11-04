@@ -1076,7 +1076,7 @@ fn emit(m: &mut Mux, event: &str, pane: Id) {
         m.inbox.push(json!({
             "kind": "agent", "pane": pane, "state": state,
             "title": if state == "blocked" { "Agente precisa de você" } else { "Agente terminou" },
-            "body": if what.is_empty() { tab.clone() } else { format!("{what} · {tab}") },
+            "body": if what.is_empty() { tab.clone() } else { format!("{tab} · {what}") },
             "color": if state == "blocked" { "blocked" } else { "done" },
         }));
     }

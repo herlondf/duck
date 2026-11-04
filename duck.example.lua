@@ -230,7 +230,8 @@ return {
   --   azure = { enabled = true, orgs = {    -- token: azure/empresa (PAT: Code, Build e Release Read)
   --     { name = 'empresa', url = 'https://dev.azure.com/empresa', project = 'proj',
   --       releases = {
-  --         { name = 'API', definition = 'api-cd', stages = { 'develop=Dev', 'tst=Tst', 'master=Prod' } },
+  --         { auto = true, branches = { 'develop', 'tst', 'master' } },     -- todas com deploy recente (path, match, days)
+  --         { name = 'API', definition = 'api-cd', stages = { 'develop=Dev', 'tst=Tst', 'master=Prd|Prod' } },
   --         { name = 'Portal', pipeline = 'portal-ci', branches = { 'develop', 'master' } },
   --       } },
   --   } },

@@ -8,8 +8,13 @@
 //   extensions = { azure = { orgs = {
 //     { name = 'empresa', url = 'https://dev.azure.com/empresa', project = 'proj', secret = 'azure/empresa',
 //       releases = {
-//         -- Release classica: o ultimo deploy de cada ambiente ("rotulo=Ambiente" troca o nome mostrado).
-//         { name = 'API', definition = 'api-cd', stages = { 'develop=Dev', 'tst=Tst', 'master=Prod' } },
+//         -- Todas as releases classicas com deploy recente, uma linha por projeto. O ambiente de
+//         -- cada branch sai do filtro de branch do proprio ambiente (ou do nome: Dev, Tst, Prd...).
+//         -- Filtros opcionais: path (pasta), match / exclude (regex no nome), days (padrao 30).
+//         { auto = true, branches = { 'develop', 'tst', 'master' }, path = 'backend' },
+//         -- Uma definicao so: o ultimo deploy de cada ambiente ("rotulo=Ambiente" troca o nome
+//         -- mostrado; "Prd|Prod" aceita qualquer um dos dois). branches tambem vale aqui.
+//         { name = 'API', definition = 'api-cd', stages = { 'develop=Dev', 'tst=Tst', 'master=Prd|Prod' } },
 //         -- Pipeline YAML (ou CI): o ultimo build de cada branch.
 //         { name = 'Portal', pipeline = 'portal-ci', branches = { 'develop', 'tst', 'master' } },
 //       } },
@@ -19,7 +24,10 @@
 
 import { duck, run, Item, Section, Action } from "./duck";
 
-type RelCfg = { name?: string; project?: string; definition?: string | number; stages?: string[]; pipeline?: string | number; branches?: string[] };
+type RelCfg = {
+  name?: string; project?: string; definition?: string | number; stages?: string[]; pipeline?: string | number; branches?: string[];
+  auto?: boolean; path?: string; match?: string; exclude?: string; days?: number; notify?: boolean;
+};
 type OrgCfg = { name: string; url: string; project: string; secret?: string; releases?: RelCfg[]; release_url?: string; release_notify?: boolean };
 type Settings = { orgs?: OrgCfg[]; poll_seconds?: number };
 type Org = OrgCfg & { auth: string; me?: { id: string; name: string } };
@@ -49,16 +57,23 @@ type Stage = {
   label: string; status: string; when?: string; who?: string; release?: string; version?: string; branch?: string;
   url?: string; history?: { defId: number; envId: number } | { buildDef: number; branch: string }; error?: string;
 };
-type RelView = { name: string; stages: Stage[] };
+type RelView = { name: string; stages: Stage[]; project: string; group?: string; url?: string; notify?: boolean };
 const releases = new Map<string, RelView[]>();     // org -> projetos
 const relDefs = new Map<string, { id: number; envs: Map<string, number>; names: string[] } | null>();   // "org|proj|def" -> definicao
 const buildDefs = new Map<string, number | null>();  // "org|proj|pipeline" -> id
 const lastDeploy = new Map<string, string>();      // "org|proj|label" -> "id:status" (para avisar)
+// Definicao completa (ambientes e o branch que cada um publica), relida a cada hora.
+type DefEnv = { id: number; name: string; rank: number; branches: string[] };
+type DefInfo = { id: number; name: string; path: string; envs: DefEnv[]; url?: string; at: number };
+const defInfo = new Map<string, DefInfo>();         // "org|proj|id"
+// Deploys do projeto inteiro (descoberta automatica): uma consulta por volta.
+type ProjDeps = { deps: Map<string, any>; defs: Map<number, { name: string; path: string }>; tried: Set<string>; since: number; full: number; days: number };
+const projDeps = new Map<string, ProjDeps>();       // "org|proj"
 
 const V = "api-version=7.1";
 function root(o: Org) { return o.url.replace(/\/$/, ""); }
 
-async function call(o: Org, path: string, init: RequestInit = {}): Promise<any> {
+async function call(o: Org, path: string, init: RequestInit = {}, hdr?: (h: Headers) => void): Promise<any> {
   const headers: Record<string, string> = { Authorization: o.auth, Accept: "application/json" };
   if (init.body) headers["Content-Type"] = "application/json";
   let r: Response;
@@ -67,6 +82,7 @@ async function call(o: Org, path: string, init: RequestInit = {}): Promise<any> 
   // PAT vencido: o Azure responde 203/302 com a pagina de login em vez de 401.
   if (r.status === 203 || (r.status >= 300 && r.status < 400)) throw new Error("PAT vencido ou sem permissao (gere outro e grave com duck secret set)");
   const text = await r.text();
+  hdr?.(r.headers);
   if (!r.ok) {
     let msg = text.slice(0, 160);
     try { msg = JSON.parse(text).message ?? msg; } catch { /* html */ }
@@ -90,7 +106,7 @@ function vsrm(o: Org): string {
   if (/\/\/dev\.azure\.com\//i.test(u)) return u.replace(/\/\/dev\.azure\.com\//i, "//vsrm.dev.azure.com/");
   return u.replace(/\/\/([^./]+)\.visualstudio\.com/i, "//$1.vsrm.visualstudio.com");
 }
-async function rm(o: Org, path: string): Promise<any> { return call({ ...o, url: vsrm(o) }, path); }
+async function rm(o: Org, path: string, hdr?: (h: Headers) => void): Promise<any> { return call({ ...o, url: vsrm(o) }, path, {}, hdr); }
 // "tst=Tst" -> rotulo tst, ambiente Tst; "Tst" -> os dois iguais.
 const pair = (x: string): [string, string] => { const i = x.indexOf("="); return i < 0 ? [x.trim(), x.trim()] : [x.slice(0, i).trim(), x.slice(i + 1).trim()]; };
 const STATUS: Record<string, [string, string, string]> = {
@@ -193,6 +209,136 @@ async function buildDef(o: Org, proj: string, name: string | number): Promise<nu
   return id;
 }
 
+// Nomes que um ambiente costuma ter para cada branch (quando o ambiente nao filtra por branch).
+const GROUPS = [
+  ["develop", "dev", "development", "desenv", "desenvolvimento"],
+  ["tst", "test", "teste", "qa", "hml", "homolog", "homologacao"],
+  ["stg", "stage", "staging"],
+  ["master", "main", "prd", "prod", "production", "producao"],
+];
+const aliases = (x: string) => { const k = x.trim().toLowerCase(); return GROUPS.find((g) => g.includes(k)) ?? [k]; };
+
+// Branches que o ambiente publica: filtro "sourceBranch" do gatilho de artefato.
+function envBranches(e: any): string[] {
+  const out: string[] = [];
+  for (const c of e.conditions ?? []) {
+    if (!c?.value) continue;
+    try { const v = JSON.parse(c.value); if (v?.sourceBranch) out.push(branch(String(v.sourceBranch)).toLowerCase()); } catch { /* condicao de evento */ }
+  }
+  return out;
+}
+
+async function defFull(o: Org, proj: string, id: number): Promise<DefInfo> {
+  const k = `${o.name}|${proj}|${id}`;
+  const c = defInfo.get(k);
+  if (c && Date.now() - c.at < 3600_000) return c;
+  const d = await rm(o, `/${encodeURIComponent(proj)}/_apis/release/definitions/${id}?${V}`);
+  const v: DefInfo = {
+    id, name: String(d.name), path: String(d.path ?? "\\"), url: d._links?.web?.href, at: Date.now(),
+    envs: (d.environments ?? []).map((e: any) => ({ id: e.id, name: String(e.name).trim(), rank: e.rank ?? 0, branches: envBranches(e) })),
+  };
+  defInfo.set(k, v);
+  return v;
+}
+
+// Ambiente que publica o branch: pelo filtro de branch; empate (Prd e Prd - Cliente) ou
+// sem filtro, pelo nome (develop -> Dev, master -> Prd/Prod...).
+function envForBranch(d: DefInfo, br: string): DefEnv | undefined {
+  const b = branch(br).toLowerCase();
+  const al = aliases(b);
+  const byName = (l: DefEnv[]) => l.find((e) => al.includes(e.name.toLowerCase()));
+  const hit = d.envs.filter((e) => e.branches.includes(b)).sort((x, y) => x.rank - y.rank);
+  return hit.length ? byName(hit) ?? hit[0] : byName(d.envs);
+}
+
+// "Prd|Prod" -> o primeiro que existir; sem nenhum, tenta como branch.
+function envNamed(d: DefInfo, spec: string): DefEnv | undefined {
+  for (const n of spec.split("|").map((x) => x.trim().toLowerCase()).filter(Boolean)) {
+    const e = d.envs.find((x) => x.name.toLowerCase() === n);
+    if (e) return e;
+  }
+  return envForBranch(d, spec.split("|")[0]);
+}
+
+// [rotulo, ambiente] de cada coluna pedida na config.
+function wantedEnvs(d: DefInfo, c: RelCfg): [string, DefEnv | undefined, string][] {
+  if (c.stages?.length) return c.stages.map(pair).map(([l, spec]) => [l, envNamed(d, spec), spec]);
+  if (c.branches?.length) return c.branches.map(pair).map(([l, br]) => [l, envForBranch(d, br), br]);
+  return [...d.envs].sort((x, y) => x.rank - y.rank).map((e) => [e.name, e, e.name]);
+}
+
+const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+
+// Deploys de todas as definicoes do projeto: janela inteira a cada 30 min (descobre
+// definicao nova), no meio so o que mudou desde a ultima volta.
+async function syncDeployments(o: Org, proj: string, days: number): Promise<ProjDeps> {
+  const k = `${o.name}|${proj}`;
+  const now = Date.now();
+  let s = projDeps.get(k);
+  const full = !s || now - s.full > 30 * 60_000 || s.days < days;
+  if (!s || full) s = { deps: new Map(), defs: new Map(), tried: new Set(), since: now, full: now, days };
+  const when = full ? `minStartedTime=${iso(now - days * 86400_000)}` : `minModifiedTime=${iso(s.since - 5 * 60_000)}`;
+  let cont: string | undefined;
+  let pages = 0;
+  do {
+    const tok = cont;
+    cont = undefined;
+    const r = await rm(o, `/${encodeURIComponent(proj)}/_apis/release/deployments?${when}&latestAttemptsOnly=true&queryOrder=descending&$top=100${tok ? `&continuationToken=${tok}` : ""}&${V}`,
+      (h) => { cont = h.get("x-ms-continuationtoken") ?? undefined; });
+    for (const d of r?.value ?? []) {
+      const def = d.releaseDefinition;
+      if (!def) continue;
+      const key = `${def.id}|${d.definitionEnvironmentId}`;
+      const old = s.deps.get(key);
+      if (!old || d.id >= old.id) s.deps.set(key, d);
+      if (!s.defs.has(def.id)) s.defs.set(def.id, { name: String(def.name), path: String(def.path ?? "") });
+    }
+  } while (cont && ++pages < 20);
+  s.since = now;
+  projDeps.set(k, s);
+  return s;
+}
+
+const normPath = (x: string) => ("\\" + x.replace(/\//g, "\\").replace(/^\\+/, "")).toLowerCase();
+
+// Modo automatico: uma linha por definicao com deploy recente num dos branches pedidos.
+async function pollAuto(o: Org, c: RelCfg): Promise<RelView[]> {
+  const proj = c.project ?? o.project;
+  const s = await syncDeployments(o, proj, Math.max(1, c.days ?? 30));
+  const re = (x?: string) => { try { return x ? new RegExp(x, "i") : null; } catch { return null; } };
+  const m = re(c.match), ex = re(c.exclude);
+  const ids = [...s.defs.entries()]
+    .filter(([, d]) => (!c.path || normPath(d.path).startsWith(normPath(c.path))) && (!m || m.test(d.name)) && !(ex && ex.test(d.name)))
+    .map(([id]) => id);
+  const defs: DefInfo[] = [];
+  for (let i = 0; i < ids.length; i += 8) {
+    defs.push(...(await Promise.all(ids.slice(i, i + 8).map((id) => defFull(o, proj, id).catch(() => null)))).filter((x): x is DefInfo => !!x));
+  }
+  // Ambiente sem deploy na janela: busca o ultimo dele (uma vez a cada descoberta).
+  const missing = defs.flatMap((d) => wantedEnvs(d, c).filter(([, e]) => e).map(([, e]) => `${d.id}|${e!.id}`))
+    .filter((k) => !s.deps.has(k) && !s.tried.has(k));
+  for (let i = 0; i < missing.length; i += 8) {
+    await Promise.all(missing.slice(i, i + 8).map(async (k) => {
+      s.tried.add(k);
+      const [def, env] = k.split("|");
+      try {
+        const r = await rm(o, `/${encodeURIComponent(proj)}/_apis/release/deployments?definitionId=${def}&definitionEnvironmentId=${env}&$top=1&queryOrder=descending&${V}`);
+        if (r?.value?.[0]) s.deps.set(k, r.value[0]);
+      } catch { /* fica sem deploy */ }
+    }));
+  }
+  const out: RelView[] = [];
+  for (const d of defs) {
+    const stages = wantedEnvs(d, c).filter(([, e]) => e).map(([l, e]) => deployStage(l, s.deps.get(`${d.id}|${e!.id}`), d.id, e!.id));
+    if (!stages.some((x) => x.release)) continue;
+    out.push({ name: d.name, stages, project: proj, group: c.name ?? "Releases", url: d.url, notify: c.notify });
+  }
+  const last = (r: RelView) => Math.max(0, ...r.stages.map((x) => (x.when ? Date.parse(x.when) : 0)));
+  // Falhou ou esperando aprovacao primeiro; depois o deploy mais recente.
+  const bad = (r: RelView) => (r.stages.some((x) => ["failed", "partiallySucceeded", "pending", "inProgress"].includes(x.status)) ? 1 : 0);
+  return out.sort((a, b) => bad(b) - bad(a) || last(b) - last(a));
+}
+
 function deployStage(label: string, dep: any, defId: number, envId: number): Stage {
   if (!dep) return { label, status: "notDeployed", history: { defId, envId } };
   const pending = /pending|queued|approval/i.test(String(dep.operationStatus ?? "")) && dep.deploymentStatus !== "succeeded" && dep.deploymentStatus !== "failed";
@@ -206,27 +352,31 @@ function deployStage(label: string, dep: any, defId: number, envId: number): Sta
 }
 
 async function pollReleases(o: Org): Promise<void> {
-  const out: RelView[] = [];
+  const views: RelView[] = [];
   for (const c of o.releases ?? []) {
     const proj = c.project ?? o.project;
+    if (c.auto) {
+      try { views.push(...await pollAuto(o, c)); }
+      catch (e) { views.push({ name: c.name ?? "Releases", project: proj, stages: [{ label: "?", status: "notDeployed", error: String((e as Error).message) }] }); }
+      continue;
+    }
     const p = encodeURIComponent(proj);
     const name = c.name ?? String(c.definition ?? c.pipeline ?? "?");
     const stages: Stage[] = [];
     try {
       if (c.definition !== undefined) {
-        const d = await relDef(o, proj, c.definition);
-        if (!d) { out.push({ name, stages: [{ label: "?", status: "notDeployed", error: `definicao de release "${c.definition}" nao encontrada` }] }); continue; }
-        const wanted = (c.stages?.length ? c.stages : d.names).map(pair);
-        const got = await Promise.all(wanted.map(async ([label, env]) => {
-          const envId = d.envs.get(env.toLowerCase());
-          if (envId === undefined) return { label, status: "notDeployed", error: `ambiente "${env}" nao existe (tem: ${d.names.join(", ")})` } as Stage;
-          const r = await rm(o, `/${p}/_apis/release/deployments?definitionId=${d.id}&definitionEnvironmentId=${envId}&$top=1&queryOrder=descending&${V}`);
-          return deployStage(label, (r.value ?? [])[0], d.id, envId);
+        const d0 = await relDef(o, proj, c.definition);
+        if (!d0) { views.push({ name, project: proj, stages: [{ label: "?", status: "notDeployed", error: `definicao de release "${c.definition}" nao encontrada` }] }); continue; }
+        const d = await defFull(o, proj, d0.id);
+        const got = await Promise.all(wantedEnvs(d, c).map(async ([label, env, spec]) => {
+          if (!env) return { label, status: "notDeployed", error: `ambiente para "${spec}" nao existe (tem: ${d.envs.map((e) => e.name).join(", ")})` } as Stage;
+          const r = await rm(o, `/${p}/_apis/release/deployments?definitionId=${d.id}&definitionEnvironmentId=${env.id}&$top=1&queryOrder=descending&${V}`);
+          return deployStage(label, (r.value ?? [])[0], d.id, env.id);
         }));
         stages.push(...got);
       } else if (c.pipeline !== undefined) {
         const id = await buildDef(o, proj, c.pipeline);
-        if (!id) { out.push({ name, stages: [{ label: "?", status: "notDeployed", error: `pipeline "${c.pipeline}" nao encontrado` }] }); continue; }
+        if (!id) { views.push({ name, project: proj, stages: [{ label: "?", status: "notDeployed", error: `pipeline "${c.pipeline}" nao encontrado` }] }); continue; }
         const got = await Promise.all((c.branches ?? ["main"]).map(pair).map(async ([label, br]) => {
           const ref = br.startsWith("refs/") ? br : `refs/heads/${br}`;
           const r = await call(o, `/${p}/_apis/build/builds?definitions=${id}&branchName=${encodeURIComponent(ref)}&$top=1&queryOrder=queueTimeDescending&${V}`);
@@ -243,7 +393,10 @@ async function pollReleases(o: Org): Promise<void> {
     } catch (e) {
       stages.push({ label: "?", status: "notDeployed", error: String((e as Error).message) });
     }
-    // Aviso: deploy (ou build da branch) que terminou desde a ultima volta.
+    views.push({ name, stages, project: proj, notify: c.notify });
+  }
+  // Aviso: deploy (ou build da branch) que terminou desde a ultima volta.
+  for (const { name, stages, notify } of views) {
     for (const st of stages) {
       if (st.error || !st.release && !st.version) continue;
       const k = `${o.name}|${name}|${st.label}`;
@@ -251,7 +404,7 @@ async function pollReleases(o: Org): Promise<void> {
       const before = lastDeploy.get(k);
       lastDeploy.set(k, sig);
       const final = ["succeeded", "failed", "partiallySucceeded", "canceled"].includes(st.status);
-      if (before !== undefined && before !== sig && final && o.release_notify !== false) {
+      if (before !== undefined && before !== sig && final && o.release_notify !== false && notify !== false) {
         const [lbl, color] = STATUS[st.status] ?? [st.status, "muted"];
         duck.notify({
           title: `Azure · ${name} ${st.label}: ${lbl}`, body: [st.release, st.version, st.branch, st.who].filter(Boolean).join(" · "),
@@ -259,9 +412,8 @@ async function pollReleases(o: Org): Promise<void> {
         });
       }
     }
-    out.push({ name, stages });
   }
-  releases.set(o.name, out);
+  releases.set(o.name, views);
 }
 
 function stageItem(o: Org, rel: RelView, st: Stage): Item {
@@ -275,9 +427,49 @@ function stageItem(o: Org, rel: RelView, st: Stage): Item {
   };
 }
 
+const MARK: Record<string, string> = {
+  succeeded: "✓", failed: "✗", partiallySucceeded: "!", canceled: "–", inProgress: "…", pending: "…", rodando: "…", notDeployed: "–", nobuild: "–",
+};
+const SEVERITY = ["failed", "partiallySucceeded", "pending", "inProgress", "canceled", "succeeded", "notDeployed"];
+
+// Uma linha por projeto: "develop ✓ #1482 · tst ✓ #1483 · master ✗ #1484".
+function relRowItem(o: Org, rel: RelView): Item {
+  const worst = rel.stages.map((x) => x.status).sort((a, b) => (SEVERITY.indexOf(a) + 99) % 99 - (SEVERITY.indexOf(b) + 99) % 99)[0] ?? "notDeployed";
+  const [lbl, color, icon] = STATUS[worst] ?? [worst, "muted", "clock"];
+  const bad = rel.stages.filter((x) => x.status === worst).map((x) => x.label).join(", ");
+  const newest = rel.stages.filter((x) => x.when).sort((a, b) => Date.parse(b.when!) - Date.parse(a.when!))[0];
+  const cols = rel.stages.map((x) => `${x.label} ${MARK[x.status] ?? "?"} ${x.release ? x.release.replace(/^Release-/i, "#") : ""}`.trim()).join("  ·  ");
+  return {
+    id: `r|${o.name}|${rel.name}|*`, title: rel.name, icon: worst === "succeeded" ? "check" : icon,
+    subtitle: `${cols}${newest?.when ? `  ·  ${ago(newest.when)}` : ""}`,
+    color: worst === "succeeded" ? "muted" : color, badge: worst === "succeeded" ? "ok" : `${bad} ${lbl}`,
+    actions: [{ id: "detail", title: "Detalhes", primary: true }, ...(newest?.url ? [{ id: "web", title: "Abrir o ultimo" }] : [])],
+  };
+}
+
+// Detalhe do projeto: cada ambiente com os ultimos deploys.
+async function showRelDetail(o: Org, rel: RelView): Promise<void> {
+  const p = encodeURIComponent(rel.project);
+  const parts = await Promise.all(rel.stages.map(async (st) => {
+    const h = st.history;
+    if (!h || !("defId" in h)) return [`── ${st.label} ──`, st.error ?? "(sem historico)"];
+    const r = await rm(o, `/${p}/_apis/release/deployments?definitionId=${h.defId}&definitionEnvironmentId=${h.envId}&$top=5&queryOrder=descending&${V}`);
+    const env = (r.value ?? [])[0]?.releaseEnvironment?.name;
+    const lines = (r.value ?? []).map((d: any) => {
+      const s = deployStage(st.label, d, h.defId, h.envId);
+      return `  ${(STATUS[s.status] ?? [s.status])[0].padEnd(10)} ${s.release ?? ""}  ${s.version ?? ""}${s.branch ? ` (${s.branch})` : ""}  ${s.when ? ago(s.when) : ""}  ${s.who ?? ""}`;
+    });
+    return [`── ${st.label}${env ? ` → ${env}` : ""} ──`, ...(lines.length ? lines : ["  (nenhum deploy)"])];
+  }));
+  duck.detail({
+    title: rel.name, subtitle: `${rel.project} · ultimos deploys de cada ambiente (mais novo primeiro)`, item: `r|${o.name}|${rel.name}|*`,
+    body: parts.map((x) => x.join("\n")).join("\n\n"), actions: rel.url ? [{ id: "defweb", title: "Abrir a definicao" }] : [],
+  });
+}
+
 async function showHistory(o: Org, relName: string, st: Stage): Promise<void> {
-  const cfg = (o.releases ?? []).find((c) => (c.name ?? String(c.definition ?? c.pipeline)) === relName);
-  const p = encodeURIComponent(cfg?.project ?? o.project);
+  const rel = (releases.get(o.name) ?? []).find((x) => x.name === relName);
+  const p = encodeURIComponent(rel?.project ?? o.project);
   const h = st.history;
   if (!h) return;
   let lines: string[] = [];
@@ -309,7 +501,11 @@ async function listDefinitions(): Promise<void> {
       const ex = defs[0];
       if (ex) {
         const envs = (ex.environments ?? []).map((e: any) => `'${String(e.name).trim()}'`).slice(0, 3).join(", ");
-        out.push("", "Exemplo para o ~/.duck.lua (dentro da org):", `  releases = {`, `    { name = '${ex.name}', definition = '${ex.name}', stages = { ${envs} } },`, `  },`, "");
+        out.push("", "Exemplo para o ~/.duck.lua (dentro da org):", `  releases = {`,
+          `    -- todas com deploy nos ultimos 30 dias (filtros: path, match, exclude, days)`,
+          `    { auto = true, branches = { 'develop', 'tst', 'master' } },`,
+          `    -- ou uma so`,
+          `    { name = '${ex.name}', definition = '${ex.name}', stages = { ${envs} } },`, `  },`, "");
       }
     } catch (e) { out.push(`${o.name}: ${(e as Error).message}`); }
   }
@@ -350,10 +546,15 @@ function render(): void {
     pending += rv.filter((x) => (x.reviewers.find((r) => r.id === o.me?.id)?.vote ?? 0) === 0).length;
     secs.push({ title: `${p}Revisao pedida (${rv.length})`, items: rv.map((x) => prItem(o, x, true)) });
     secs.push({ title: `${p}Meus PRs (${mine.get(o.name)?.length ?? 0})`, items: (mine.get(o.name) ?? []).map((x) => prItem(o, x, false)) });
+    const groups = new Map<string, Item[]>();
     for (const rel of releases.get(o.name) ?? []) {
       relFailed += rel.stages.filter((s) => s.status === "failed").length;
-      secs.push({ title: `${p}Release · ${rel.name}`, items: rel.stages.map((s) => stageItem(o, rel, s)) });
+      if (rel.group) {
+        if (!groups.has(rel.group)) { groups.set(rel.group, []); secs.push({ title: `${p}${rel.group}`, items: groups.get(rel.group)! }); }
+        groups.get(rel.group)!.push(rel.stages.some((x) => x.error) ? stageItem(o, rel, rel.stages[0]) : relRowItem(o, rel));
+      } else secs.push({ title: `${p}Release · ${rel.name}`, items: rel.stages.map((s) => stageItem(o, rel, s)) });
     }
+    for (const sec of secs) if (sec.items.length && [...groups.values()].includes(sec.items)) sec.title = `${sec.title} (${sec.items.length})`;
     secs.push({ title: `${p}Builds recentes`, items: (builds.get(o.name) ?? []).map((b) => buildItem(o, b)) });
   }
   const err = [...errors.entries()].map(([n, e]) => `${n}: ${e}`).join(" | ");
@@ -396,6 +597,13 @@ async function onAction(action: string, item: string): Promise<void> {
   if (!o) return;
   if (kind === "r") {
     const rel = (releases.get(name) ?? []).find((x) => x.name === a);
+    if (rel && b === "*") {
+      const newest = rel.stages.filter((x) => x.when && x.url).sort((p, q) => Date.parse(q.when!) - Date.parse(p.when!))[0];
+      if (action === "web" && newest?.url) duck.openUrl(newest.url);
+      else if (action === "defweb" && rel.url) duck.openUrl(rel.url);
+      else await showRelDetail(o, rel);
+      return;
+    }
     const st = rel?.stages.find((x) => x.label === b);
     if (!st) return;
     if (action === "web" && st.url) duck.openUrl(st.url);
