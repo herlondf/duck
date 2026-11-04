@@ -1088,12 +1088,28 @@ fn agent_loop(srv: Arc<Server>) {
     let Ok(mut sys) = System::new() else { return };
     let mut children: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
     let mut tick = 0u64;
+    let mut last_scan: Option<Instant> = None;
+    let mut last_ids: Vec<Id> = Vec::new();
     loop {
         std::thread::sleep(Duration::from_secs(2));
         // Arvore de processos a cada 6s (a varredura custa ~20ms); titulo e
-        // estado a cada 2s. ponytail: trocar por eventos de processo (ETW) se
-        // ainda aparecer no profiling.
-        if tick % 3 == 0 && !srv.lock().panes.is_empty() {
+        // estado a cada 2s. Um agente so aparece ou some com saida no pane
+        // (o comando digitado, o prompt de volta), entao sem saida nova e sem
+        // pane novo a varredura e pulada; uma a cada minuto pega o resto.
+        let scan = tick % 3 == 0 && {
+            let m = srv.lock();
+            let mut ids: Vec<Id> = m.panes.keys().copied().collect();
+            ids.sort_unstable();
+            let due = !ids.is_empty() && match last_scan {
+                None => true,
+                Some(t) => ids != last_ids || t.elapsed() >= Duration::from_secs(60)
+                    || m.panes.values().any(|p| p.last_output > t),
+            };
+            last_ids = ids;
+            due
+        };
+        if scan {
+            last_scan = Some(Instant::now());
             sys.refresh_processes_specifics(ProcessesToUpdate::All, true,
                 ProcessRefreshKind::nothing().with_exe(UpdateKind::Never));
             children.clear();
@@ -2667,6 +2683,18 @@ fn ext_sink(srv: &Arc<Server>) -> crate::ext::Sink {
 /// pergunta, colar) espera a janela, que recebe o estado ao conectar.
 fn ext_incoming(srv: &Arc<Server>, ext: &str, msg: Value, gen: u64) {
     let mut m = srv.lock();
+    // Agentes abertos (pasta, estado): para uma rotina esperar o agente que
+    // voce esta usando no mesmo repositorio. Pane privado fica de fora.
+    if msg["type"] == "agents" {
+        if !m.ext.has_perm(ext, "agents") { return; }
+        let list: Vec<Value> = m.workspaces.iter().flat_map(|w| w.tabs.iter().flat_map(move |t| t.all().into_iter().map(move |id| (w.name.clone(), t.title.clone(), id))))
+            .filter_map(|(ws, tab, id)| m.panes.get(&id).filter(|p| !p.private && p.agent.is_some()).map(|p| json!({
+                "pane": id, "workspace": ws, "tab": tab, "title": p.title, "cwd": p.cwd, "parent": p.parent,
+                "agent": p.agent, "idle_secs": p.last_output.elapsed().as_secs(),
+            }))).collect();
+        m.ext.send(ext, json!({"type": "agents", "id": msg["id"], "agents": list}));
+        return;
+    }
     let Some(msg) = m.ext.incoming(ext, msg, gen) else { return };
     if m.subs == 0 {
         match msg["type"].as_str().unwrap_or("") {

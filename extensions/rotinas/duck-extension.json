@@ -6,6 +6,7 @@
   "category": "Agentes",
   "description": "Pedidos ao Claude Code em horários marcados (cron ou a cada N minutos), rodando enquanto o Duck estiver aberto, com aviso do resultado na tela, na Echo ou no celular. Uma rotina por arquivo em ~/.duck/rotinas/*.md",
   "command": ["node", "dist/index.js"],
+  "permissions": ["agents"],
   "settings": [
     { "key": "ha_urls", "title": "Home Assistant para falar na Echo e mandar push (endereços em ordem, separados por vírgula; o webhook fica em duck secret set rotinas/ha-webhook)", "type": "list", "default": "" }
   ]

@@ -17,6 +17,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import { duck, run, Item, Section, AgentResult } from "./duck";
 
 const DIR = path.join(os.homedir(), ".duck", "rotinas");
@@ -50,6 +51,10 @@ type Task = {
   speakNight: boolean;
   /** Tamanho maximo do texto falado. */
   speakMax: number;
+  /** Adia se o limite de 5h do perfil passou disto (%). 0 = nao olha. */
+  usageMax: number;
+  /** Adia enquanto um agente seu trabalha no mesmo repositorio. */
+  yieldToAgent: boolean;
   error?: string;
 };
 
@@ -63,6 +68,9 @@ let running: string | null = null;
 let filesSig = "";
 /** Enderecos do Home Assistant, na ordem (local primeiro, tunel depois). */
 let haUrls: string[] = [];
+/** Rotinas na hora, esperando o limite ou o agente: id -> motivo. */
+const deferred = new Map<string, { since: number; reason: string }>();
+let ticking = false;
 
 // ---------------------------------------------------------------- Home Assistant
 
@@ -208,6 +216,8 @@ function parseTask(file: string): Task {
     phone: bool("celular", false),
     speakNight: bool("falar_noite", false),
     speakMax: Math.min(600, Number(head.falar_max) || 250),
+    usageMax: head.uso_max !== undefined ? Math.max(0, Math.min(100, Number(head.uso_max) || 0)) : 85,
+    yieldToAgent: bool("ceder", true),
   };
   try {
     if (!m) throw new Error("falta o cabecalho entre linhas ---");
@@ -258,17 +268,117 @@ function next(t: Task): number | null {
   return null;
 }
 
-function tick(): void {
-  scan();
-  const now = Date.now();
-  for (const t of tasks) {
-    if (t.error || !t.enabled || state.paused[t.id] || queue.includes(t.id) || running === t.id) continue;
-    const due = next(t);
-    if (due === null || due > now) continue;
-    // Horario perdido (Duck fechado, PC dormindo): so roda se catchup ou se foi agora ha pouco.
-    if (t.catchup || now - due < 10 * 60_000) queue.push(t.id);
-    else { state.last[t.id] = now; saveState(); duck.log(`pulou ${t.id} (horario de ${new Date(due).toLocaleString("pt-BR")} perdido)`); }
+// ---------------------------------------------------------------- quando adiar
+
+const USAGE_DIR = path.join(os.homedir(), "AppData", "Local", "Temp", "claude-usage");
+const usageProfile = new Map<string, string>(); // session_id -> pasta do perfil (minusculas)
+
+function profileDir(profile: string): string {
+  if (!profile || profile === "default") return path.join(os.homedir(), ".claude");
+  return /[\\/]/.test(profile) ? profile : path.join(os.homedir(), `.claude-${profile}`);
+}
+
+/** Limite de 5h do perfil, pelo que o statusline das suas sessoes grava (mesma fonte da extensao Uso do Claude). */
+function usage5h(profile: string): { pct: number; resets: number } | null {
+  const want = path.resolve(profileDir(profile)).toLowerCase();
+  let files: { f: string; t: number }[] = [];
+  try {
+    files = fs.readdirSync(USAGE_DIR).filter((f) => f.endsWith(".json"))
+      .map((f) => ({ f, t: fs.statSync(path.join(USAGE_DIR, f)).mtimeMs }))
+      .filter((x) => x.t > Date.now() - 6 * 3600_000).sort((a, b) => b.t - a.t);
+  } catch { return null; }
+  for (const { f } of files) {
+    let u: { session_id?: string; rate_limits?: { five_hour?: { used_percentage: number; resets_at: number } } };
+    try { u = JSON.parse(read(path.join(USAGE_DIR, f))); } catch { continue; }
+    const l = u.rate_limits?.five_hour;
+    const sid = u.session_id;
+    if (!sid || !l) continue;
+    let dir = usageProfile.get(sid);
+    if (dir === undefined) {
+      dir = "";
+      const home = os.homedir();
+      let names: string[] = [];
+      try { names = fs.readdirSync(home).filter((n) => n === ".claude" || n.startsWith(".claude-")); } catch { /* sem home */ }
+      for (const n of names) {
+        const root = path.join(home, n, "projects");
+        try {
+          if (fs.readdirSync(root).some((d) => fs.existsSync(path.join(root, d, sid + ".jsonl")))) { dir = path.join(home, n).toLowerCase(); break; }
+        } catch { /* sem projects */ }
+      }
+      usageProfile.set(sid, dir);
+    }
+    if (dir !== want) continue;
+    if (l.resets_at * 1000 <= Date.now()) return { pct: 0, resets: 0 };
+    return { pct: Math.round(l.used_percentage), resets: l.resets_at * 1000 };
   }
+  return null;
+}
+
+const tops = new Map<string, string>();
+/** Raiz do repositorio git da pasta, em minusculas ("" fora de repositorio ou caminho do WSL). */
+function repoRoot(dir: string): string {
+  if (!dir || dir.startsWith("/")) return "";
+  const k = dir.toLowerCase();
+  if (!tops.has(k)) {
+    let top = "";
+    try {
+      top = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).trim();
+    } catch { /* nao e repositorio */ }
+    tops.set(k, top ? path.resolve(top).toLowerCase() : "");
+  }
+  return tops.get(k)!;
+}
+
+/** Motivo para esperar agora, ou null para rodar. */
+async function gate(t: Task): Promise<string | null> {
+  if (t.usageMax > 0) {
+    const u = usage5h(t.profile);
+    if (u && u.pct >= t.usageMax) {
+      const at = new Date(u.resets).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+      return `limite de 5h em ${u.pct}% (renova às ${at})`;
+    }
+  }
+  if (t.yieldToAgent) {
+    const mine = repoRoot(t.cwd);
+    if (mine) {
+      const list = await duck.agents();
+      const busy = (list ?? []).find((a) => (a.agent.state === "working" || a.agent.state === "blocked") && repoRoot(a.cwd) === mine);
+      if (busy) return `agente trabalhando no mesmo repositório (aba ${busy.tab || busy.title})`;
+    }
+  }
+  return null;
+}
+
+async function tick(): Promise<void> {
+  if (ticking) return;
+  ticking = true;
+  try {
+    scan();
+    const now = Date.now();
+    for (const t of tasks) {
+      if (t.error || !t.enabled || state.paused[t.id] || queue.includes(t.id) || running === t.id) { deferred.delete(t.id); continue; }
+      const due = next(t);
+      if (due === null || due > now) { deferred.delete(t.id); continue; }
+      const waiting = deferred.get(t.id);
+      // Horario perdido (Duck fechado, PC dormindo): so roda se catchup ou se foi agora ha pouco.
+      // Adiada pelo limite ou pelo agente: espera ate o proximo horario, depois desiste deste.
+      const nextSlot = t.cron ? nextCron(t.cron, due) : t.everyMs ? due + t.everyMs : null;
+      const fresh = t.catchup || now - due < 10 * 60_000 || (!!waiting && (nextSlot === null || nextSlot > now));
+      if (!fresh) {
+        state.last[t.id] = now; saveState(); deferred.delete(t.id);
+        duck.log(`pulou ${t.id} (horario de ${new Date(due).toLocaleString("pt-BR")} perdido${waiting ? `, adiada: ${waiting.reason}` : ""})`);
+        render();
+        continue;
+      }
+      const why = await gate(t);
+      if (why) {
+        if (waiting?.reason !== why) { deferred.set(t.id, { since: waiting?.since ?? now, reason: why }); duck.log(`${t.id}: adiada, ${why}`); render(); }
+        continue;
+      }
+      if (waiting) { deferred.delete(t.id); duck.log(`${t.id}: liberada depois de ${Math.round((now - waiting.since) / 60000)} min`); }
+      queue.push(t.id);
+    }
+  } finally { ticking = false; }
   void pump();
 }
 
@@ -364,6 +474,7 @@ function render(): void {
     else if (queue.includes(t.id)) { sub = "na fila"; color = "working"; }
     else if (!t.enabled) { sub = "desligada (enabled: false)"; color = "muted"; }
     else if (paused) { sub = "pausada"; color = "muted"; }
+    else if (deferred.has(t.id)) { sub = `adiada: ${deferred.get(t.id)!.reason}`; color = "working"; }
     else sub = n ? `próxima: ${when(n)}` : "sem horário";
     if (last && !t.error) sub += ` · última: ${last.ok ? (last.quiet ? "nada a relatar" : "ok") : "falhou"} ${ago(last.at)}`;
     return {
@@ -416,6 +527,8 @@ cron: 0 8 * * 1-5
 # quiet: OK           (resposta que começa com isto não vira aviso)
 # falar: escritorio   (Echo que lê a resposta pelo Home Assistant; entre 22h e 7h vira push)
 # celular: true       (push no celular pelo Home Assistant)
+# uso_max: 85         (adia se o limite de 5h do perfil passou disto; 0 = não olha)
+# ceder: true         (adia enquanto um agente seu trabalha no mesmo repositório)
 enabled: false
 ---
 Escreva aqui o pedido, como escreveria para o Claude Code.
@@ -434,8 +547,8 @@ run({
     ]);
     loadState();
     scan();
-    tick();
-    setInterval(tick, 20_000);
+    void tick();
+    setInterval(() => void tick(), 20_000);
     // Atualiza "próxima"/"há N min" na visao.
     setInterval(render, 60_000);
   },

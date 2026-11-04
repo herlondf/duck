@@ -1366,8 +1366,15 @@ impl Gui {
             return self.flash(&format!("git worktree add falhou (a branch {branch} ja existe?)"));
         }
         let cmd = self.cfg.agent_profiles.get(profile).map(|p| p.cmd.clone()).unwrap_or_else(|| "claude".into());
-        self.cmd(json!({"cmd": "spawn", "where": "tab", "cwd": dest_s, "title": format!("⎇ {branch}"), "type": cmd}));
-        self.flash(&format!("Worktree {dest_s} na branch {branch}; agente subindo"));
+        // Porta propria e preparo (.duck-worktree.json do repo): dois agentes
+        // com servidor de desenvolvimento nao brigam pela mesma porta.
+        let port = worktree_port(&dest_s);
+        let wt = WorktreeCfg::load(&top);
+        let copied = wt.copy_into(&top, &dest);
+        let line = wt.command(port, &cmd);
+        self.cmd(json!({"cmd": "spawn", "where": "tab", "cwd": dest_s, "title": format!("⎇ {branch}"), "type": line}));
+        let extra = if copied > 0 { format!(", {copied} arquivo(s) copiado(s)") } else { String::new() };
+        self.flash(&format!("Worktree {dest_s} na branch {branch}, porta {port}{extra}; agente subindo"));
     }
 
     fn worktree_finish(&mut self) {
@@ -1381,15 +1388,19 @@ impl Gui {
         let base = git(&main, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default().trim().to_string();
         let here = git(&cwd, &["rev-parse", "--show-toplevel"]).unwrap_or_default().trim().to_string();
         let ps = |c: String| json!(["pwsh", "-NoLogo", "-NoProfile", "-NoExit", "-Command", c]);
+        let wt = WorktreeCfg::load(std::path::Path::new(&main));
+        let teardown = wt.teardown.as_ref().map(|t| format!("Push-Location '{here}'; {t}; Pop-Location; ")).unwrap_or_default();
+        let port = worktree_ports().get(&here.to_lowercase().replace('\\', "/")).copied();
         let items = vec![
             Item::new(format!("Ver o diff de {branch} contra {base}"), "flutuante", "popup",
                 vec![ps(format!("git -C '{main}' -c color.ui=always --no-pager diff --stat {base}...{branch}; git -C '{main}' -c color.ui=always --no-pager diff {base}...{branch}"))]),
             Item::new(format!("Mesclar {branch} em {base} (no repo principal)"), main.clone(), "popup",
                 vec![ps(format!("git -C '{here}' status --short; git -C '{main}' merge --no-ff {branch}"))]),
-            Item::new(format!("Remover a worktree e a branch {branch}"), here.clone(), "popup",
-                vec![ps(format!("git -C '{main}' worktree remove '{here}'; git -C '{main}' branch -d {branch}"))]),
+            Item::new(format!("Remover a worktree e a branch {branch}"), if teardown.is_empty() { here.clone() } else { format!("{here} (roda o teardown antes)") }, "popup",
+                vec![ps(format!("{teardown}git -C '{main}' worktree remove '{here}'; git -C '{main}' branch -d {branch}"))]),
         ];
-        self.overlay = Some(Overlay::list(&format!("Worktree {branch} (base: {base})"), items));
+        let title = match port { Some(p) => format!("Worktree {branch} (base: {base}, porta {p})"), None => format!("Worktree {branch} (base: {base})") };
+        self.overlay = Some(Overlay::list(&title, items));
     }
 
     /// Bifurca a sessao do agente ativo: pane novo com --fork-session.
@@ -2065,6 +2076,69 @@ fn merge_frame(prev: Option<&Frame>, mut f: Frame) -> Frame {
     f
 }
 
+/// `.duck-worktree.json` na raiz do repositorio:
+/// `{"copy": [".env"], "setup": "npm ci", "env": {"PORT": "{port}"}, "teardown": "docker compose down"}`.
+#[derive(Default, serde::Deserialize)]
+struct WorktreeCfg {
+    #[serde(default)] copy: Vec<String>,
+    setup: Option<String>,
+    #[serde(default)] env: std::collections::BTreeMap<String, String>,
+    teardown: Option<String>,
+}
+
+impl WorktreeCfg {
+    fn load(repo: &std::path::Path) -> WorktreeCfg {
+        let Ok(t) = std::fs::read_to_string(repo.join(".duck-worktree.json")) else { return WorktreeCfg::default() };
+        serde_json::from_str(&t).unwrap_or_else(|e| { crate::proto::log(&format!(".duck-worktree.json invalido: {e}")); WorktreeCfg::default() })
+    }
+
+    /// Copia os arquivos fora do git (.env etc.) do repo principal; devolve quantos.
+    fn copy_into(&self, from: &std::path::Path, to: &std::path::Path) -> usize {
+        let mut n = 0;
+        for rel in &self.copy {
+            if rel.contains("..") || std::path::Path::new(rel).is_absolute() { continue; }
+            let (src, dst) = (from.join(rel), to.join(rel));
+            if !src.is_file() || dst.exists() { continue; }
+            if let Some(d) = dst.parent() { let _ = std::fs::create_dir_all(d); }
+            if std::fs::copy(&src, &dst).is_ok() { n += 1; }
+        }
+        n
+    }
+
+    /// Linha digitada no pwsh do pane novo: ambiente, preparo e o agente.
+    fn command(&self, port: u16, agent: &str) -> String {
+        let q = |v: &str| v.replace("{port}", &port.to_string()).replace('\'', "''");
+        let mut s = format!("$env:DUCK_PORT='{port}'; ");
+        for (k, v) in &self.env {
+            if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { s += &format!("$env:{k}='{}'; ", q(v)); }
+        }
+        if let Some(setup) = self.setup.as_deref().filter(|x| !x.trim().is_empty()) { s += &format!("{}; ", setup.replace("{port}", &port.to_string())); }
+        s + agent
+    }
+}
+
+fn worktree_ports_file() -> std::path::PathBuf { crate::proto::data_dir().join("worktree-ports.json") }
+
+fn worktree_ports() -> std::collections::BTreeMap<String, u16> {
+    std::fs::read_to_string(worktree_ports_file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Porta da worktree: a que ja tem, ou a primeira livre a partir de 4100 (de 10 em 10).
+fn worktree_port(dir: &str) -> u16 {
+    let key = dir.to_lowercase().replace('\\', "/");
+    let mut ports = worktree_ports();
+    // Worktree que nao existe mais devolve a porta.
+    ports.retain(|d, _| std::path::Path::new(d).exists() || *d == key);
+    if let Some(p) = ports.get(&key) { return *p; }
+    let used: Vec<u16> = ports.values().copied().collect();
+    let port = (0..400u16).map(|i| 4100 + i * 10)
+        .find(|p| !used.contains(p) && std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .unwrap_or(4100);
+    ports.insert(key, port);
+    let _ = std::fs::write(worktree_ports_file(), serde_json::to_string_pretty(&ports).unwrap_or_default());
+    port
+}
+
 fn git(cwd: &str, args: &[&str]) -> Option<String> {
     let mut c = std::process::Command::new("git");
     c.arg("-C").arg(cwd).args(args);
@@ -2609,7 +2683,10 @@ impl Gui {
         match ev {
             WindowEvent::CloseRequested => if self.quick { self.toggle_quick() } else { el.exit() },
             WindowEvent::Resized(s) => {
-                if let Some(r) = self.r.as_mut() { r.resize(s.width, s.height); }
+                if let Some(r) = self.r.as_mut() {
+                    r.resize(s.width, s.height);
+                    if s.width == 0 || s.height == 0 { r.hibernate(); }
+                }
                 self.send_size();
                 self.save_geometry();
             }

@@ -267,6 +267,7 @@ pub struct Renderer {
     swash: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
+    glyph_cache: Cache,
     text: Vec<TextRenderer>,
     quads: Quads,
     bg: Option<BgImage>,
@@ -343,7 +344,7 @@ impl Renderer {
         let quads = Quads::new(&device, config.format);
         let scale = window.scale_factor() as f32;
         let mut r = Renderer {
-            window, surface, device, queue, config, swash: SwashCache::new(), viewport, atlas, text, quads,
+            window, surface, device, queue, config, swash: SwashCache::new(), viewport, atlas, glyph_cache: cache, text, quads,
             bg: None, post: None, cache: HashMap::new(), widths: HashMap::new(), family: family.into(), ui_family: String::new(),
             weight: 400, features: Vec::new(), font_px: 0.0, cell_w: 8.0, cell_h: 16.0,
             line_height, transparent, font_system, lost,
@@ -466,6 +467,24 @@ impl Renderer {
     }
 
     pub fn animated(&self) -> bool { self.post.is_some() }
+
+    /// Janela minimizada: solta o que se refaz no proximo quadro (textos
+    /// moldados, atlas de glifos, alvo do shader) e devolve as paginas ao
+    /// Windows. A troca de cadeia ja encolhe para 1x1 no resize(0, 0).
+    pub fn hibernate(&mut self) {
+        self.cache.clear();
+        self.cache.shrink_to_fit();
+        self.swash = SwashCache::new();
+        self.atlas = TextAtlas::new(&self.device, &self.queue, &self.glyph_cache, self.config.format);
+        self.text = (0..LAYERS).map(|_| TextRenderer::new(&mut self.atlas, &self.device, wgpu::MultisampleState::default(), None)).collect();
+        if let Some(p) = self.post.as_mut() { p.target = None; }
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+            SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+        }
+    }
 
     pub fn resize(&mut self, w: u32, h: u32) {
         self.config.width = w.max(1);

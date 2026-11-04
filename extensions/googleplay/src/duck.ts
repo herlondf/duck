@@ -83,8 +83,14 @@ function claudeExe(): string {
   return fs.existsSync(local) ? local : "claude";
 }
 
+/** Pane com agente aberto no Duck (manifesto precisa de "permissions": ["agents"]). */
+export type AgentPane = {
+  pane: number; workspace: string; tab: string; title: string; cwd: string; parent?: number | null; idle_secs: number;
+  agent: { name: string; state: string; since: number; source: string; session?: string | null; config_dir?: string | null; [k: string]: unknown };
+};
+
 let seq = 0;
-const waiting = new Map<number, (v: string | null) => void>();
+const waiting = new Map<number, (v: any) => void>();
 
 type Handlers = {
   init?: (m: Init) => unknown;
@@ -130,6 +136,16 @@ export const duck = {
   secret(name: string): Promise<string | null> {
     const id = ++seq;
     return new Promise((res) => { waiting.set(id, res); send({ type: "secret", id, name }); });
+  },
+  /** Agentes abertos nos panes do Duck: pasta, estado (working, blocked, done, idle)...
+   *  Sem a permissao "agents" no manifesto, a resposta nao vem (null em 3 s). */
+  agents(): Promise<AgentPane[] | null> {
+    const id = ++seq;
+    return new Promise((res) => {
+      const t = setTimeout(() => { waiting.delete(id); res(null); }, 3000);
+      waiting.set(id, (v) => { clearTimeout(t); res(v); });
+      send({ type: "agents", id });
+    });
   },
   /** Lista para escolher; a escolha chega em `input` com value = id da opcao. */
   choose(id: string, title: string, options: { id: string; title: string; hint?: string }[]) { send({ type: "choose", id, title, options }); },
@@ -197,6 +213,7 @@ export const duck = {
 export function run(h: Handlers): void {
   const dispatch = async (m: any) => {
     if (m.type === "secret") { waiting.get(m.id)?.(m.value ?? null); waiting.delete(m.id); return; }
+    if (m.type === "agents") { waiting.get(m.id)?.(m.agents ?? []); waiting.delete(m.id); return; }
     const fn = ({
       init: h.init, action: h.action, command: h.command, input: h.input,
       "view-open": h.viewOpen, "view-close": h.viewClose, context: h.context, clipboard: h.clipboard,
