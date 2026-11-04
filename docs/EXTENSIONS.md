@@ -135,6 +135,36 @@ need (account, repository, number) and parse it back in `action`.
 `refresh`, `jira`, `azure`) or any Nerd Font glyph. **Colors** are theme names
 (`accent`, `done`, `working`, `blocked`, `muted`, `fg`) or `#rrggbb`.
 
+## Running Claude Code from an extension
+
+`duck.agent()` runs Claude Code headless (`claude -p`) and resolves with the
+final answer. It uses the login of a Claude Code profile (Pro/Max plan), never
+an API key: `ANTHROPIC_API_KEY` is removed from the agent's environment.
+
+```ts
+const r = await duck.agent({
+  prompt: "Resuma as notícias de IA das últimas 6 horas em 3 frases",
+  profile: "",                  // "" = ~/.claude, "work" = ~/.claude-work, or a path
+  tools: ["WebSearch", "WebFetch"],
+  maxTurns: 10,
+});
+if (r.ok) duck.notify({ title: "Notícias", body: r.text });
+```
+
+| option | meaning |
+|---|---|
+| `prompt` | the request, sent through stdin |
+| `cwd` | folder the agent works in (default: the extension folder) |
+| `profile` | Claude Code profile whose login is used |
+| `tools` | tools allowed without asking (`"Bash(gh issue list:*)"` style); everything else is denied, since nobody is there to approve |
+| `permissionMode` | `acceptEdits` lets it edit files in `cwd` |
+| `maxTurns`, `model`, `system`, `resume`, `timeoutSec` | passed to Claude Code (`system` is appended to the system prompt; timeout defaults to 30 min) |
+
+The result is `{ok, text, error?, sessionId?, turns?, durationMs?, costUsd?}`.
+Pass `sessionId` back as `resume` to continue the same conversation. Start and
+end of each run go to the extension log. Runs share the plan's usage limits
+with your interactive sessions, so keep schedules sparse.
+
 ## Minimal extension (TypeScript)
 
 ```ts

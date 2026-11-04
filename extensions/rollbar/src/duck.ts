@@ -6,6 +6,10 @@
 // Protocolo completo: docs/EXTENSIONS.md.
 
 import * as readline from "node:readline";
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 export type Action = { id: string; title: string; primary?: boolean };
 export type Item = {
@@ -33,6 +37,51 @@ export type ViewMsg = { type: "view-open" | "view-close"; view: string };
 export type ContextMsg = { type: "context"; cwd: string; pane: number; domain: string; title: string };
 /** Texto copiado dentro do Duck (manifesto precisa de "permissions": ["clipboard"]). */
 export type ClipboardMsg = { type: "clipboard"; text: string };
+
+export type AgentOptions = {
+  /** O pedido, como voce digitaria para o Claude Code. */
+  prompt: string;
+  /** Pasta onde o agente trabalha (repositorio). Padrao: a pasta da extensao. */
+  cwd?: string;
+  /** Perfil do Claude Code: "" = ~/.claude; "trabalho" = ~/.claude-trabalho; ou um caminho. */
+  profile?: string;
+  /** Ferramentas liberadas sem pedir, ex.: ["WebSearch", "Read", "Bash(gh issue list:*)"].
+   *  O resto e negado (nao ha ninguem para aprovar). */
+  tools?: string[];
+  /** acceptEdits deixa editar arquivos do cwd sem pedir. */
+  permissionMode?: "default" | "acceptEdits" | "plan";
+  maxTurns?: number;
+  model?: string;
+  /** Texto somado ao prompt de sistema. */
+  system?: string;
+  /** Continua uma conversa anterior (sessionId de um resultado). */
+  resume?: string;
+  /** Mata o agente depois disso. Padrao: 30 min. */
+  timeoutSec?: number;
+};
+export type AgentResult = {
+  ok: boolean;
+  /** Resposta final do agente. */
+  text: string;
+  error?: string;
+  sessionId?: string;
+  turns?: number;
+  durationMs?: number;
+  /** Custo estimado pelo Claude Code; no plano (Pro/Max) nao e cobrado a parte. */
+  costUsd?: number;
+};
+
+/** Pasta de config do perfil do Claude Code ("" = a padrao, ~/.claude). */
+function claudeDir(profile: string): string | null {
+  if (!profile || profile === "default") return null;
+  if (/[\\/]/.test(profile)) return profile;
+  return path.join(os.homedir(), `.claude-${profile}`);
+}
+
+function claudeExe(): string {
+  const local = path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "claude.exe" : "claude");
+  return fs.existsSync(local) ? local : "claude";
+}
 
 let seq = 0;
 const waiting = new Map<number, (v: string | null) => void>();
@@ -67,7 +116,7 @@ export const duck = {
   },
   /** Item na barra de titulo; clicar abre a visao `view`. text vazio remove. */
   status(id: string, text: string, opts: { color?: string; view?: string } = {}) { send({ type: "status", id, text, ...opts }); },
-  /** Aviso: cartao no Duck (janela em foco) ou toast do Windows com botoes. */
+  /** Aviso: cartao no Duck (janela em foco) ou no canto da tela, com botoes. */
   notify(n: { title: string; body?: string; item?: string; actions?: Action[]; color?: string; seconds?: number }) { send({ type: "notify", ...n }); },
   /** Painel flutuante com texto rolavel e botoes. */
   detail(d: { title: string; subtitle?: string; body: string; item?: string; actions?: (Action & { item?: string })[] }) { send({ type: "detail", ...d }); },
@@ -92,6 +141,56 @@ export const duck = {
   /** Mensagem curta no canto da janela. */
   flash(text: string) { send({ type: "flash", text }); },
   log(...a: unknown[]) { if (host && NAME) host.log(NAME, a); else console.error(new Date().toISOString(), ...a); },
+  /** Roda o Claude Code sem tela (`claude -p`) e devolve a resposta final.
+   *  Usa o login do perfil (assinatura Pro/Max), nunca uma chave de API:
+   *  ANTHROPIC_API_KEY e removida do ambiente do agente. */
+  agent(o: AgentOptions): Promise<AgentResult> {
+    const args = ["-p", "--output-format", "json"];
+    if (o.tools?.length) args.push("--allowedTools", o.tools.join(","));
+    if (o.permissionMode) args.push("--permission-mode", o.permissionMode);
+    if (o.maxTurns) args.push("--max-turns", String(o.maxTurns));
+    if (o.model) args.push("--model", o.model);
+    if (o.system) args.push("--append-system-prompt", o.system);
+    if (o.resume) args.push("--resume", o.resume);
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of Object.keys(env)) {
+      if (k === "CLAUDECODE" || k.startsWith("CLAUDE_CODE_") || k === "ANTHROPIC_API_KEY" || k === "ANTHROPIC_AUTH_TOKEN" || k === "CLAUDE_CONFIG_DIR") delete env[k];
+    }
+    const dir = claudeDir(o.profile ?? "");
+    if (dir) env.CLAUDE_CONFIG_DIR = dir;
+    const cwd = o.cwd ?? process.cwd();
+    const started = Date.now();
+    duck.log(`agente: inicio (perfil ${o.profile || "padrao"}, ${cwd})`);
+    return new Promise((resolve) => {
+      let out = "", err = "", done = false;
+      const finish = (r: AgentResult) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        duck.log(`agente: fim em ${Math.round((Date.now() - started) / 1000)}s, ok=${r.ok}${r.error ? `, ${r.error}` : ""}`);
+        resolve(r);
+      };
+      // O prompt vai pelo stdin: na linha de comando do Windows aspas e quebras se perdem.
+      const child = spawn(claudeExe(), args, { cwd, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+      const timer = setTimeout(() => { child.kill(); finish({ ok: false, text: "", error: "tempo esgotado" }); }, (o.timeoutSec ?? 1800) * 1000);
+      child.stdout.on("data", (d) => { out += d; });
+      child.stderr.on("data", (d) => { err += d; });
+      child.on("error", (e) => finish({ ok: false, text: "", error: `claude nao abriu: ${e.message}` }));
+      child.on("close", (code) => {
+        try {
+          const j = JSON.parse(out.trim().split("\n").pop() || "{}");
+          const ok = j.type === "result" && !j.is_error && j.subtype === "success";
+          finish({
+            ok, text: j.result ?? "", sessionId: j.session_id, turns: j.num_turns, durationMs: j.duration_ms, costUsd: j.total_cost_usd,
+            error: ok ? undefined : (j.subtype && j.subtype !== "success" ? j.subtype : (j.result || err.trim() || `saiu com ${code}`)),
+          });
+        } catch {
+          finish({ ok: false, text: "", error: (err.trim() || out.trim() || `saiu com ${code}`).slice(0, 500) });
+        }
+      });
+      child.stdin.end(o.prompt);
+    });
+  },
 };
 
 /** Liga os handlers e comeca a ler o stdin. O processo sai quando o Duck fecha. */
