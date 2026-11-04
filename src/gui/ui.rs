@@ -268,6 +268,13 @@ impl Gui {
                 .filter(|(k, _)| g(k) > 0).map(|(k, t)| (format!("{} {t}", g(k)), k.to_string())).collect();
             ext_badges.push(("duck:agent_panel".into(), "\u{f06a9}".into(), "Agentes".into(), chips));
         }
+        if builtin_on("inbox") {
+            let n = self.frame.inbox_unread;
+            let blocked = self.frame.agents.get("blocked").copied().unwrap_or(0);
+            let mut chips = Vec::new();
+            if n > 0 { chips.push((n.to_string(), if blocked > 0 { "blocked".to_string() } else { "accent".to_string() })); }
+            ext_badges.push(("duck:inbox".into(), "bell".into(), "Avisos".into(), chips));
+        }
         for v in &self.exts.views {
             if ext_badges.iter().any(|b| b.0.starts_with(&format!("{}/", v.ext))) { continue; }
             let label = self.exts.label(&v.ext);
@@ -818,7 +825,8 @@ impl Gui {
                 let br = [rx, 8.0, bw, bar_h - 16.0];
                 let open = match key.strip_prefix("duck:") {
                     Some("sys_panel") => sys_open,
-                    Some(_) => agent_open,
+                    Some("agent_panel") => agent_open,
+                    Some(_) => false,
                     None => ext_open.as_deref().is_some_and(|k| k.split('/').next() == key.split('/').next()),
                 };
                 let hv = inside(br, mouse);
@@ -1719,6 +1727,24 @@ impl Gui {
                 self.send_size();
             }
             "focus_mode" => { self.focus_mode = !self.focus_mode; self.send_size(); if self.focus_mode { self.flash("Modo foco (Ctrl+Shift+Z sai)"); } }
+            "inbox" => self.open_inbox(),
+            "inbox_clear" => { self.cmd(json!({"cmd": "inbox-clear"})); self.overlay = None; self.flash("Avisos apagados"); }
+            "inbox_open" => {
+                let v = args.first().cloned().unwrap_or(Value::Null);
+                let pane = v["pane"].as_u64().unwrap_or(0);
+                if v["kind"] == "agent" || (v["kind"] == "blocked" && pane != 0) {
+                    self.overlay = None;
+                    self.cmd(json!({"cmd": "focus", "pane": pane}));
+                } else if v["kind"] == "ext" {
+                    let ext = v["ext"].as_str().unwrap_or("").to_string();
+                    let item = v["item"].as_str().unwrap_or("").to_string();
+                    let actions = v["actions"].as_array().into_iter().flatten()
+                        .map(|a| (a["id"].as_str().unwrap_or("").to_string(), a["title"].as_str().unwrap_or("").to_string(), item.clone())).collect();
+                    let lines = v["body"].as_str().unwrap_or("").replace("\r\n", "\n").lines().map(String::from).collect();
+                    let subtitle = format!("{} · {}", self.exts.label(&ext), ago(v["at"].as_u64().unwrap_or(0)));
+                    self.overlay = Some(Overlay { kind: OverlayKind::Detail { ext, subtitle, lines, actions, scroll: 0 }, ..Overlay::list(v["title"].as_str().unwrap_or(""), vec![]) });
+                }
+            }
             "agent_panel" => {
                 if self.agent_panel.take().is_none() { self.sys_panel = false; self.ext_panel = None; self.refresh_agent_panel(true); }
                 self.stats.lock().unwrap().want_procs = self.sys_panel;
@@ -2096,24 +2122,16 @@ impl Gui {
     }
 
     pub(super) fn session_items(&mut self, limit: usize) -> Vec<Item> {
-        let mut found: Vec<(u64, String, String, String)> = Vec::new(); // (mtime, perfil, sessao, caminho)
-        for prof in std::fs::read_dir(config::home()).into_iter().flatten().flatten() {
-            let pname = prof.file_name().to_string_lossy().to_string();
-            if !pname.starts_with(".claude") || !prof.path().join("projects").is_dir() { continue; }
-            for proj in std::fs::read_dir(prof.path().join("projects")).into_iter().flatten().flatten() {
-                for f in std::fs::read_dir(proj.path()).into_iter().flatten().flatten() {
-                    let p = f.path();
-                    if p.extension().is_none_or(|e| e != "jsonl") { continue; }
-                    let mtime = f.metadata().and_then(|m| m.modified()).ok()
-                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-                    found.push((mtime, pname.clone(), p.file_stem().unwrap().to_string_lossy().to_string(), p.to_string_lossy().to_string()));
-                }
-            }
+        // (mtime, perfil, sessao, caminho, WSL: (dominio, home no Linux))
+        let mut found: Vec<(u64, String, String, String, Option<(String, String)>)> = Vec::new();
+        for (mtime, prof, session, path) in scan_profiles(&config::home()) {
+            found.push((mtime, prof, session, path, None));
         }
+        found.extend(wsl_sessions(&self.cfg.domains));
         found.sort_by(|a, b| b.0.cmp(&a.0));
         found.truncate(limit);
         let mut items = Vec::new();
-        for (mtime, prof, session, path) in found {
+        for (mtime, prof, session, path, wsl) in found {
             let head = read_head(&path, 96 * 1024);
             let (mut cwd, mut title) = (String::new(), String::new());
             for line in head.lines() {
@@ -2130,10 +2148,20 @@ impl Gui {
             let dir = cwd.rsplit(['/', '\\']).next().unwrap_or("").to_string();
             let perfil = prof.trim_start_matches(".claude").trim_start_matches('-');
             let perfil = if perfil.is_empty() { "pessoal" } else { perfil };
-            let env = if prof == ".claude" { String::new() } else { format!("$env:CLAUDE_CONFIG_DIR='{}'; ", config::home().join(&prof).display()) };
-            let cmd = format!("{env}claude --resume {session}");
-            items.push(Item::new(format!("{dir} · {title}"), format!("sessao · {perfil} · {}", ago(mtime)), "spawn",
-                vec![json!({"where": "tab", "cwd": cwd, "title": dir, "cmd": ["pwsh", "-NoLogo", "-NoExit", "-Command", cmd]})]));
+            match wsl {
+                None => {
+                    let env = if prof == ".claude" { String::new() } else { format!("$env:CLAUDE_CONFIG_DIR='{}'; ", config::home().join(&prof).display()) };
+                    let cmd = format!("{env}claude --resume {session}");
+                    items.push(Item::new(format!("{dir} · {title}"), format!("sessao · {perfil} · {}", ago(mtime)), "spawn",
+                        vec![json!({"where": "tab", "cwd": cwd, "title": dir, "cmd": ["pwsh", "-NoLogo", "-NoExit", "-Command", cmd]})]));
+                }
+                Some((domain, home)) => {
+                    // No shell do WSL (o bash fica depois que o claude sai), como a restauracao do checkpoint.
+                    let env = if prof == ".claude" { String::new() } else { format!("CLAUDE_CONFIG_DIR='{home}/{prof}' ") };
+                    items.push(Item::new(format!("{dir} · {title}"), format!("sessao · {domain} · {perfil} · {}", ago(mtime)), "spawn",
+                        vec![json!({"where": "tab", "domain": domain, "cwd": cwd, "title": dir, "type": format!("{env}claude --resume {session}")})]));
+                }
+            }
         }
         items
     }
@@ -3046,5 +3074,70 @@ mod tests {
 
 /// Nome da extensao dona do badge ("duck:sys_panel" -> "system", "jira/issues" -> "jira").
 fn badge_name(key: &str) -> &str {
-    match key { "duck:sys_panel" => "system", "duck:agent_panel" => "agents", k => k.split('/').next().unwrap_or(k) }
+    match key { "duck:sys_panel" => "system", "duck:agent_panel" => "agents", "duck:inbox" => "inbox", k => k.split('/').next().unwrap_or(k) }
+}
+
+
+/// Transcripts do Claude Code nos perfis (~/.claude*/projects) de uma home:
+/// (mtime, perfil, sessao, caminho). Copias de seguranca ficam de fora.
+fn scan_profiles(home: &std::path::Path) -> Vec<(u64, String, String, String)> {
+    let mut found = Vec::new();
+    for prof in std::fs::read_dir(home).into_iter().flatten().flatten() {
+        let pname = prof.file_name().to_string_lossy().to_string();
+        if !pname.starts_with(".claude") || pname.contains(".bak") || pname.contains("backup") || !prof.path().join("projects").is_dir() { continue; }
+        for proj in std::fs::read_dir(prof.path().join("projects")).into_iter().flatten().flatten() {
+            for f in std::fs::read_dir(proj.path()).into_iter().flatten().flatten() {
+                let p = f.path();
+                if p.extension().is_none_or(|e| e != "jsonl") { continue; }
+                let mtime = f.metadata().and_then(|m| m.modified()).ok()
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                found.push((mtime, pname.clone(), p.file_stem().unwrap().to_string_lossy().to_string(), p.to_string_lossy().to_string()));
+            }
+        }
+    }
+    found
+}
+
+/// Sessoes do Claude Code dentro das distros do WSL que sao dominios do Duck.
+/// So as distros ja rodando (ler \\wsl.localhost acorda uma parada), e o
+/// resultado vale 60 s (o acesso pelo 9P e lento).
+#[allow(clippy::type_complexity)]
+fn wsl_sessions(domains: &[config::Domain]) -> Vec<(u64, String, String, String, Option<(String, String)>)> {
+    #[cfg(not(windows))]
+    { let _ = domains; return Vec::new(); }
+    #[cfg(windows)]
+    {
+        type Found = Vec<(u64, String, String, String, Option<(String, String)>)>;
+        static CACHE: std::sync::Mutex<Option<(Instant, Found)>> = std::sync::Mutex::new(None);
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((t, v)) = cache.as_ref() { if t.elapsed() < Duration::from_secs(60) { return v.clone(); } }
+        let distros: Vec<(String, String)> = domains.iter().filter_map(|d| {
+            if !d.cmd.first().is_some_and(|c| c.to_lowercase().contains("wsl")) { return None; }
+            let i = d.cmd.iter().position(|a| a == "-d" || a == "--distribution")?;
+            Some((d.name.clone(), d.cmd.get(i + 1)?.clone()))
+        }).collect();
+        let mut out: Found = Vec::new();
+        if !distros.is_empty() {
+            let mut c = std::process::Command::new("wsl.exe");
+            c.args(["-l", "--running", "-q"]);
+            { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); }
+            let running: Vec<String> = c.output().ok().map(|o| {
+                // wsl.exe escreve UTF-16LE.
+                let u: Vec<u16> = o.stdout.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+                String::from_utf16_lossy(&u).lines().map(|l| l.trim().trim_matches('\0').to_lowercase()).filter(|l| !l.is_empty()).collect()
+            }).unwrap_or_default();
+            for (domain, distro) in distros {
+                if !running.contains(&distro.to_lowercase()) { continue; }
+                let base = std::path::PathBuf::from(format!(r"\\wsl.localhost\{distro}\home"));
+                for user in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+                    let uname = user.file_name().to_string_lossy().to_string();
+                    for (mtime, prof, session, path) in scan_profiles(&user.path()) {
+                        out.push((mtime, prof, session, path, Some((domain.clone(), format!("/home/{uname}")))));
+                    }
+                }
+            }
+        }
+        *cache = Some((Instant::now(), out.clone()));
+        out
+    }
 }

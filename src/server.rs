@@ -341,6 +341,8 @@ pub struct Mux {
     clipboard: (u64, String),
     events: Vec<(u64, Value)>,
     event_seq: u64,
+    /// Central de avisos: o que apareceu (extensoes, agentes), lido ou nao.
+    inbox: Inbox,
     approvals: Vec<Approval>,
     approval_seq: u64,
     secrets: Vec<regex::Regex>,
@@ -905,12 +907,39 @@ fn scrub(m: &Mux, text: String) -> String {
 
 // ------------------------------------------------------------------ eventos
 
+#[derive(Default)]
+struct Inbox { items: Vec<Value>, seq: u64, read: u64 }
+
+impl Inbox {
+    /// Guarda um aviso (os 60 ultimos). `v` tem title, body, color e o que
+    /// for preciso para agir depois (ext + item + actions, ou pane).
+    fn push(&mut self, mut v: Value) {
+        self.seq += 1;
+        v["seq"] = json!(self.seq);
+        v["at"] = json!(now_secs());
+        self.items.push(v);
+        if self.items.len() > 60 { self.items.remove(0); }
+    }
+    fn unread(&self) -> usize { self.items.iter().filter(|v| v["seq"].as_u64().unwrap_or(0) > self.read).count() }
+}
+
 fn emit(m: &mut Mux, event: &str, pane: Id) {
     let (title, cwd, state) = m.panes.get(&pane)
         .map(|p| (p.title.clone(), p.cwd.clone(), p.agent.as_ref().map(|a| a.state.clone()).unwrap_or_default()))
         .unwrap_or_default();
     m.event_seq += 1;
     let ev = json!({"event": event, "pane": pane, "title": title, "cwd": cwd, "state": state});
+    if event == "attention" && (state == "blocked" || state == "done") {
+        let tab = m.workspaces.iter().flat_map(|w| w.tabs.iter().map(move |t| (w, t))).find(|(_, t)| t.all().contains(&pane))
+            .map(|(w, t)| format!("{} · {}", w.name, if t.title.is_empty() { "aba" } else { &t.title })).unwrap_or_default();
+        let what = title.trim_start_matches(|c: char| !c.is_alphanumeric()).to_string();
+        m.inbox.push(json!({
+            "kind": "agent", "pane": pane, "state": state,
+            "title": if state == "blocked" { "Agente precisa de você" } else { "Agente terminou" },
+            "body": if what.is_empty() { tab.clone() } else { format!("{what} · {tab}") },
+            "color": if state == "blocked" { "blocked" } else { "done" },
+        }));
+    }
     m.events.push((m.event_seq, ev));
     if m.events.len() > 64 { m.events.remove(0); }
     if let Some(cmd) = m.cfg.hooks.get(event).cloned() {
@@ -1398,7 +1427,7 @@ fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> 
         "t": "frame", "workspace": ws_name, "workspaces": workspaces, "tabs": tabs,
         "active_pane": active, "cols": cols, "rows": rows, "panes": panes,
         "agents": counts, "clipboard": [m.clipboard.0, m.clipboard.1],
-        "approvals": approvals, "resurrect": m.resurrect, "recovered": m.recovered,
+        "approvals": approvals, "resurrect": m.resurrect, "recovered": m.recovered, "inbox_unread": m.inbox.unread(),
         "tokens": m.panes.values().filter_map(|p| p.agent.as_ref()?.session_tokens).sum::<u64>(),
         "ports": m.panes.values().flat_map(|p| p.ports.iter().copied()).collect::<std::collections::BTreeSet<u16>>(),
         "version": env!("CARGO_PKG_VERSION"),
@@ -2077,6 +2106,22 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             if m.events.len() > 64 { m.events.remove(0); }
             proto::ok(json!({}))
         }
+        // Central de avisos: lista (mais novo primeiro), marcar como lidos, limpar.
+        "inbox" => {
+            let items: Vec<Value> = m.inbox.items.iter().rev().cloned().collect();
+            proto::ok(json!({"items": items, "read": m.inbox.read}))
+        }
+        "inbox-read" => {
+            m.inbox.read = m.inbox.seq;
+            srv.notify();
+            proto::ok(json!({}))
+        }
+        "inbox-clear" => {
+            m.inbox.items.clear();
+            m.inbox.read = m.inbox.seq;
+            srv.notify();
+            proto::ok(json!({}))
+        }
         "events" => {
             let since = a.get("since").and_then(|v| v.as_u64()).unwrap_or(0);
             let ev: Vec<Value> = m.events.iter().filter(|(s, _)| *s > since).map(|(s, e)| {
@@ -2696,6 +2741,12 @@ fn ext_incoming(srv: &Arc<Server>, ext: &str, msg: Value, gen: u64) {
         return;
     }
     let Some(msg) = m.ext.incoming(ext, msg, gen) else { return };
+    if msg["type"] == "notify" {
+        m.inbox.push(json!({
+            "kind": "ext", "ext": ext, "title": msg["title"], "body": msg["body"], "color": msg["color"],
+            "item": msg["item"], "actions": msg["actions"],
+        }));
+    }
     if m.subs == 0 {
         match msg["type"].as_str().unwrap_or("") {
             "notify" => return ext_toast(ext, &msg),
@@ -2775,7 +2826,7 @@ pub fn run() {
     let srv = Arc::new(Server {
         mux: Mutex::new(Mux {
             panes: HashMap::new(), workspaces: Vec::new(), next: 1, size: (100, 30),
-            clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0,
+            clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0, inbox: Inbox::default(),
             approvals: Vec::new(), approval_seq: 0, secrets, recovered: 0, resurrect: false, light: false,
             history: load_history(), budget_warned: false, ext: Default::default(), subs: 0,
         }),
@@ -2886,7 +2937,7 @@ mod tests {
         let m = Mux {
             panes: HashMap::new(), workspaces: vec![], next: 1, size: (10, 10), clients: HashMap::new(),
             cfg: config::parse(&t),
-            clipboard: (0, String::new()), events: vec![], event_seq: 0, approvals: vec![], approval_seq: 0,
+            clipboard: (0, String::new()), events: vec![], event_seq: 0, inbox: Inbox::default(), approvals: vec![], approval_seq: 0,
             secrets: vec![], recovered: 0, resurrect: false, light: false, history: vec![], budget_warned: false, ext: Default::default(), subs: 0,
         };
         assert!(check_scope(&m, Caller(Some(5)), "send", &json!({"pane": 9})).is_err());

@@ -111,6 +111,7 @@ struct Frame {
     #[serde(default)] version: String,
     #[serde(default)] tokens: u64,
     #[serde(default)] ports: Vec<u16>,
+    #[serde(default)] inbox_unread: usize,
 }
 
 impl PaneView {
@@ -484,9 +485,10 @@ impl Gui {
         if let Some(e) = err { self.flash(&e); }
         self.keys = parse_bindings(&lua, t.get("keys").ok());
         // Atalhos novos com padrao (a config do usuario pode sobrescrever).
-        let defaults: [(&str, &str, &str, Vec<Value>); 24] = [
+        let defaults: [(&str, &str, &str, Vec<Value>); 25] = [
             ("w", "CTRL|SHIFT", "close_tab", vec![]),
             ("i", "CTRL|SHIFT", "agent_panel", vec![]),
+            ("j", "CTRL|SHIFT", "inbox", vec![]),
             ("y", "CTRL|SHIFT", "agent_timeline", vec![]),
             ("z", "CTRL|SHIFT", "focus_mode", vec![]),
             ("b", "CTRL|ALT", "toggle_sidebar", vec![]),
@@ -1132,6 +1134,7 @@ impl Gui {
             b("Modo foco (esconde abas e escurece o resto)", "focus_mode", vec![]),
             b("Barra lateral de abas: recolher/abrir", "toggle_sidebar", vec![]),
             b("Agentes: painel lateral do agente (plano, tokens)", "agent_panel", vec![]),
+            b("Caixa de entrada: o que espera você e os avisos que passaram", "inbox", vec![]),
             b("Agentes: linha do tempo da sessao", "agent_timeline", vec![]),
             b("Editor de comando (varias linhas, Ctrl+Z)", "composer", vec![]),
             b("Galeria de temas (previa ao vivo)", "theme_gallery", vec![]),
@@ -1401,6 +1404,41 @@ impl Gui {
         ];
         let title = match port { Some(p) => format!("Worktree {branch} (base: {base}, porta {p})"), None => format!("Worktree {branch} (base: {base})") };
         self.overlay = Some(Overlay::list(&title, items));
+    }
+
+    /// Caixa de entrada: primeiro o que espera voce agora (agente pedindo
+    /// aprovacao), depois os avisos que passaram (extensoes, agentes), mesmo
+    /// os que chegaram com a janela fechada. Abrir marca tudo como lido.
+    fn open_inbox(&mut self) {
+        let Ok(v) = self.call(json!({"cmd": "inbox"})) else { return self.flash("Server sem caixa de entrada (reinicie o server)") };
+        let read = v["read"].as_u64().unwrap_or(0);
+        let mut items = Vec::new();
+        if let Ok(l) = self.call(json!({"cmd": "list"})) {
+            for w in l["workspaces"].as_array().into_iter().flatten() {
+                for t in w["tabs"].as_array().into_iter().flatten() {
+                    for p in t["panes"].as_array().into_iter().flatten() {
+                        if p["agent"]["state"] != "blocked" { continue; }
+                        let title = p["title"].as_str().unwrap_or("").trim_start_matches(|c: char| !c.is_alphanumeric()).to_string();
+                        let tab = t["title"].as_str().filter(|x| !x.is_empty()).unwrap_or("aba");
+                        items.push(Item::new(format!("⏸ Esperando você: {}", if title.is_empty() { tab } else { &title }),
+                            format!("{} · {tab} · Enter abre o pane", w["name"].as_str().unwrap_or("")), "inbox_open",
+                            vec![json!({"kind": "blocked", "pane": p["id"]})]));
+                    }
+                }
+            }
+        }
+        for it in v["items"].as_array().into_iter().flatten() {
+            let unread = it["seq"].as_u64().unwrap_or(0) > read;
+            let body = it["body"].as_str().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
+            let body: String = body.chars().take(90).collect();
+            let from = if it["kind"] == "ext" { self.exts.label(it["ext"].as_str().unwrap_or("")) } else { "Agente".to_string() };
+            items.push(Item::new(format!("{}{}", if unread { "● " } else { "" }, it["title"].as_str().unwrap_or("")),
+                format!("{from} · {} · {body}", ago(it["at"].as_u64().unwrap_or(0))), "inbox_open", vec![it.clone()]));
+        }
+        if v["items"].as_array().is_some_and(|a| !a.is_empty()) { items.push(Item::new("Limpar os avisos", "", "inbox_clear", vec![])); }
+        if items.is_empty() { return self.flash("Nada esperando você e nenhum aviso"); }
+        self.cmd(json!({"cmd": "inbox-read"}));
+        self.overlay = Some(Overlay::list("Caixa de entrada", items));
     }
 
     /// Bifurca a sessao do agente ativo: pane novo com --fork-session.
