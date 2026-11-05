@@ -271,12 +271,21 @@ pub fn doctor() -> i32 {
             println!("{}hooks do Duck em ~/{name}/settings.json{}", ok(has), if has { "" } else { "  (duck install --hooks <arquivo>)" });
         }
     }
-    let wsl = std::process::Command::new("wsl.exe").args(["-l", "-q"]).output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).replace('\0', "").lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(", "))
-        .unwrap_or_default();
-    println!("{}WSL: {}", ok(!wsl.is_empty()), if wsl.is_empty() { "nenhuma distro" } else { &wsl });
     let script = crate::proto::data_dir().join("shell").join("duck.sh");
-    println!("    shell integration bash/zsh: no ~/.bashrc do WSL ponha  . {}", to_wsl_path(&script.to_string_lossy()));
+    if cfg!(windows) {
+        let wsl = std::process::Command::new("wsl.exe").args(["-l", "-q"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).replace('\0', "").lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        println!("{}WSL: {}", ok(!wsl.is_empty()), if wsl.is_empty() { "nenhuma distro" } else { &wsl });
+        println!("    shell integration bash/zsh: no ~/.bashrc do WSL ponha  . {}", to_wsl_path(&script.to_string_lossy()));
+    } else {
+        // Linux/macOS: o duck.sh precisa ser carregado pelo rc do shell.
+        let home = crate::config::home();
+        let has = [".bashrc", ".zshrc"].iter()
+            .any(|f| std::fs::read_to_string(home.join(f)).unwrap_or_default().contains("duck/shell/duck.sh"));
+        println!("{}shell integration bash/zsh{}", ok(has),
+            if has { String::new() } else { format!("  (no ~/.bashrc ou ~/.zshrc ponha  . {})", script.display()) });
+    }
     doctor_extensions();
     0
 }

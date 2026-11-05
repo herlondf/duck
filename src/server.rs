@@ -956,8 +956,16 @@ fn run_check(check: &str, cwd: &str, domain_cmd: &[String]) -> (i32, String) {
         c.args(["--cd", cwd, "--", "bash", "-lc", check]);
         c
     } else {
-        let mut c = std::process::Command::new("pwsh");
-        c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", check]);
+        // Windows: PowerShell. Linux/macOS: o shell padrao.
+        let mut c = if cfg!(windows) {
+            let mut c = std::process::Command::new("pwsh");
+            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", check]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", check]);
+            c
+        };
         if std::path::Path::new(cwd).is_dir() { c.current_dir(cwd); }
         c
     };
@@ -3040,7 +3048,8 @@ mod tests {
         l.iter = 2; l.phase = "passed".into();
         assert_eq!(l.label(), "✓ 2/5");
         assert!(!l.active());
-        let (code, out) = run_check("Write-Output ok; exit 3", ".", &[]);
+        let cmd = if cfg!(windows) { "Write-Output ok; exit 3" } else { "echo ok; exit 3" };
+        let (code, out) = run_check(cmd, ".", &[]);
         assert_eq!((code, out.trim()), (3, "ok"));
     }
 
