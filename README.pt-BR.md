@@ -50,7 +50,8 @@ fazendo.
 
 ## Instalação
 
-Precisa do [Rust](https://rustup.rs) (stable). O primeiro build leva uns 5
+Precisa do [Rust](https://rustup.rs) (stable); no Linux e no macOS o instalador
+oferece instalar. O primeiro build leva uns 5
 minutos. O **[playbook](docs/PLAYBOOK.pt-BR.md)** tem o passo a passo
 completo: pré-requisitos, conferência, cada extensão e as rotinas.
 
@@ -70,21 +71,21 @@ pwsh -File .\install.ps1              # só o terminal (as opções avulsas: -Bo
 ### Linux
 
 ```bash
-curl https://sh.rustup.rs -sSf | sh
-sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
-sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel                # Fedora
-sudo pacman -S --needed base-devel pkgconf libxkbcommon wayland libx11                     # Arch
 git clone https://github.com/herlondf/duck.git && cd duck
-./install.sh                 # compila, ~/.local/bin, ~/.duck.lua, atalho no menu de apps
+./install.sh                 # compila, ~/.local/bin, PATH, shell integration, ~/.duck.lua, atalho no menu de apps
 ./install.sh --all           # + abre no login, hooks do Claude Code, extensões
 ```
+
+Falta o Rust ou os pacotes de build (gcc, pkg-config, libs de X11/Wayland)? O
+instalador oferece instalar: o rustup no seu home, os pacotes com `sudo` pelo
+apt, dnf, pacman ou zypper. `--yes` responde sim para tudo.
 
 ### macOS
 
 ```bash
-curl https://sh.rustup.rs -sSf | sh
+xcode-select --install       # compilador C, se ainda nao tiver
 git clone https://github.com/herlondf/duck.git && cd duck
-./install.sh                 # compila, ~/.local/bin, ~/Applications/Duck.app
+./install.sh                 # compila (oferece instalar o Rust), ~/.local/bin, ~/Applications/Duck.app
 ```
 
 Depois rode `duck` (abre a janela) ou `duck doctor`, que confere config,

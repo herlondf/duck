@@ -49,7 +49,8 @@ doing.
 
 ## Install
 
-You need [Rust](https://rustup.rs) (stable). The first build takes about 5
+You need [Rust](https://rustup.rs) (stable); on Linux and macOS the installer
+offers to install it. The first build takes about 5
 minutes. The **[playbook](docs/PLAYBOOK.md)** has the full step by step:
 prerequisites, checks, every extension and routines.
 
@@ -69,21 +70,21 @@ pwsh -File .\install.ps1              # just the terminal (single options: -Boot
 ### Linux
 
 ```bash
-curl https://sh.rustup.rs -sSf | sh
-sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
-sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel                # Fedora
-sudo pacman -S --needed base-devel pkgconf libxkbcommon wayland libx11                     # Arch
 git clone https://github.com/herlondf/duck.git && cd duck
-./install.sh                 # build, ~/.local/bin, ~/.duck.lua, app menu entry
+./install.sh                 # build, ~/.local/bin, PATH, shell integration, ~/.duck.lua, app menu entry
 ./install.sh --all           # + open at login, Claude Code hooks, extensions
 ```
+
+Missing Rust or build packages (gcc, pkg-config, X11/Wayland libs)? The
+installer offers to install them: rustup in your home, the packages with
+`sudo` through apt, dnf, pacman or zypper. `--yes` answers yes to everything.
 
 ### macOS
 
 ```bash
-curl https://sh.rustup.rs -sSf | sh
+xcode-select --install       # C compiler, if you don't have it yet
 git clone https://github.com/herlondf/duck.git && cd duck
-./install.sh                 # build, ~/.local/bin, ~/Applications/Duck.app
+./install.sh                 # build (offers to install Rust), ~/.local/bin, ~/Applications/Duck.app
 ```
 
 Then run `duck` (opens the window) or `duck doctor`, which checks config,

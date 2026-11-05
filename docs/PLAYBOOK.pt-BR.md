@@ -50,12 +50,23 @@ para instalar, se faltar o Rust, o MSVC Build Tools ou o Node.
 ### Linux e macOS
 
 ```bash
-curl https://sh.rustup.rs -sSf | sh
-sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
-sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel                # Fedora
-sudo pacman -S --needed base-devel pkgconf libxkbcommon wayland libx11                     # Arch
 git clone https://github.com/herlondf/duck.git && cd duck
 ./install.sh --all
+```
+
+O instalador oferece instalar o que falta: o Rust (rustup, no seu home) e os
+pacotes de build (com `sudo`, pelo apt, dnf, pacman ou zypper; no macOS pede
+para rodar `xcode-select --install`). Ele também põe o `~/.local/bin` no PATH e
+a shell integration no `~/.bashrc` / `~/.zshrc`, num bloco `# >>> duck >>>`
+que reinstalações trocam em vez de duplicar. `--yes` responde sim para tudo;
+`--no-shell` não mexe nos arquivos do shell.
+
+Pacotes à mão, se preferir:
+
+```bash
+sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
+sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel    # Fedora
+sudo pacman -S --needed base-devel pkgconf libxkbcommon wayland libx11                    # Arch
 ```
 
 O Windows é o sistema de uso diário. O Linux compila e passa nos testes,

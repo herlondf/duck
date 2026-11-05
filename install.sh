@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 # Duck installer for Linux and macOS / instalador do Duck para Linux e macOS.
 #
-#   ./install.sh                 build + install to ~/.local/bin
+#   ./install.sh                 build + install to ~/.local/bin, PATH and shell integration
+#                                (offers to install Rust and the build packages when missing)
 #   ./install.sh --boot          also open Duck at login, restoring the last checkpoint
 #   ./install.sh --claude-hooks  also register `duck hook` in ~/.claude*/settings.json
 #   ./install.sh --skip-build    reuse target/release
 #   ./install.sh --extensions    build the bundled extensions (Node 18+); enable them in Ctrl+Shift+P
 #   ./install.sh --all           same as --boot --claude-hooks --extensions
+#   ./install.sh --yes           answer yes to every question (unattended install)
+#   ./install.sh --no-shell      leave ~/.bashrc and ~/.zshrc alone
 #
-# Nothing outside your home directory is changed. / Nada fora do seu home e alterado.
+# Only system packages (with sudo, after asking) change anything outside your home.
+# So os pacotes do sistema (com sudo, depois de perguntar) mexem fora do seu home.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")" && pwd)"
 case "${LANG:-}${LC_ALL:-}" in pt*) pt=1 ;; *) pt=0 ;; esac
 say() { if [ "$pt" = 1 ]; then printf '%s\n' "$1"; else printf '%s\n' "$2"; fi; }
 
-boot=0; hooks=0; build=1; exts=0
+boot=0; hooks=0; build=1; exts=0; yes=0; shellrc=1
 for a in "$@"; do
   case "$a" in
     --boot) boot=1 ;;
@@ -23,10 +27,22 @@ for a in "$@"; do
     --skip-build) build=0 ;;
     --extensions) exts=1 ;;
     --all) boot=1; hooks=1; exts=1 ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    --yes|-y) yes=1 ;;
+    --no-shell) shellrc=0 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
     *) say "opcao desconhecida: $a" "unknown option: $a"; exit 2 ;;
   esac
 done
+
+# Pergunta sim/nao. --yes responde sim; sem terminal (CI) responde nao.
+ask() {
+  [ "$yes" = 1 ] && return 0
+  [ -t 0 ] || return 1
+  local r
+  if [ "$pt" = 1 ]; then printf '%s [S/n] ' "$1"; else printf '%s [Y/n] ' "$2"; fi
+  read -r r || return 1
+  case "$r" in ""|[sSyY]*) return 0 ;; *) return 1 ;; esac
+}
 
 os="$(uname -s)"
 if [ "$build" = 1 ]; then
@@ -35,28 +51,55 @@ if [ "$build" = 1 ]; then
     . "$HOME/.cargo/env"
   fi
   if ! command -v cargo >/dev/null 2>&1; then
-    say "Rust nao encontrado. Instale com: curl https://sh.rustup.rs -sSf | sh" \
-        "Rust not found. Install it with: curl https://sh.rustup.rs -sSf | sh"
-    exit 1
-  fi
-  if [ "$os" = Linux ]; then
-    # Compilador C (linker e Lua embutido), pkg-config e libs de janela/teclado do winit/wgpu.
-    if command -v apt-get >/dev/null 2>&1; then
-      deps="sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev"
-    elif command -v dnf >/dev/null 2>&1; then
-      deps="sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel"
-    elif command -v pacman >/dev/null 2>&1; then
-      deps="sudo pacman -S --needed base-devel pkgconf libxkbcommon wayland libx11"
-    elif command -v zypper >/dev/null 2>&1; then
-      deps="sudo zypper install gcc pkg-config libxkbcommon-devel wayland-devel libX11-devel"
+    if command -v curl >/dev/null 2>&1 && ask "Rust nao encontrado. Instalar agora (rustup, no seu home)?" "Rust not found. Install it now (rustup, in your home)?"; then
+      curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+      . "$HOME/.cargo/env"
     else
-      deps="gcc, pkg-config, libxkbcommon, wayland, libX11 (dev packages)"
+      say "Rust nao encontrado. Instale com: curl https://sh.rustup.rs -sSf | sh" \
+          "Rust not found. Install it with: curl https://sh.rustup.rs -sSf | sh"
+      exit 1
     fi
-    missing=""
-    command -v cc >/dev/null 2>&1 || missing="$missing cc"
-    command -v pkg-config >/dev/null 2>&1 || missing="$missing pkg-config"
-    if [ -n "$missing" ]; then
-      say "Faltando:$missing. Instale com: $deps" "Missing:$missing. Install with: $deps"
+  fi
+
+  # Compilador C (linker e Lua embutido), pkg-config e libs de janela/teclado do winit/wgpu.
+  missing=""
+  command -v cc >/dev/null 2>&1 || missing="$missing cc"
+  if [ "$os" = Linux ]; then
+    if command -v pkg-config >/dev/null 2>&1; then
+      for lib in xkbcommon wayland-client x11; do
+        pkg-config --exists "$lib" || missing="$missing $lib"
+      done
+    else
+      missing="$missing pkg-config"
+    fi
+  fi
+  if [ -n "$missing" ]; then
+    if [ "$os" = Darwin ]; then
+      say "Faltando:$missing. Rode: xcode-select --install (e depois este script de novo)" \
+          "Missing:$missing. Run: xcode-select --install (then this script again)"
+      exit 1
+    fi
+    pkgs=""; inst=""
+    if command -v apt-get >/dev/null 2>&1; then
+      pkgs="build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev"; inst="apt-get install -y"
+    elif command -v dnf >/dev/null 2>&1; then
+      pkgs="gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel"; inst="dnf install -y"
+    elif command -v pacman >/dev/null 2>&1; then
+      pkgs="base-devel pkgconf libxkbcommon wayland libx11"; inst="pacman -S --needed --noconfirm"
+    elif command -v zypper >/dev/null 2>&1; then
+      pkgs="gcc pkg-config libxkbcommon-devel wayland-devel libX11-devel"; inst="zypper install -y"
+    else
+      say "Faltando:$missing. Instale gcc, pkg-config e os pacotes de desenvolvimento de libxkbcommon, wayland e libX11." \
+          "Missing:$missing. Install gcc, pkg-config and the dev packages for libxkbcommon, wayland and libX11."
+      exit 1
+    fi
+    sudo=""; [ "$(id -u)" = 0 ] || sudo="sudo "
+    say "Faltando:$missing" "Missing:$missing"
+    if ask "Instalar agora? $sudo$inst $pkgs" "Install now? $sudo$inst $pkgs"; then
+      case "$inst" in apt-get*) ${sudo}apt-get update -qq ;; esac
+      ${sudo}$inst $pkgs
+    else
+      say "Instale com: $sudo$inst $pkgs" "Install with: $sudo$inst $pkgs"
       exit 1
     fi
   fi
@@ -69,11 +112,37 @@ mkdir -p "$bin"
 install -m 755 "$root/target/release/duck" "$bin/duck"
 install -m 755 "$root/target/release/duckw" "$bin/duckw"
 
-case ":$PATH:" in
-  *":$bin:"*) ;;
-  *) say "Adicione ao PATH: export PATH=\"$bin:\$PATH\" (no ~/.bashrc ou ~/.zshrc)" \
-         "Add to PATH: export PATH=\"$bin:\$PATH\" (in ~/.bashrc or ~/.zshrc)" ;;
-esac
+# PATH e shell integration no ~/.bashrc e ~/.zshrc, num bloco que e trocado
+# a cada instalacao (rodar de novo nao duplica).
+if [ "$shellrc" = 1 ]; then
+  rcs=""
+  for f in .bashrc .zshrc; do [ -f "$HOME/$f" ] && rcs="$rcs $HOME/$f"; done
+  if [ -z "$rcs" ]; then
+    case "${SHELL:-}" in *zsh) rcs="$HOME/.zshrc" ;; *) rcs="$HOME/.bashrc" ;; esac
+  fi
+  for rc in $rcs; do
+    if [ -f "$rc" ]; then
+      # Backup so na primeira vez: guarda o arquivo de antes do Duck.
+      [ -f "$rc.bak-duck" ] || cp "$rc" "$rc.bak-duck"
+      tmp="$(mktemp)"
+      awk '/^# >>> duck >>>$/{skip=1} !skip{print} /^# <<< duck <<<$/{skip=0}' "$rc" > "$tmp"
+      cat "$tmp" > "$rc"; rm -f "$tmp"
+    fi
+    {
+      echo '# >>> duck >>>'
+      echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+      echo '[ -f "$HOME/.local/share/duck/shell/duck.sh" ] && . "$HOME/.local/share/duck/shell/duck.sh"'
+      echo '# <<< duck <<<'
+    } >> "$rc"
+    say "PATH e shell integration em $rc (backup: $rc.bak-duck)" "PATH and shell integration in $rc (backup: $rc.bak-duck)"
+  done
+else
+  case ":$PATH:" in
+    *":$bin:"*) ;;
+    *) say "Adicione ao PATH: export PATH=\"$bin:\$PATH\" (no ~/.bashrc ou ~/.zshrc)" \
+           "Add to PATH: export PATH=\"$bin:\$PATH\" (in ~/.bashrc or ~/.zshrc)" ;;
+  esac
+fi
 
 "$bin/duck" init
 
@@ -146,5 +215,5 @@ if [ "$exts" = 1 ]; then
   say "Ative as extensoes no Duck: Ctrl+Shift+P > Extensoes." "Enable extensions in Duck: Ctrl+Shift+P > Extensions."
 fi
 
-say "Pronto. Abra pelo menu de aplicativos (Duck) ou rode: duck" "Done. Open Duck from your app menu or run: duck"
+say "Pronto. Abra pelo menu de aplicativos (Duck) ou, num terminal novo, rode: duck" "Done. Open Duck from your app menu or, in a new terminal, run: duck"
 say "Confira com: duck doctor (config, server, hooks, extensoes e tokens que faltam). Passo a passo: docs/PLAYBOOK.pt-BR.md" "Check with: duck doctor (config, server, hooks, extensions and missing tokens). Step by step: docs/PLAYBOOK.md"

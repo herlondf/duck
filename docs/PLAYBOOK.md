@@ -53,12 +53,23 @@ command when Rust, the MSVC Build Tools or Node is missing.
 ### Linux and macOS
 
 ```bash
-curl https://sh.rustup.rs -sSf | sh
-sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
-sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel                # Fedora
-sudo pacman -S --needed base-devel pkgconf libxkbcommon wayland libx11                     # Arch
 git clone https://github.com/herlondf/duck.git && cd duck
 ./install.sh --all
+```
+
+The installer offers to install what is missing: Rust (rustup, in your home)
+and the build packages (with `sudo`, through apt, dnf, pacman or zypper; on
+macOS it asks you to run `xcode-select --install`). It also adds `~/.local/bin`
+to the PATH and the shell integration to `~/.bashrc` / `~/.zshrc`, in a
+`# >>> duck >>>` block that reinstalls replace instead of duplicate.
+`--yes` answers yes to everything; `--no-shell` leaves the rc files alone.
+
+Manual packages, if you prefer:
+
+```bash
+sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
+sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel    # Fedora
+sudo pacman -S --needed base-devel pkgconf libxkbcommon wayland libx11                    # Arch
 ```
 
 Windows is the daily driver. Linux builds and passes the tests but has had
