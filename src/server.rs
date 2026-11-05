@@ -2619,8 +2619,9 @@ fn resume_line(domain_cmd: &[String], a: &Agent, extra: &str) -> Option<String> 
     let bin = if a.name.is_empty() { "claude" } else { &a.name };
     // Opcoes da config (ex.: --dangerously-skip-permissions) voltam junto.
     let session = &if extra.trim().is_empty() { session.clone() } else { format!("{session} {}", extra.trim()) };
-    let wsl = domain_cmd.first().is_some_and(|c| c.to_lowercase().contains("wsl"));
-    Some(match (&a.config_dir, wsl) {
+    // Fora do Windows (ou no WSL) o shell do pane e POSIX.
+    let posix = !cfg!(windows) || domain_cmd.first().is_some_and(|c| c.to_lowercase().contains("wsl"));
+    Some(match (&a.config_dir, posix) {
         (Some(d), true) => format!("CLAUDE_CONFIG_DIR='{d}' {bin} --resume {session}\r"),
         (Some(d), false) => format!("$env:CLAUDE_CONFIG_DIR='{d}'; {bin} --resume {session}\r"),
         (None, _) => format!("{bin} --resume {session}\r"),
@@ -3081,8 +3082,11 @@ mod tests {
         assert_eq!(idx256(1), pal(1));
         assert_eq!(split_cmd("claude --resume 'a b'"), vec!["claude", "--resume", "a b"]);
         let ag = Agent { name: "claude".into(), session: Some("abc".into()), config_dir: Some("C:/p".into()), ..Default::default() };
-        assert_eq!(resume_line(&[], &ag, "--dangerously-skip-permissions").unwrap(), "$env:CLAUDE_CONFIG_DIR='C:/p'; claude --resume abc --dangerously-skip-permissions\r");
-        assert_eq!(resume_line(&[], &ag, "").unwrap(), "$env:CLAUDE_CONFIG_DIR='C:/p'; claude --resume abc\r");
+        let env = if cfg!(windows) { "$env:CLAUDE_CONFIG_DIR='C:/p'; " } else { "CLAUDE_CONFIG_DIR='C:/p' " };
+        assert_eq!(resume_line(&[], &ag, "--dangerously-skip-permissions").unwrap(), format!("{env}claude --resume abc --dangerously-skip-permissions\r"));
+        assert_eq!(resume_line(&[], &ag, "").unwrap(), format!("{env}claude --resume abc\r"));
+        let wsl = vec!["wsl.exe".to_string()];
+        assert_eq!(resume_line(&wsl, &ag, "").unwrap(), "CLAUDE_CONFIG_DIR='C:/p' claude --resume abc\r");
         assert_eq!(percent_decode("/C:/My%20Dir"), "/C:/My Dir");
     }
 

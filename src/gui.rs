@@ -950,8 +950,8 @@ impl Gui {
             "agent_diff" => {
                 // Diff do repo do pane ativo num flutuante (o que o agente mudou).
                 let cwd = self.active().map(|p| p.cwd.clone()).unwrap_or_default();
-                self.cmd(json!({"cmd": "float", "cwd": cwd, "argv": ["pwsh", "-NoLogo", "-NoProfile", "-NoExit", "-Command",
-                    "git -c color.ui=always status -sb; git -c color.ui=always --no-pager diff --stat; git -c color.ui=always --no-pager diff"]}));
+                self.cmd(json!({"cmd": "float", "cwd": cwd, "argv": crate::shell_keep(
+                    "git -c color.ui=always status -sb; git -c color.ui=always --no-pager diff --stat; git -c color.ui=always --no-pager diff")}));
             }
             "save_state" => match self.call(json!({"cmd": "save"})) {
                 Ok(_) => self.flash(&format!("Workspace salvo: {}", self.frame.workspace)),
@@ -1363,7 +1363,10 @@ impl Gui {
         }
         items.push(Item::new("Imagem de fundo...", "caminho png/jpg", "setting_prompt", vec![json!("background.image"), json!(""), json!("text")]));
         self.settings_more(&mut items);
-        items.push(Item::new("Abrir ~/.duck.lua no editor", "", "spawn", vec![json!({"where": "tab", "cmd": ["pwsh", "-NoProfile", "-Command", format!("notepad '{}'", config::config_path().display())]})]));
+        let path = config::config_path().display().to_string();
+        let edit = if cfg!(windows) { json!(["pwsh", "-NoProfile", "-Command", format!("notepad '{path}'")]) }
+                   else { json!(["sh", "-c", "exec ${VISUAL:-${EDITOR:-vi}} \"$0\"", path]) };
+        items.push(Item::new("Abrir ~/.duck.lua no editor", "", "spawn", vec![json!({"where": "tab", "cmd": edit})]));
         self.overlay = Some(Overlay::list("Configuracoes (gravam em ~/.duck-local.lua)", items));
     }
 
@@ -1544,9 +1547,9 @@ impl Gui {
         let branch = git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default().trim().to_string();
         let base = git(&main, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default().trim().to_string();
         let here = git(&cwd, &["rev-parse", "--show-toplevel"]).unwrap_or_default().trim().to_string();
-        let ps = |c: String| json!(["pwsh", "-NoLogo", "-NoProfile", "-NoExit", "-Command", c]);
+        let ps = |c: String| crate::shell_keep(&c);
         let wt = WorktreeCfg::load(std::path::Path::new(&main));
-        let teardown = wt.teardown.as_ref().map(|t| format!("Push-Location '{here}'; {t}; Pop-Location; ")).unwrap_or_default();
+        let teardown = wt.teardown.as_ref().map(|t| if cfg!(windows) { format!("Push-Location '{here}'; {t}; Pop-Location; ") } else { format!("(cd '{here}' && {t}); ") }).unwrap_or_default();
         let port = worktree_ports().get(&here.to_lowercase().replace('\\', "/")).copied();
         let items = vec![
             Item::new(format!("Ver o diff de {branch} contra {base}"), "flutuante", "popup",
@@ -1612,8 +1615,8 @@ impl Gui {
             return self.flash("Sem sessao conhecida neste pane (os hooks do Duck estao instalados? duck doctor)");
         };
         let dir = p["agent"]["config_dir"].as_str().unwrap_or("");
-        let wsl = self.is_wsl(p["domain"].as_str().unwrap_or(""));
-        let line = match (dir.is_empty(), wsl) {
+        let posix = !cfg!(windows) || self.is_wsl(p["domain"].as_str().unwrap_or(""));
+        let line = match (dir.is_empty(), posix) {
             (true, _) => format!("claude --resume {session} --fork-session"),
             (false, true) => format!("CLAUDE_CONFIG_DIR='{dir}' claude --resume {session} --fork-session"),
             (false, false) => format!("$env:CLAUDE_CONFIG_DIR='{dir}'; claude --resume {session} --fork-session"),
@@ -2322,12 +2325,14 @@ impl WorktreeCfg {
         n
     }
 
-    /// Linha digitada no pwsh do pane novo: ambiente, preparo e o agente.
+    /// Linha digitada no shell do pane novo (pwsh no Windows, sh/bash fora):
+    /// ambiente, preparo e o agente.
     fn command(&self, port: u16, agent: &str) -> String {
-        let q = |v: &str| v.replace("{port}", &port.to_string()).replace('\'', "''");
-        let mut s = format!("$env:DUCK_PORT='{port}'; ");
+        let (set, quote) = if cfg!(windows) { ("$env:", "''") } else { ("export ", "'\\''") };
+        let q = |v: &str| v.replace("{port}", &port.to_string()).replace('\'', quote);
+        let mut s = format!("{set}DUCK_PORT='{port}'; ");
         for (k, v) in &self.env {
-            if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { s += &format!("$env:{k}='{}'; ", q(v)); }
+            if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { s += &format!("{set}{k}='{}'; ", q(v)); }
         }
         if let Some(setup) = self.setup.as_deref().filter(|x| !x.trim().is_empty()) { s += &format!("{}; ", setup.replace("{port}", &port.to_string())); }
         s + agent
@@ -2968,8 +2973,13 @@ mod tests {
     #[test]
     fn worktree_line_sets_port_env_and_setup() {
         let wt: WorktreeCfg = serde_json::from_str(r#"{"setup": "npm ci", "env": {"PORT": "{port}", "BAD-KEY": "x", "NAME": "o'k"}}"#).unwrap();
-        assert_eq!(wt.command(4120, "claude"), "$env:DUCK_PORT='4120'; $env:NAME='o''k'; $env:PORT='4120'; npm ci; claude");
-        assert_eq!(WorktreeCfg::default().command(4100, "claude"), "$env:DUCK_PORT='4100'; claude");
+        if cfg!(windows) {
+            assert_eq!(wt.command(4120, "claude"), "$env:DUCK_PORT='4120'; $env:NAME='o''k'; $env:PORT='4120'; npm ci; claude");
+            assert_eq!(WorktreeCfg::default().command(4100, "claude"), "$env:DUCK_PORT='4100'; claude");
+        } else {
+            assert_eq!(wt.command(4120, "claude"), "export DUCK_PORT='4120'; export NAME='o'\\''k'; export PORT='4120'; npm ci; claude");
+            assert_eq!(WorktreeCfg::default().command(4100, "claude"), "export DUCK_PORT='4100'; claude");
+        }
     }
 
     #[test]

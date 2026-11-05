@@ -417,7 +417,7 @@ impl Gui {
                 let Some(info) = catalog().into_iter().find(|i| i.name == s(0)) else { return true };
                 let line = "npm install --no-audit --no-fund; npm run build";
                 self.cmd(json!({"cmd": "float", "replace": true, "cwd": info.dir.display().to_string(),
-                    "argv": if cfg!(windows) { json!(["pwsh", "-NoLogo", "-NoProfile", "-NoExit", "-Command", line]) } else { json!(["sh", "-c", line]) }}));
+                    "argv": crate::shell_keep(line)}));
                 self.flash("Compilando; depois use Ativar no menu Extensoes");
             }
             "ext_set" => {

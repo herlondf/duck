@@ -2190,10 +2190,16 @@ impl Gui {
             let perfil = if perfil.is_empty() { "pessoal" } else { perfil };
             match wsl {
                 None => {
-                    let env = if prof == ".claude" { String::new() } else { format!("$env:CLAUDE_CONFIG_DIR='{}'; ", config::home().join(&prof).display()) };
+                    let cfg_dir = config::home().join(&prof).display().to_string();
+                    let env = match (prof == ".claude", cfg!(windows)) {
+                        (true, _) => String::new(),
+                        (false, true) => format!("$env:CLAUDE_CONFIG_DIR='{cfg_dir}'; "),
+                        (false, false) => format!("CLAUDE_CONFIG_DIR='{cfg_dir}' "),
+                    };
                     let cmd = format!("{env}claude --resume {session}");
+                    let argv = if cfg!(windows) { json!(["pwsh", "-NoLogo", "-NoExit", "-Command", cmd]) } else { crate::shell_keep(&cmd) };
                     items.push(Item::new(format!("{dir} · {title}"), format!("sessao · {perfil} · {}", ago(mtime)), "spawn",
-                        vec![json!({"where": "tab", "cwd": cwd, "title": dir, "cmd": ["pwsh", "-NoLogo", "-NoExit", "-Command", cmd]})]));
+                        vec![json!({"where": "tab", "cwd": cwd, "title": dir, "cmd": argv})]));
                 }
                 Some((domain, home)) => {
                     // No shell do WSL (o bash fica depois que o claude sai), como a restauracao do checkpoint.

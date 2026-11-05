@@ -32,6 +32,16 @@ pub fn gui_exe() -> Option<std::path::PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// Roda `cmd` e deixa o shell aberto depois: pwsh -NoExit no Windows; fora
+/// dele, sh e em seguida o $SHELL do usuario.
+pub fn shell_keep(cmd: &str) -> serde_json::Value {
+    if cfg!(windows) {
+        serde_json::json!(["pwsh", "-NoLogo", "-NoProfile", "-NoExit", "-Command", cmd])
+    } else {
+        serde_json::json!(["sh", "-c", format!("{cmd}; exec \"${{SHELL:-sh}}\"")])
+    }
+}
+
 pub fn entry(gui_binary: bool) -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
     config::migrate_from_lasso();
