@@ -145,7 +145,7 @@ pub fn plugin(args: &[String]) -> i32 {
 /// `duck install`: atalho no Iniciar do Windows que sobe o Duck restaurando
 /// o checkpoint. Os hooks do Claude ficam em `duck install --hooks <settings.json>`.
 pub fn install(args: &[String]) -> i32 {
-    let exe = std::env::current_exe().unwrap();
+    let exe = crate::proto::current_exe().unwrap();
     let gui = crate::gui_exe().unwrap_or_else(|| exe.clone());
     if let Some(i) = args.iter().position(|a| a == "--hooks") {
         let Some(path) = args.get(i + 1) else { eprintln!("uso: duck install --hooks <settings.json>"); return 2 };

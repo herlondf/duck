@@ -489,8 +489,8 @@ fn spawn_pane(srv: &Arc<Server>, m: &mut Mux, o: SpawnOpts) -> Result<Id, String
         .unwrap_or_else(|| config::home().to_string_lossy().to_string());
     let token = proto::random_hex(16);
     // DUCK_BIN = o de console (CLI para agentes); o host roda no sem console.
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string();
-    let cli_exe = std::env::current_exe().ok().map(|p| p.with_file_name(if cfg!(windows) { "duck.exe" } else { "duck" }))
+    let exe = proto::current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string();
+    let cli_exe = proto::current_exe().ok().map(|p| p.with_file_name(if cfg!(windows) { "duck.exe" } else { "duck" }))
         .filter(|p| p.is_file()).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| exe.clone());
     let wslenv = std::env::var("WSLENV").unwrap_or_default();
     let env = vec![

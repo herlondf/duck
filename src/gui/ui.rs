@@ -162,7 +162,7 @@ pub(super) fn register_protocol() {
     #[cfg(windows)]
     std::thread::spawn(|| {
         use std::os::windows::process::CommandExt;
-        let Some(exe) = std::env::current_exe().ok().map(|e| e.with_file_name("duck.exe")).filter(|e| e.is_file()) else { return };
+        let Some(exe) = crate::proto::current_exe().ok().map(|e| e.with_file_name("duck.exe")).filter(|e| e.is_file()) else { return };
         let cmd = format!("\"{}\" url \"%1\"", exe.display());
         for args in [
             vec!["add", r"HKCU\Software\Classes\duck", "/ve", "/d", "URL:Duck", "/f"],

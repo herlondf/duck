@@ -35,7 +35,7 @@ pub fn extensions_dir() -> PathBuf { crate::config::home().join(".duck").join("e
 /// Pastas de extensoes da instalacao: `<raiz>/extensions`, subindo a partir do executavel.
 fn shared_dirs() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = crate::proto::current_exe() {
         let mut d = exe.parent().map(|p| p.to_path_buf());
         for _ in 0..4 {
             let Some(cur) = d else { break };

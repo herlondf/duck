@@ -26,7 +26,7 @@ pub mod toast;
 
 /// Executavel da janela (duckw.exe ao lado deste), se existir.
 pub fn gui_exe() -> Option<std::path::PathBuf> {
-    let me = std::env::current_exe().ok()?;
+    let me = proto::current_exe().ok()?;
     let name = if cfg!(windows) { "duckw.exe" } else { "duckw" };
     let p = me.with_file_name(name);
     p.is_file().then_some(p)

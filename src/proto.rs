@@ -114,9 +114,22 @@ impl Conn {
     }
 }
 
+/// O proprio executavel. No Linux, depois de uma reinstalacao o binario em
+/// uso e apagado e o caminho vira "... (deleted)": usa o novo no mesmo lugar.
+pub fn current_exe() -> std::io::Result<PathBuf> {
+    std::env::current_exe().map(undeleted)
+}
+
+fn undeleted(p: PathBuf) -> PathBuf {
+    match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(orig) => PathBuf::from(orig),
+        None => p,
+    }
+}
+
 pub fn spawn_server() -> std::io::Result<()> {
     // Processos de fundo pelo executavel sem console, quando existir.
-    let exe = crate::gui_exe().map(Ok).unwrap_or_else(std::env::current_exe)?;
+    let exe = crate::gui_exe().map(Ok).unwrap_or_else(current_exe)?;
     spawn_detached(&[exe.to_string_lossy().to_string(), "server".into()], &[]).map(|_| ())
 }
 
@@ -167,7 +180,11 @@ pub fn spawn_detached(argv: &[String], extra: &[(String, String)]) -> std::io::R
             if leaked_env(&k) { cmd.env_remove(k); }
         }
         for (k, v) in extra { cmd.env(k, v); }
-        cmd.spawn().map(|c| c.id())
+        let mut child = cmd.spawn()?;
+        let pid = child.id();
+        // Recolhe o filho quando ele sair (senao fica zumbi ate quem chamou sair).
+        std::thread::spawn(move || { let _ = child.wait(); });
+        Ok(pid)
     }
 }
 
@@ -216,4 +233,15 @@ pub fn ok(extra: Value) -> Value {
     let mut v = json!({"ok": true});
     if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) { o.extend(e); }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exe_path_after_reinstall() {
+        assert_eq!(undeleted("/home/u/.local/bin/duckw (deleted)".into()), PathBuf::from("/home/u/.local/bin/duckw"));
+        assert_eq!(undeleted("/home/u/.local/bin/duckw".into()), PathBuf::from("/home/u/.local/bin/duckw"));
+    }
 }
