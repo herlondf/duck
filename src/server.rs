@@ -157,6 +157,12 @@ pub struct Agent {
     pub todo_done: Option<u32>,
     #[serde(default)]
     pub todo_total: Option<u32>,
+    /// Ultimo pedido feito ao agente (hook UserPromptSubmit) e o passo do
+    /// plano em andamento: aparecem na previa da aba.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub step: Option<String>,
     #[serde(skip)]
     pub hook_at: Option<Instant>,
 }
@@ -221,6 +227,11 @@ struct Pane {
     bell_at: Option<Instant>,
     /// OSC 9;4: (estado 1=normal 2=erro 3=indeterminado 4=pausa, %).
     progress: Option<(u8, u8)>,
+    /// Segredos ja avisados (hash) e os novos ainda por avisar (inicio do token).
+    secrets_seen: std::collections::HashSet<u64>,
+    secrets_new: Vec<String>,
+    /// "Mostrar segredos": a mascara sai ate este instante.
+    reveal_until: Option<Instant>,
 }
 
 impl Pane {
@@ -305,11 +316,13 @@ struct Tab {
     float_visible: bool,
     float_prev: Id,
     color: String,
+    /// Fixada: fica a esquerda, so com o icone, e nao fecha por engano.
+    pinned: bool,
 }
 
 impl Tab {
     fn new(id: Id, title: &str) -> Tab {
-        Tab { id, title: title.into(), root: Node::Leaf(id), active: id, zoomed: false, floating: None, float_visible: false, float_prev: id, color: String::new() }
+        Tab { id, title: title.into(), root: Node::Leaf(id), active: id, zoomed: false, floating: None, float_visible: false, float_prev: id, color: String::new(), pinned: false }
     }
     fn has(&self, id: Id) -> bool { self.root.contains(id) || self.floating == Some(id) }
     fn all(&self) -> Vec<Id> { let mut v = self.root.leaves(); v.extend(self.floating); v }
@@ -361,7 +374,16 @@ pub struct Mux {
     ext: crate::ext::Host,
     /// Janelas assinando a tela agora.
     subs: usize,
+    /// Abas fechadas (a mais recente no fim): Ctrl+Alt+T reabre.
+    closed: Vec<(String, SavedTab)>,
+    /// Picture-in-picture: o pane aparece pequeno no canto das outras abas.
+    pip: Option<Id>,
+    /// Arquivos mexidos por pasta de agente (git): pasta -> (arquivos, +, -, lista).
+    changes: HashMap<String, Changes>,
 }
+
+#[derive(Clone, Default, Serialize)]
+struct Changes { files: usize, add: i64, del: i64, list: Vec<(String, String, i64, i64)> }
 
 pub struct Server {
     mux: Mutex<Mux>,
@@ -571,7 +593,7 @@ fn attach(srv: &Arc<Server>, m: &mut Mux, id: Id, client: ptyhost::Client, pid: 
         agent: meta.agent, attention: false, last_output: Instant::now(), cols, rows, parent: meta.parent,
         token: meta.token, private: meta.private, marks: Vec::new(),
         ports: Default::default(), queue: Vec::new(), rec: None, marks_pending: false, reanchor: false, progress: None,
-        mute_replies_until: Instant::now(), bell_at: None,
+        mute_replies_until: Instant::now(), bell_at: None, secrets_seen: Default::default(), secrets_new: Vec::new(), reveal_until: None,
     };
     let lines = p.history_lines(m.cfg.scrollback, m.cfg.scrollback_mb);
     p.term.set_options(TermConfig { scrolling_history: lines, osc52: Osc52::OnlyCopy, ..TermConfig::default() });
@@ -639,7 +661,8 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
     // ter sossegado: fixa as marcas pendentes antes de o cursor andar.
     if !replay { p.resolve_marks(); }
     if let Some((f, t0, _)) = p.rec.as_mut() {
-        let line = json!([t0.elapsed().as_secs_f64(), "o", String::from_utf8_lossy(data)]);
+        let text = String::from_utf8_lossy(data);
+        let line = json!([t0.elapsed().as_secs_f64(), "o", config::screen_secrets().replace_all(&text, "***")]);
         let _ = writeln!(f, "{line}");
     }
     if !replay {
@@ -807,6 +830,17 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn close_pane(m: &mut Mux, id: Id) {
+    if m.pip == Some(id) { m.pip = None; }
+    // Ultimo pane da aba: guarda a aba (pasta, comando, sessao do agente)
+    // para reabrir depois.
+    let last = m.workspaces.iter().find_map(|w| w.tabs.iter().find(|t| matches!(t.root, Node::Leaf(x) if x == id)).map(|t| (w.name.clone(), t)));
+    if let Some((ws, t)) = last {
+        if m.panes.contains_key(&id) {
+            let saved = SavedTab { title: t.title.clone(), zoomed: false, active: 0, root: save_node(m, &t.root), color: t.color.clone(), pinned: t.pinned };
+            m.closed.push((ws, saved));
+            if m.closed.len() > 20 { m.closed.remove(0); }
+        }
+    }
     if let Some(p) = m.panes.remove(&id) {
         let _ = p.io.send(Io::Kill);
         emit(m, "pane-closed", id);
@@ -1403,7 +1437,41 @@ fn tab_state(m: &Mux, t: &Tab) -> (String, bool) {
 
 type RunT = (usize, usize, String, i64, i64, u16, Option<String>);
 
-fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64)) -> Value {
+/// Troca por bolinhas os caracteres de token numa linha (runs da tela) e
+/// devolve o texto dos tokens achados.
+fn mask_row(runs: &mut [Value], re: &regex::Regex) -> Vec<String> {
+    // Texto da linha com a coluna de cada char.
+    let mut text = String::new();
+    let mut cols: Vec<usize> = Vec::new();
+    let mut last_end = 0usize;
+    for r in runs.iter() {
+        let (Some(col), Some(t)) = (r[0].as_u64(), r[1].as_str()) else { continue };
+        let step = if r[4].as_u64().unwrap_or(0) & 32 != 0 { 2 } else { 1 };
+        let col = col as usize;
+        // Buraco entre runs (espacos que nao vieram): vira espaco.
+        for gap in last_end..col { text.push(' '); cols.push(gap); }
+        for (i, ch) in t.chars().enumerate() { text.push(ch); cols.push(col + i * step); }
+        last_end = col + t.chars().count() * step;
+    }
+    let mut hidden = std::collections::HashSet::new();
+    let mut found = Vec::new();
+    for m in re.find_iter(&text) {
+        let a = text[..m.start()].chars().count();
+        let n = m.as_str().chars().count();
+        for c in &cols[a..a + n] { hidden.insert(*c); }
+        found.push(m.as_str().to_string());
+    }
+    if hidden.is_empty() { return found; }
+    for r in runs.iter_mut() {
+        let (Some(col), Some(t)) = (r[0].as_u64(), r[1].as_str()) else { continue };
+        let step = if r[4].as_u64().unwrap_or(0) & 32 != 0 { 2 } else { 1 };
+        let masked: String = t.chars().enumerate().map(|(i, ch)| if hidden.contains(&(col as usize + i * step)) { '•' } else { ch }).collect();
+        r[1] = json!(masked);
+    }
+    found
+}
+
+fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64, bool)) -> Value {
     p.resolve_marks();
     if p.cols != r.w || p.rows != r.h {
         p.cols = r.w;
@@ -1454,6 +1522,18 @@ fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64)) -
         if let Some(z) = cell.zerowidth() { r.2.extend(z.iter()); }
     }
     flush(&mut run, &mut lines);
+    // Tokens na tela viram bolinhas (o app continua vendo o texto real).
+    if cap.2 && p.reveal_until.is_none_or(|t| t < Instant::now()) {
+        let re = config::screen_secrets();
+        for row in lines.iter_mut() {
+            for tok in mask_row(row, re) {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                tok.hash(&mut h);
+                if p.secrets_seen.insert(h.finish()) && p.secrets_seen.len() < 500 { p.secrets_new.push(tok.chars().take(4).collect()); }
+            }
+        }
+    }
     let show_cursor = mode.contains(TermMode::SHOW_CURSOR) && offset == 0 && cursor.shape != CursorShape::Hidden;
     let cur = if show_cursor {
         let shape = match cursor.shape { CursorShape::Beam => "beam", CursorShape::Underline => "underline", _ => "block" };
@@ -1545,7 +1625,7 @@ fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> 
         let agent = t.all().iter().filter_map(|id| m.panes.get(id)?.agent.as_ref()).next().cloned();
         let progress = t.all().iter().filter_map(|id| m.panes.get(id)?.progress).max_by_key(|x| x.1);
         json!({
-            "index": i + 1, "title": t.title, "active": i == ws.active, "color": t.color,
+            "index": i + 1, "id": t.id, "pinned": t.pinned, "title": t.title, "active": i == ws.active, "color": t.color,
             "pane_title": p.map(|p| p.title.clone()).unwrap_or_default(),
             "cwd": p.map(|p| p.cwd.clone()).unwrap_or_default(),
             "domain": p.map(|p| p.domain.clone()).unwrap_or_default(),
@@ -1556,6 +1636,10 @@ fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> 
             "loop": t.all().iter().find_map(|id| m.loops.get(id)).map(|l| l.label()).unwrap_or_default(),
             "agent": agent.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
             "profile": agent.as_ref().and_then(|a| a.config_dir.as_deref()).map(profile_name).unwrap_or_default(),
+            "prompt": agent.as_ref().and_then(|a| a.prompt.clone()),
+            "step": agent.as_ref().and_then(|a| a.step.clone()),
+            "changes": t.all().iter().filter_map(|id| m.panes.get(id).filter(|p| p.agent.is_some()))
+                .find_map(|p| m.changes.get(&p.cwd)).filter(|c| c.files > 0).map(|c| json!([c.files, c.add, c.del])),
         })
     }).collect();
     let workspaces: Vec<String> = m.workspaces.iter().map(|w| w.name.clone()).collect();
@@ -1563,20 +1647,37 @@ fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> 
     for p in m.panes.values() {
         if let Some(a) = &p.agent { if let Some(c) = counts.get_mut(a.state.as_str()) { *c += 1; } }
     }
-    let cap = (m.cfg.scrollback, m.cfg.scrollback_mb);
+    let cap = (m.cfg.scrollback, m.cfg.scrollback_mb, m.cfg.secret_mask);
     let mut panes = Vec::new();
-    let list: Vec<(Id, Rect, bool)> = rects.into_iter().map(|(i, r)| (i, r, false)).chain(float.map(|(i, r)| (i, r, true))).collect();
+    // PiP: pane de outra aba, pequeno no canto de baixo a direita.
+    let pip = m.pip.filter(|id| m.panes.contains_key(id) && !rects.iter().any(|(r, _)| r == id) && float.is_none_or(|(f, _)| f != *id)).map(|id| {
+        let (w, h) = (((cols as f32 * 0.38) as u16).max(30).min(cols.saturating_sub(4)), ((rows as f32 * 0.32) as u16).max(8).min(rows.saturating_sub(2)));
+        (id, Rect { x: cols.saturating_sub(w + 2), y: rows.saturating_sub(h + 1), w, h })
+    });
+    let list: Vec<(Id, Rect, bool)> = rects.into_iter().map(|(i, r)| (i, r, false)).chain(float.map(|(i, r)| (i, r, true))).chain(pip.map(|(i, r)| (i, r, true))).collect();
     for (id, r, fl) in list {
         let Some(p) = m.panes.get_mut(&id) else { continue };
         let mut v = pane_json(p, id, r, fl, cap);
         v["header"] = json!(header && !fl && r.y > 0);
+        if pip.is_some_and(|(x, _)| x == id) { v["pip"] = json!(true); }
+        if p.reveal_until.is_some_and(|t| t > Instant::now()) { v["revealed"] = json!(true); }
         panes.push(v);
+    }
+    // Token novo na tela: aviso (uma vez por token).
+    let found: Vec<(Id, Vec<String>)> = m.panes.iter_mut().filter(|(_, p)| !p.secrets_new.is_empty()).map(|(id, p)| (*id, std::mem::take(&mut p.secrets_new))).collect();
+    for (id, toks) in found {
+        let title = "Segredo na tela".to_string();
+        let body = format!("{} no pane {id}. Ele aparece mascarado na tela, nas gravacoes e no que vai para agentes. Se nao era para aparecer, troque o token.",
+            toks.iter().map(|t| format!("{t}…")).collect::<Vec<_>>().join(", "));
+        m.inbox.push(json!({"kind": "security", "pane": id, "title": title, "body": body, "color": "blocked"}));
+        crate::gui::toast_card(&title, &body, &[("Abrir".into(), format!("duck://focus/{id}"))], Some("blocked"));
     }
     let approvals: Vec<&Approval> = m.approvals.iter().filter(|a| a.decided.is_none()).collect();
     Ok(json!({
         "t": "frame", "workspace": ws_name, "workspaces": workspaces, "tabs": tabs,
         "active_pane": active, "cols": cols, "rows": rows, "panes": panes,
         "agents": counts, "clipboard": [m.clipboard.0, m.clipboard.1],
+        "closed": m.closed.len(),
         "approvals": approvals, "resurrect": m.resurrect, "recovered": m.recovered, "inbox_unread": m.inbox.unread(),
         "tokens": m.panes.values().filter_map(|p| p.agent.as_ref()?.session_tokens).sum::<u64>(),
         "ports": m.panes.values().flat_map(|p| p.ports.iter().copied()).collect::<std::collections::BTreeSet<u16>>(),
@@ -1857,7 +1958,10 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let n = a.get("lines").and_then(|v| v.as_u64()).map(|v| v as usize);
             let p = &m.panes[&id];
             let n = if a.get("all").and_then(|v| v.as_bool()).unwrap_or(false) { None } else { Some(n.unwrap_or(p.rows as usize)) };
-            proto::ok(json!({"pane": id, "text": pane_text(&p.term, n)}))
+            let text = pane_text(&p.term, n);
+            // Quem le pela API (agente, script num pane) recebe sem segredos.
+            let text = if caller.0.is_some() { scrub(m, text) } else { text };
+            proto::ok(json!({"pane": id, "text": text}))
         }
         "last-output" => {
             let id = target(srv, m, a)?;
@@ -1866,6 +1970,7 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let k = p.marks.iter().rev().find(|k| k.out_start.is_some() && k.out_end.is_some())
                 .ok_or("nenhum comando terminado neste pane (a shell integration esta ligada?)")?;
             let text = abs_text(p, k.out_start.unwrap(), k.out_end.unwrap());
+            let text = if caller.0.is_some() { scrub(m, text) } else { text };
             proto::ok(json!({"pane": id, "text": text, "exit": k.exit, "ms": k.dur_ms}))
         }
         "blocks" => {
@@ -1884,7 +1989,7 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let k = p.marks.iter().rev().find(|k| k.exit.is_some_and(|e| e != 0) && k.out_start.is_some())
                 .ok_or("nenhum comando falhou neste pane (a shell integration esta ligada?)")?;
             let text = abs_text(p, k.out_start.unwrap(), k.out_end.unwrap_or(k.out_start.unwrap() + 200));
-            proto::ok(json!({"pane": id, "command": k.command, "exit": k.exit, "output": scrub(m, text), "cwd": p.cwd, "domain": p.domain}))
+            proto::ok(json!({"pane": id, "command": scrub(m, k.command.clone()), "exit": k.exit, "output": scrub(m, text), "cwd": p.cwd, "domain": p.domain}))
         }
         "history" => {
             // Mais recentes primeiro, sem repetir comando; filtros opcionais.
@@ -1980,6 +2085,20 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             close_pane(m, id);
             proto::ok(json!({}))
         }
+        "changes" => {
+            // Arquivos mexidos na pasta do pane (o que o agente alterou no repo).
+            let id = target(srv, m, a)?;
+            let cwd = m.panes[&id].cwd.clone();
+            let c = m.changes.get(&cwd).cloned().or_else(|| git_changes(&cwd)).unwrap_or_default();
+            proto::ok(json!({"cwd": cwd, "files": c.files, "add": c.add, "del": c.del, "list": c.list}))
+        }
+        "reveal" => {
+            // Mostra os segredos do pane por alguns segundos (a mascara volta sozinha).
+            let id = target(srv, m, a)?;
+            let secs = a.get("secs").and_then(|v| v.as_u64()).unwrap_or(30).min(600);
+            m.panes.get_mut(&id).unwrap().reveal_until = Some(Instant::now() + Duration::from_secs(secs));
+            proto::ok(json!({"secs": secs}))
+        }
         "private" => {
             let id = target(srv, m, a)?;
             let p = m.panes.get_mut(&id).unwrap();
@@ -2039,18 +2158,120 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
                 Some(t) => (t - 1).clamp(0, n - 1) as usize,
                 None => (from as i64 + a.get("delta").and_then(|v| v.as_i64()).unwrap_or(1)).clamp(0, n - 1) as usize,
             };
+            // Fixadas ficam antes das soltas: o destino nao cruza a fronteira.
+            let npin = w.tabs.iter().filter(|t| t.pinned).count();
+            let to = if w.tabs[from].pinned { to.min(npin.saturating_sub(1)) } else { to.max(npin) };
             let t = w.tabs.remove(from);
             w.tabs.insert(to, t);
             w.active = to;
             proto::ok(json!({}))
+        }
+        "swap-panes" => {
+            // Troca dois panes de lugar na mesma aba (pane + other, ou pane + dir).
+            let id = target(srv, m, a)?;
+            let other = match (arg_id(a, "other"), arg_str(a, "dir")) {
+                (Some(o), _) => o,
+                (None, Some(d)) => neighbor(srv, m, a, d)?,
+                _ => return Err("swap-panes: other ou dir".into()),
+            };
+            if id == other { return Ok(proto::ok(json!({}))); }
+            let (wi, ti) = locate(m, id).ok_or("pane sem aba")?;
+            let t = &mut m.workspaces[wi].tabs[ti];
+            if !t.root.contains(id) || !t.root.contains(other) { return Err("os dois panes precisam estar no layout da mesma aba".into()); }
+            t.root.replace(id, Id::MAX);
+            t.root.replace(other, id);
+            t.root.replace(Id::MAX, other);
+            t.active = id;
+            proto::ok(json!({}))
+        }
+        "pip" => {
+            // Liga/desliga o PiP do pane (o ativo por padrao).
+            let id = target(srv, m, a)?;
+            let on = a.get("on").and_then(|v| v.as_bool()).unwrap_or(m.pip != Some(id));
+            m.pip = if on { Some(id) } else { None };
+            proto::ok(json!({"pip": m.pip}))
+        }
+        "pin-tab" => {
+            let client = arg_str(a, "client").unwrap_or("cli").to_string();
+            let wi = client_ws(m, srv, &client)?;
+            let w = &mut m.workspaces[wi];
+            let i = a.get("index").and_then(|v| v.as_i64()).map(|i| (i - 1).max(0) as usize).unwrap_or(w.active);
+            if i >= w.tabs.len() { return Err("aba inexistente".into()); }
+            let mut t = w.tabs.remove(i);
+            t.pinned = a.get("on").and_then(|v| v.as_bool()).unwrap_or(!t.pinned);
+            let pinned = t.pinned;
+            // Vai para o fim do grupo das fixadas (ou para o comeco das soltas).
+            let to = w.tabs.iter().filter(|t| t.pinned).count();
+            w.tabs.insert(to, t);
+            w.active = to;
+            proto::ok(json!({"pinned": pinned}))
+        }
+        "tab-focus" => {
+            // Aba pelo id, em qualquer workspace (alternar com a anterior).
+            let id = arg_id(a, "id").ok_or("falta id")?;
+            let (wi, ti) = m.workspaces.iter().enumerate()
+                .find_map(|(wi, w)| w.tabs.iter().position(|t| t.id == id).map(|ti| (wi, ti))).ok_or("a aba nao existe mais")?;
+            m.workspaces[wi].active = ti;
+            let name = m.workspaces[wi].name.clone();
+            if let Some(c) = arg_str(a, "client") { view(m, c, &name); }
+            proto::ok(json!({}))
+        }
+        "next-blocked" => {
+            // Proximo agente pedindo aprovacao, depois do pane informado (da a volta).
+            let cur = arg_id(a, "after").unwrap_or(0);
+            let mut ids: Vec<Id> = m.panes.iter().filter(|(_, p)| p.agent.as_ref().is_some_and(|a| a.state == "blocked")).map(|(id, _)| *id).collect();
+            ids.sort();
+            let id = *ids.iter().find(|i| **i > cur).or(ids.first()).ok_or("nenhum agente pedindo aprovacao")?;
+            let (wi, ti) = locate(m, id).ok_or("pane sem aba")?;
+            let w = &mut m.workspaces[wi];
+            w.active = ti;
+            w.tabs[ti].active = id;
+            if w.tabs[ti].floating == Some(id) { w.tabs[ti].float_visible = true; }
+            let name = w.name.clone();
+            if let Some(c) = arg_str(a, "client") { view(m, c, &name); }
+            if let Some(p) = m.panes.get_mut(&id) { p.attention = false; }
+            proto::ok(json!({"pane": id, "total": ids.len()}))
+        }
+        "reopen-tab" => {
+            let client = arg_str(a, "client").unwrap_or("cli").to_string();
+            let (ws, t) = m.closed.pop().ok_or("nenhuma aba fechada para reabrir")?;
+            let mut pending = Vec::new();
+            let root = restore_node(srv, m, &t.root, &mut pending)?;
+            let leaves = root.leaves();
+            let mut tab = Tab::new(leaves[0], &t.title);
+            tab.root = root;
+            tab.color = t.color.clone();
+            tab.pinned = t.pinned;
+            // Volta para o workspace de onde saiu (se ainda existe), senao o atual.
+            let wi = match m.workspaces.iter().position(|w| w.name == ws) { Some(i) => i, None => client_ws(m, srv, &client)? };
+            let w = &mut m.workspaces[wi];
+            let at = if tab.pinned { w.tabs.iter().filter(|t| t.pinned).count() } else { w.tabs.len() };
+            w.tabs.insert(at, tab);
+            w.active = at;
+            let name = w.name.clone();
+            view(m, &client, &name);
+            let resumed = !pending.is_empty();
+            send_later(srv, pending);
+            proto::ok(json!({"resumed": resumed, "title": t.title}))
         }
         "close-tab" => {
             let client = arg_str(a, "client").unwrap_or("cli").to_string();
             let wi = client_ws(m, srv, &client)?;
             let w = &m.workspaces[wi];
             let i = a.get("index").and_then(|v| v.as_i64()).map(|i| (i - 1).max(0) as usize).unwrap_or(w.active);
-            let ids = w.tabs.get(i).map(|t| t.all()).ok_or("aba inexistente")?;
+            let t = w.tabs.get(i).ok_or("aba inexistente")?;
+            let ids = t.all();
+            // A aba inteira (splits incluidos) para reabrir; o close_pane do
+            // ultimo pane guardaria so ele.
+            let full = SavedTab {
+                title: t.title.clone(), zoomed: false, color: t.color.clone(), pinned: t.pinned,
+                active: t.root.leaves().iter().position(|x| *x == t.active).unwrap_or(0), root: save_node(m, &t.root),
+            };
+            let ws = w.name.clone();
+            let before = m.closed.len();
             for id in ids { close_pane(m, id); }
+            m.closed.truncate(before);
+            m.closed.push((ws, full));
             proto::ok(json!({"closed": i + 1}))
         }
         "block-output" => {
@@ -2230,6 +2451,8 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
                         ag.todo_done = Some(d as u32);
                         ag.todo_total = Some(t as u32);
                     }
+                    if let Some(t) = arg_str(a, "prompt").map(|t| clean(&t.replace(['\n', '\r'], " "), 400)).filter(|t| !t.trim().is_empty()) { ag.prompt = Some(t); }
+                    if let Some(t) = a.get("step") { ag.step = t.as_str().map(|t| clean(t, 200)).filter(|t| !t.is_empty()); }
                 }
                 if let Some(c) = arg_str(a, "cwd") { if !c.is_empty() { p.cwd = clean(c, 1024); } }
             }
@@ -2514,15 +2737,22 @@ fn open_layout(srv: &Arc<Server>, m: &mut Mux, spec: &Value) -> Result<String, S
 }
 
 fn neighbor(srv: &Arc<Server>, m: &mut Mux, a: &Value, dir: &str) -> Result<Id, String> {
-    let client = arg_str(a, "client").unwrap_or("cli").to_string();
-    let wi = client_ws(m, srv, &client)?;
-    let w = &m.workspaces[wi];
-    let t = &w.tabs[w.active];
+    // A partir do pane informado (na aba dele) ou do ativo da janela.
+    let (wi, ti, from) = match arg_id(a, "pane").and_then(|p| locate(m, p).map(|(w, t)| (w, t, p))) {
+        Some(x) => x,
+        None => {
+            let client = arg_str(a, "client").unwrap_or("cli").to_string();
+            let wi = client_ws(m, srv, &client)?;
+            let ti = m.workspaces[wi].active;
+            (wi, ti, m.workspaces[wi].tabs[ti].active)
+        }
+    };
+    let t = &m.workspaces[wi].tabs[ti];
     let mut rects = Vec::new();
     t.root.layout(Rect { x: 0, y: 0, w: m.size.0, h: m.size.1 }, &mut rects);
-    let Some(cur) = rects.iter().find(|(id, _)| *id == t.active).map(|x| x.1) else { return Ok(t.active) };
+    let Some(cur) = rects.iter().find(|(id, _)| *id == from).map(|x| x.1) else { return Ok(from) };
     let (cx, cy) = (cur.x as i32 * 2 + cur.w as i32, cur.y as i32 * 2 + cur.h as i32);
-    let best = rects.iter().filter(|(id, r)| *id != t.active && match dir {
+    let best = rects.iter().filter(|(id, r)| *id != from && match dir {
         "left" => r.x + r.w <= cur.x,
         "right" => r.x >= cur.x + cur.w,
         "up" => r.y + r.h <= cur.y,
@@ -2531,7 +2761,7 @@ fn neighbor(srv: &Arc<Server>, m: &mut Mux, a: &Value, dir: &str) -> Result<Id, 
         let (x, y) = (r.x as i32 * 2 + r.w as i32, r.y as i32 * 2 + r.h as i32);
         (x - cx).abs() + (y - cy).abs()
     });
-    Ok(best.map(|b| b.0).unwrap_or(t.active))
+    Ok(best.map(|b| b.0).unwrap_or(from))
 }
 
 fn wait(srv: &Arc<Server>, a: &Value) -> Result<Value, String> {
@@ -2561,7 +2791,7 @@ enum Saved {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SavedTab { title: String, zoomed: bool, active: usize, root: Saved, #[serde(default)] color: String }
+struct SavedTab { title: String, zoomed: bool, active: usize, root: Saved, #[serde(default)] color: String, #[serde(default)] pinned: bool }
 
 #[derive(Serialize, Deserialize)]
 struct SavedWs { name: String, saved_at: u64, active: usize, tabs: Vec<SavedTab> }
@@ -2593,7 +2823,7 @@ fn save_workspace(m: &Mux, name: &str) -> Result<(), String> {
     let s = SavedWs {
         name: name.into(), saved_at: now_secs(), active: w.active,
         tabs: w.tabs.iter().map(|t| SavedTab {
-            title: t.title.clone(), zoomed: t.zoomed, color: t.color.clone(),
+            title: t.title.clone(), zoomed: t.zoomed, color: t.color.clone(), pinned: t.pinned,
             active: t.root.leaves().iter().position(|x| *x == t.active).unwrap_or(0),
             root: save_node(m, &t.root),
         }).collect(),
@@ -2668,11 +2898,18 @@ fn restore_workspace(srv: &Arc<Server>, m: &mut Mux, name: &str) -> Result<Strin
         tab.root = root;
         tab.zoomed = t.zoomed;
         tab.color = t.color.clone();
+        tab.pinned = t.pinned;
         tabs.push(tab);
     }
     let active = s.active.min(tabs.len().saturating_sub(1));
     m.workspaces.push(Workspace { name: ws_name.clone(), tabs, active });
-    // O shell precisa subir antes de receber o comando de retomada.
+    send_later(srv, pending);
+    Ok(ws_name)
+}
+
+/// O shell precisa subir antes de receber o comando de retomada.
+fn send_later(srv: &Arc<Server>, pending: Vec<(Id, String)>) {
+    if pending.is_empty() { return; }
     let s2 = srv.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(2500));
@@ -2681,7 +2918,65 @@ fn restore_workspace(srv: &Arc<Server>, m: &mut Mux, name: &str) -> Result<Strin
             if let Some(p) = m.panes.get(&id) { p.write(line.as_bytes()); }
         }
     });
-    Ok(ws_name)
+}
+
+/// `git status` + `git diff --numstat HEAD` da pasta: o que mudou no repo.
+fn git_changes(cwd: &str) -> Option<Changes> {
+    // So pasta do Windows (a do WSL comeca com /) e que exista.
+    if cwd.is_empty() || cwd.starts_with('/') || !std::path::Path::new(cwd).is_dir() { return None; }
+    let run = |args: &[&str]| -> Option<String> {
+        let mut c = std::process::Command::new("git");
+        c.arg("-C").arg(cwd).args(args);
+        #[cfg(windows)]
+        { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); }
+        let o = c.output().ok()?;
+        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).to_string())
+    };
+    let status = run(&["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let mut nums: HashMap<String, (i64, i64)> = HashMap::new();
+    for l in run(&["diff", "--numstat", "HEAD"]).unwrap_or_default().lines() {
+        let f: Vec<&str> = l.splitn(3, '\t').collect();
+        if f.len() == 3 { nums.insert(f[2].to_string(), (f[0].parse().unwrap_or(0), f[1].parse().unwrap_or(0))); }
+    }
+    let mut c = Changes::default();
+    for l in status.lines() {
+        if l.len() < 4 { continue; }
+        let st = l[..2].trim().to_string();
+        let path = l[3..].rsplit(" -> ").next().unwrap_or("").trim_matches('"').to_string();
+        // Arquivo novo (fora do indice): o diff nao conta; conta as linhas dele.
+        let (a, d) = nums.get(&path).copied().unwrap_or_else(|| {
+            let f = std::path::Path::new(cwd).join(&path);
+            let small = std::fs::metadata(&f).is_ok_and(|m| m.is_file() && m.len() < 1_000_000);
+            (if st == "??" && small { std::fs::read(&f).map(|b| bytecount_lines(&b)).unwrap_or(0) } else { 0 }, 0)
+        });
+        c.add += a;
+        c.del += d;
+        c.list.push((if st.is_empty() { "M".into() } else { st }, path, a, d));
+    }
+    c.files = c.list.len();
+    c.list.sort_by(|x, y| (y.2 + y.3).cmp(&(x.2 + x.3)));
+    c.list.truncate(200);
+    Some(c)
+}
+
+fn bytecount_lines(b: &[u8]) -> i64 {
+    if b.is_empty() { return 0; }
+    b.iter().filter(|c| **c == 10).count() as i64 + if b.last() == Some(&10) { 0 } else { 1 }
+}
+
+/// A cada 5s: arquivos mexidos nas pastas onde ha agente (git fora do lock).
+fn changes_loop(srv: Arc<Server>) {
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let cwds: std::collections::BTreeSet<String> = srv.lock().panes.values().filter(|p| p.agent.is_some()).map(|p| p.cwd.clone()).collect();
+        let mut fresh = HashMap::new();
+        for c in cwds { if let Some(ch) = git_changes(&c) { fresh.insert(c, ch); } }
+        let mut m = srv.lock();
+        let changed = fresh.iter().any(|(k, v)| m.changes.get(k).is_none_or(|o| o.files != v.files || o.add != v.add || o.del != v.del)) || fresh.len() != m.changes.len();
+        m.changes = fresh;
+        drop(m);
+        if changed { srv.notify(); }
+    }
 }
 
 /// Autosave: estado de cada workspace + checkpoint (o que o server oferece
@@ -2700,7 +2995,7 @@ fn autosave_loop(srv: Arc<Server>) {
 // ------------------------------------------------------------------ live.json
 
 #[derive(Serialize, Deserialize)]
-struct LiveTab { title: String, root: Node, active: Id, zoomed: bool, floating: Option<Id>, color: String }
+struct LiveTab { title: String, root: Node, active: Id, zoomed: bool, floating: Option<Id>, color: String, #[serde(default)] pinned: bool }
 #[derive(Serialize, Deserialize)]
 struct LiveWs { name: String, active: usize, tabs: Vec<LiveTab> }
 #[derive(Serialize, Deserialize)]
@@ -2713,7 +3008,7 @@ fn live_snapshot(m: &Mux) -> Live {
             name: w.name.clone(), active: w.active,
             tabs: w.tabs.iter().map(|t| LiveTab {
                 title: t.title.clone(), root: t.root.clone(), active: t.active, zoomed: t.zoomed,
-                floating: t.floating, color: t.color.clone(),
+                floating: t.floating, color: t.color.clone(), pinned: t.pinned,
             }).collect(),
         }).collect(),
         panes: m.panes.iter().map(|(id, p)| (*id, PaneMeta {
@@ -2776,6 +3071,7 @@ fn recover(srv: &Arc<Server>) {
             tab.root = root;
             tab.zoomed = lt.zoomed;
             tab.color = lt.color;
+            tab.pinned = lt.pinned;
             if let Some(f) = lt.floating.filter(|f| attached.contains(f)) { tab.floating = Some(f); placed.push(f); }
             tabs.push(tab);
         }
@@ -3017,7 +3313,7 @@ pub fn run() {
             panes: HashMap::new(), workspaces: Vec::new(), next: 1, size: (100, 30),
             clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0, inbox: Inbox::default(), loops: HashMap::new(),
             approvals: Vec::new(), approval_seq: 0, secrets, recovered: 0, resurrect: false, light: false,
-            history: load_history(), budget_warned: false, ext: Default::default(), subs: 0,
+            history: load_history(), budget_warned: false, ext: Default::default(), subs: 0, closed: Vec::new(), pip: None, changes: HashMap::new(),
         }),
         gen: Mutex::new(0),
         cv: Condvar::new(),
@@ -3030,6 +3326,7 @@ pub fn run() {
     { let s = srv.clone(); std::thread::spawn(move || agent_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || autosave_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || live_loop(s)); }
+    { let s = srv.clone(); std::thread::spawn(move || changes_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || sync_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || { let sink = ext_sink(&s); s.lock().ext.start_all(&sink); s.notify(); }); }
     for conn in listener.incoming().flatten() {
@@ -3122,6 +3419,27 @@ mod tests {
     }
 
     #[test]
+    fn mask_hides_tokens_across_runs() {
+        // Token quebrado em dois runs (cores diferentes) e um texto comum.
+        let mut row = vec![
+            json!([0, "export T=ghp_abcdefghij", -1, -2, 0]),
+            json!([23, "klmnopqrstuvwxyz0123456789", 5, -2, 1]),
+            json!([50, " fim", -1, -2, 0]),
+        ];
+        let found = mask_row(&mut row, crate::config::screen_secrets());
+        assert_eq!(found.len(), 1);
+        assert_eq!(row[0][1], "export T=••••••••••••••");
+        assert!(row[1][1].as_str().unwrap().chars().all(|c| c == '•'));
+        assert_eq!(row[2][1], " fim");
+        let mut plain = vec![json!([0, "git log --oneline 2cfc632", -1, -2, 0])];
+        assert!(mask_row(&mut plain, crate::config::screen_secrets()).is_empty());
+        // PAT novo do Azure DevOps (84 com AZDO) e chave AWS.
+        let pat = format!("{}AZDO{}", "A1b2".repeat(13), "x9Y8".repeat(7));
+        let mut az = vec![json!([0, format!("pat {pat}"), -1, -2, 0]), json!([100, "AKIAABCDEFGHIJKLMNOP", -1, -2, 0])];
+        assert_eq!(mask_row(&mut az, crate::config::screen_secrets()).len(), 2);
+    }
+
+    #[test]
     fn frame_diff_sends_only_changed_rows() {
         let mut sent = HashMap::new();
         let mut f1 = json!({"panes": [{"id": 1, "w": 10, "h": 2, "lines": [[[0, "a"]], [[0, "b"]]]}]});
@@ -3142,7 +3460,7 @@ mod tests {
             panes: HashMap::new(), workspaces: vec![], next: 1, size: (10, 10), clients: HashMap::new(),
             cfg: config::parse(&t),
             clipboard: (0, String::new()), events: vec![], event_seq: 0, inbox: Inbox::default(), loops: HashMap::new(), approvals: vec![], approval_seq: 0,
-            secrets: vec![], recovered: 0, resurrect: false, light: false, history: vec![], budget_warned: false, ext: Default::default(), subs: 0,
+            secrets: vec![], recovered: 0, resurrect: false, light: false, history: vec![], budget_warned: false, ext: Default::default(), subs: 0, closed: Vec::new(), pip: None, changes: HashMap::new(),
         };
         assert!(check_scope(&m, Caller(Some(5)), "send", &json!({"pane": 9})).is_err());
         assert!(check_scope(&m, Caller(Some(5)), "read", &json!({"pane": 9})).is_ok());

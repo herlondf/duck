@@ -25,6 +25,7 @@ use crate::proto::Conn;
 use crate::render::{lin, Layer, Quad, Renderer, TextItem};
 
 mod ext;
+mod best;
 mod graph;
 mod ui;
 use ui::{Ac, AgentPanel, Composer, Hit};
@@ -42,6 +43,13 @@ struct TabInfo {
     #[serde(default)] profile: String,
     /// Loop com verificador na aba: "⟳ 2/5", "✓ 3/5", "✗ 5/5".
     #[serde(default, rename = "loop")] looping: String,
+    /// Id estavel da aba (alternar com a anterior) e se esta fixada.
+    #[serde(default)] id: u64,
+    #[serde(default)] pinned: bool,
+    /// Ultimo pedido ao agente, passo do plano e arquivos mexidos (n, +, -).
+    #[serde(default)] prompt: Option<String>,
+    #[serde(default)] step: Option<String>,
+    #[serde(default)] changes: Option<(usize, i64, i64)>,
 }
 
 /// Trecho de texto: coluna, texto, fg, bg, flags e link OSC 8 opcional.
@@ -92,6 +100,10 @@ struct PaneView {
     #[serde(default)] input: Option<(i64, usize)>,
     #[serde(default)] recording: bool,
     #[serde(default)] queued: usize,
+    /// Pane de outra aba no canto (picture-in-picture).
+    #[serde(default)] pip: bool,
+    /// Segredos aparecendo sem mascara agora ("mostrar segredos").
+    #[serde(default)] revealed: bool,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -115,6 +127,8 @@ struct Frame {
     #[serde(default)] tokens: u64,
     #[serde(default)] ports: Vec<u16>,
     #[serde(default)] inbox_unread: usize,
+    /// Abas fechadas que da para reabrir.
+    #[serde(default)] closed: usize,
 }
 
 impl PaneView {
@@ -242,6 +256,9 @@ struct Overlay {
     gallery: Option<Theme>,
     /// Campo de token: mostra bolinhas no lugar do texto.
     secret: bool,
+    /// Paleta: uso por rotulo (ultimo uso em segundos, vezes). Recentes
+    /// primeiro com a busca vazia; frequentes sobem no desempate.
+    rank: HashMap<String, (u64, u32)>,
 }
 
 /// Fuzzy por subsequencia: todos os chars na ordem; consecutivos e inicio de
@@ -276,13 +293,13 @@ fn fuzzy(q: &str, s: &str) -> Option<i32> {
 impl Overlay {
     fn list(title: &str, items: Vec<Item>) -> Overlay {
         let mut o = Overlay { title: title.into(), input: String::new(), items, shown: vec![], sel: 0, kind: OverlayKind::List, agents: false,
-            dialog: false, home: false, palette: false, gallery: None, secret: false };
+            dialog: false, home: false, palette: false, gallery: None, secret: false, rank: HashMap::new() };
         o.filter();
         o
     }
     fn prompt(title: &str, initial: &str, action: &str, args: Vec<Value>) -> Overlay {
         Overlay { title: title.into(), input: initial.into(), items: vec![], shown: vec![], sel: 0, kind: OverlayKind::Prompt(action.into(), args), agents: false,
-            dialog: false, home: false, palette: false, gallery: None, secret: false }
+            dialog: false, home: false, palette: false, gallery: None, secret: false, rank: HashMap::new() }
     }
     fn dialog(title: &str, items: Vec<Item>) -> Overlay {
         let mut o = Overlay::list(title, items);
@@ -290,9 +307,23 @@ impl Overlay {
         o
     }
     fn filter(&mut self) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut v: Vec<(i32, usize)> = self.items.iter().enumerate()
-            .filter_map(|(i, it)| fuzzy(&self.input, &format!("{} {}", it.label, it.hint)).map(|s| (s, i))).collect();
+            .filter_map(|(i, it)| fuzzy(&self.input, &format!("{} {}", it.label, it.hint)).map(|s| {
+                // Frequente e recente sobem um pouco: desempate, nao passa na frente de um casamento melhor.
+                let bonus = self.rank.get(&it.label).map(|(at, n)| (*n).min(8) as i32 * 25 + if now.saturating_sub(*at) < 86_400 { 60 } else { 0 }).unwrap_or(0);
+                (s + bonus, i)
+            })).collect();
         if !self.input.is_empty() { v.sort_by(|a, b| b.0.cmp(&a.0)); }
+        else if !self.rank.is_empty() {
+            // Busca vazia: os 6 usados por ultimo no topo, o resto na ordem de sempre.
+            let mut rec: Vec<(u64, usize)> = v.iter().filter_map(|(_, i)| self.rank.get(&self.items[*i].label).map(|r| (r.0, *i))).collect();
+            rec.sort_by(|a, b| b.0.cmp(&a.0));
+            rec.truncate(6);
+            let top: Vec<usize> = rec.into_iter().map(|x| x.1).collect();
+            v.retain(|(_, i)| !top.contains(i));
+            v.splice(0..0, top.into_iter().map(|i| (0, i)));
+        }
         self.shown = v.into_iter().map(|x| x.1).collect();
         self.sel = 0;
     }
@@ -451,6 +482,17 @@ pub struct Gui {
     ext_content: f32,
     /// Ultimo contexto (pane ativo) mandado as extensoes.
     ext_context: Option<Value>,
+    /// Aba atual e a anterior (ids): alternar entre as duas ultimas.
+    tab_cur: u64,
+    tab_prev: u64,
+    /// Uso da paleta (rotulo -> ultimo uso, vezes), em palette.json.
+    palette_rank: HashMap<String, (u64, u32)>,
+    /// Rolagem pausada: tamanho do historico quando o pane saiu do fim
+    /// (a diferenca sao as linhas novas que chegaram desde entao).
+    scroll_base: HashMap<u64, i64>,
+    /// Arrastando o cabecalho de um pane (pane, inicio, mexeu): soltar sobre
+    /// outro troca os dois de lugar.
+    pane_drag: Option<(u64, (f32, f32), bool)>,
 }
 
 /// Menu por assunto: a paleta so com os comandos cujo rotulo (ou dica) comeca
@@ -465,8 +507,9 @@ fn default_menus() -> Vec<Menu> {
         m("orquestracao", "Orquestração: agentes, loop, mapa, caixa de entrada", &["Agentes:", "Loop:", "Caixa de entrada", "Git:", "Checkpoint:"]),
         m("extensoes", "Extensões: painéis e comandos", &["Extensões", "extensao ·"]),
         m("janela", "Janela: abas, panes e workspaces", &["Dividir", "Fechar", "Zoom", "Pane", "Nova aba", "Novo pane", "Renomear", "Cor da aba", "Mover", "Redimensionar",
+            "Reabrir", "Aba anterior", "Fixar", "PiP", "Trocar o pane",
             "Broadcast", "Trocar de workspace", "Criar/ir", "Salvar workspace", "Restaurar workspace", "Apagar estado", "Modo foco", "Barra lateral", "Layout:", "Inicio:"]),
-        m("config", "Configuração", &["Configuracoes", "Galeria de temas", "Tema a partir", "Fonte", "Recarregar config", "Reiniciar server", "Encerrar server", "Desanexar"]),
+        m("config", "Configuração", &["Configuracoes", "Galeria de temas", "Tema a partir", "Fonte", "Densidade", "Segredos:", "Recarregar config", "Reiniciar server", "Encerrar server", "Desanexar"]),
     ]
 }
 
@@ -512,6 +555,7 @@ impl Gui {
             tab_drag: None, badge_drag: None, badge_rects: vec![], badge_row: (0.0, 0.0), shortcuts: vec![], menus: vec![], ext_order: vec![], div_drag: None, title_click: Instant::now() - Duration::from_secs(5), resize_edge: None,
             collapsed: HashMap::new(), pinned: HashMap::new(), search_hits: None, composer: None, ac: None, ac_dismissed: String::new(),
             usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), last_loop_check: String::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
+            tab_cur: 0, tab_prev: 0, palette_rank: load_palette_rank(), scroll_base: HashMap::new(), pane_drag: None,
         };
         g.load_config();
         g
@@ -530,7 +574,7 @@ impl Gui {
         if let Some(e) = err { self.flash(&e); }
         self.keys = parse_bindings(&lua, t.get("keys").ok());
         // Atalhos novos com padrao (a config do usuario pode sobrescrever).
-        let defaults: [(&str, &str, &str, Vec<Value>); 32] = [
+        let defaults: [(&str, &str, &str, Vec<Value>); 42] = [
             ("p", "CTRL|SHIFT", "palette", vec![]),
             ("1", "CTRL|SHIFT", "menu", vec![json!("orquestracao")]),
             ("2", "CTRL|SHIFT", "menu", vec![json!("extensoes")]),
@@ -563,6 +607,16 @@ impl Gui {
             ("h", "CTRL|SHIFT", "sessions", vec![]),
             (",", "CTRL", "settings", vec![]),
             ("l", "CTRL|SHIFT", "lock", vec![]),
+            ("q", "ALT", "tab_last", vec![]),
+            ("t", "CTRL|ALT", "reopen_tab", vec![]),
+            ("a", "CTRL|ALT", "next_blocked", vec![]),
+            ("p", "CTRL|ALT", "pin_tab", vec![]),
+            ("f", "CTRL|ALT", "pip", vec![]),
+            ("k", "CTRL|ALT", "density", vec![]),
+            ("arrowleft", "ALT|SHIFT", "swap_pane", vec![json!("left")]),
+            ("arrowright", "ALT|SHIFT", "swap_pane", vec![json!("right")]),
+            ("arrowup", "ALT|SHIFT", "swap_pane", vec![json!("up")]),
+            ("arrowdown", "ALT|SHIFT", "swap_pane", vec![json!("down")]),
         ];
         for (k, m, a, args) in defaults {
             let mods = parse_mods(m);
@@ -869,7 +923,85 @@ impl Gui {
                 self.cmd(req);
             }
             "close_pane" => self.cmd(json!({"cmd": "close", "pane": ap})),
-            "close_tab" => for id in self.frame.panes.iter().map(|p| p.id).collect::<Vec<_>>() { self.cmd(json!({"cmd": "close", "pane": id})) },
+            "close_tab" => match self.frame.tabs.iter().find(|t| t.active) {
+                Some(t) if t.pinned => { let i = t.index; self.close_tab_asking(i) }
+                _ => self.cmd(json!({"cmd": "close-tab"})),
+            },
+            "tab_last" => {
+                if self.tab_prev == 0 { return self.flash("Ainda nao ha aba anterior"); }
+                if let Err(e) = self.call(json!({"cmd": "tab-focus", "id": self.tab_prev})) { self.flash(&e); }
+            }
+            "reopen_tab" => match self.call(json!({"cmd": "reopen-tab"})) {
+                Ok(v) => {
+                    let t = v["title"].as_str().filter(|t| !t.is_empty()).map(|t| format!(" \"{t}\"")).unwrap_or_default();
+                    self.flash(&format!("Aba{t} reaberta{}", if v["resumed"].as_bool() == Some(true) { "; retomando a sessao do agente" } else { "" }));
+                }
+                Err(e) => self.flash(&e),
+            },
+            "next_blocked" => match self.call(json!({"cmd": "next-blocked", "after": ap})) {
+                Ok(v) => {
+                    let pane = v["pane"].as_u64().unwrap_or(0);
+                    // O cartao do canto sobre este agente perde o sentido: some.
+                    crate::toast::dismiss_pane(pane);
+                    let n = v["total"].as_u64().unwrap_or(1);
+                    if n > 1 { self.flash(&format!("{n} agentes pedem aprovacao: o atalho de novo vai para o proximo")); }
+                }
+                Err(e) => self.flash(&e),
+            },
+            "pin_tab" => {
+                let idx = args.first().and_then(|v| v.as_i64());
+                let mut req = json!({"cmd": "pin-tab"});
+                if let Some(i) = idx { req["index"] = json!(i); }
+                match self.call(req) {
+                    Ok(v) => self.flash(if v["pinned"].as_bool() == Some(true) { "Aba fixada: fica a esquerda e pede confirmacao para fechar" } else { "Aba solta" }),
+                    Err(e) => self.flash(&e),
+                }
+            }
+            "preview_file" => self.open_preview(&s(0), 1, 1),
+            "reveal_secrets" => match self.call(json!({"cmd": "reveal", "pane": ap, "secs": 30})) {
+                Ok(_) => self.flash("Segredos visiveis neste pane por 30s"),
+                Err(e) => self.flash(&e),
+            },
+            "guard_install" | "guard_scan" => {
+                let cwd = self.active().map(|p| p.cwd.clone()).unwrap_or_default();
+                if cwd.is_empty() || cwd.starts_with("/") { return self.flash("Pasta do pane desconhecida (ou WSL): rode duck guard install no repo"); }
+                if name == "guard_install" {
+                    match crate::guard::install(std::path::Path::new(&cwd), false) { Ok(m) => self.flash(&m), Err(e) => self.flash(&e) }
+                } else {
+                    let exe = std::env::current_exe().map(|p| p.with_file_name("duck.exe").to_string_lossy().to_string()).unwrap_or_default();
+                    self.cmd(json!({"cmd": "spawn", "where": "down", "pane": ap, "argv": ["pwsh", "-NoLogo", "-NoExit", "-Command", format!("& '{exe}' guard scan --all --path '{cwd}'")]}));
+                }
+            }
+            "scroll_bottom" => {
+                let id = args.first().and_then(|v| v.as_u64()).unwrap_or(ap);
+                self.cmd(json!({"cmd": "scroll", "to": "bottom", "pane": id}));
+            }
+            "swap_pane" => if let Err(e) = self.call(json!({"cmd": "swap-panes", "pane": ap, "dir": s(0)})) { self.flash(&e) },
+            "pip" => match self.call(json!({"cmd": "pip", "pane": ap})) {
+                Ok(v) => self.flash(if v["pip"].is_null() { "PiP desligado" } else { "PiP: este pane aparece no canto das outras abas (clique nele para voltar)" }),
+                Err(e) => self.flash(&e),
+            },
+            "density" => {
+                let next = if self.cfg.ui.density == "compact" { "comfortable" } else { "compact" };
+                self.cfg.ui.density = next.into();
+                let _ = set_local_setting("ui.density", &format!("{next:?}"));
+                self.send_size();
+                self.flash(if next == "compact" { "Densidade compacta (Ctrl+Alt+K volta)" } else { "Densidade confortavel" });
+            }
+            "tab_menu" => {
+                let idx = n(0, 0);
+                let Some(t) = self.frame.tabs.iter().find(|t| t.index as i64 == idx).cloned() else { return };
+                self.cmd(json!({"cmd": "tab", "index": idx}));
+                let mut items = vec![
+                    Item::new(if t.pinned { "Soltar a aba" } else { "Fixar a aba" }, &self.hint_for("pin_tab", None), "pin_tab", vec![json!(idx)]),
+                    Item::new("Renomear (nome fixo)", &self.hint_for("rename_tab", None), "rename_tab", vec![]),
+                    Item::new("Cor da aba", "", "tab_color", vec![]),
+                    Item::new("Mover para outro workspace", &self.hint_for("move_tab_ws", None), "move_tab_ws", vec![]),
+                    Item::new("Fechar a aba", "", "close_tab_idx", vec![json!(idx)]),
+                ];
+                if self.frame.closed > 0 { items.push(Item::new("Reabrir a ultima aba fechada", &self.hint_for("reopen_tab", None), "reopen_tab", vec![])); }
+                self.overlay = Some(Overlay::list("Aba", items));
+            }
             "zoom" => self.cmd(json!({"cmd": "zoom"})),
             "rename_tab" => {
                 // Sem nome fixo ainda: comeca com o que a aba mostra agora (Enter ja fixa).
@@ -1074,6 +1206,12 @@ impl Gui {
             "agent_worktree" => self.overlay = Some(Overlay::prompt("Nome da branch da worktree", "", "agent_worktree_go", vec![json!(n(0, 0))])),
             "agent_worktree_go" => self.agent_worktree(n(0, 0) as usize, s(1)),
             "worktree_finish" => self.worktree_finish(),
+            "best_of" => self.best_prompt(),
+            "best_task" => self.best_task(s(0)),
+            "best_go" => self.best_start(s(0), s(1)),
+            "best_compare" => self.best_compare(),
+            "best_pick" => self.best_pick(n(0, 0) as usize),
+            "best_choose" => self.best_choose(n(0, 0) as usize, args.get(1).cloned().unwrap_or(Value::Null)),
             "agent_grid" => self.open_grid(),
             "agent_graph" => self.open_graph(),
             "queue_message" => {
@@ -1105,7 +1243,8 @@ impl Gui {
                 Ok(v) => self.flash(&format!("Gravacao salva: {}  (duck play <arquivo>)", v["path"].as_str().unwrap_or(""))),
                 Err(e) => self.flash(&e),
             },
-            "popup" => self.cmd(json!({"cmd": "float", "replace": true, "argv": s(0)})),
+            // argv: texto ("lazygit") ou lista (["pwsh", "-Command", "..."]).
+            "popup" => self.cmd(json!({"cmd": "float", "replace": true, "argv": args.first().cloned().unwrap_or(Value::Null)})),
             "open_file" => self.open_in_editor(&s(0), n(1, 1), n(2, 1)),
             "detach" => std::process::exit(0),
             "kill_server" => { let _ = self.call(json!({"cmd": "kill-server"})); std::process::exit(0); }
@@ -1197,6 +1336,8 @@ impl Gui {
         let items = self.palette_items(true);
         let mut o = Overlay::list("Paleta: comandos, abas, sessoes, historico e arquivos", items);
         o.palette = true;
+        o.rank = self.palette_rank.clone();
+        o.filter();
         self.overlay = Some(o);
     }
 
@@ -1211,6 +1352,8 @@ impl Gui {
             .collect();
         let mut o = Overlay::list(&m.title, items);
         o.palette = true;
+        o.rank = self.palette_rank.clone();
+        o.filter();
         self.overlay = Some(o);
     }
 
@@ -1240,8 +1383,18 @@ impl Gui {
             b("Fechar pane", "close_pane", vec![]),
             b("Fechar aba", "close_tab", vec![]),
             b("Zoom do pane (alternar)", "zoom", vec![]),
+            b("PiP: mostrar este pane no canto das outras abas (liga/desliga)", "pip", vec![]),
+            b("Trocar o pane de lugar com o vizinho da esquerda", "swap_pane", vec![json!("left")]),
+            b("Trocar o pane de lugar com o vizinho da direita", "swap_pane", vec![json!("right")]),
+            b("Trocar o pane de lugar com o vizinho de cima", "swap_pane", vec![json!("up")]),
+            b("Trocar o pane de lugar com o vizinho de baixo", "swap_pane", vec![json!("down")]),
+            b("Densidade: compacta / confortavel", "density", vec![]),
             b("Pane flutuante (abre/esconde; continua rodando)", "float", vec![]),
             b("Nova aba", "new_tab", vec![]),
+            b("Reabrir a ultima aba fechada (agente volta com a sessao)", "reopen_tab", vec![]),
+            b("Aba anterior (alternar entre as duas ultimas)", "tab_last", vec![]),
+            b("Fixar/soltar a aba", "pin_tab", vec![]),
+            b("Agentes: ir para o proximo que pede aprovacao", "next_blocked", vec![]),
             b("Renomear aba", "rename_tab", vec![]),
             b("Cor da aba", "tab_color", vec![]),
             b("Mover aba para a direita", "move_tab", vec![json!(1)]),
@@ -1290,6 +1443,7 @@ impl Gui {
             b("Galeria de temas (previa ao vivo)", "theme_gallery", vec![]),
             b("Tema a partir do papel de parede", "wallpaper_theme", vec![]),
             b("Extensões: ativar, configurar, contas e tokens", "extensions", vec![]),
+            b("Extensões: revisoes pendentes (GitHub e Azure juntos)", "reviews", vec![]),
             b("Menu: orquestração", "menu", vec![json!("orquestracao")]),
             b("Menu: extensões", "menu", vec![json!("extensoes")]),
             b("Menu: janela (abas, panes, workspaces)", "menu", vec![json!("janela")]),
@@ -1303,8 +1457,13 @@ impl Gui {
             b("Agentes: mapa da orquestração (agentes, panes filhos e subagentes)", "agent_graph", vec![]),
             b("Agentes: recado na fila (entregue quando o agente parar)", "queue_message", vec![]),
             b("Agentes: bifurcar a sessao do agente num pane novo", "fork_agent", vec![]),
+            b("Agentes: melhor de N (a mesma tarefa em N worktrees; voce escolhe a melhor)", "best_of", vec![]),
+            b("Agentes: comparar o melhor de N e escolher", "best_compare", vec![]),
             b("Agentes: revisar o diff e comentar para o agente", "review", vec![]),
             b("Git: finalizar worktree (diff, mesclar, remover)", "worktree_finish", vec![]),
+            b("Git: instalar a guarda neste repo (barra segredo e palavra proibida no commit/push)", "guard_install", vec![]),
+            b("Git: procurar segredos e palavras proibidas no historico do repo", "guard_scan", vec![]),
+            b("Segredos: mostrar os mascarados deste pane por 30s", "reveal_secrets", vec![]),
             b("Historico de comandos (todos os panes, WSL incluso)", "history", vec![]),
             b("Gravar sessao do pane (asciinema) / parar", "record", vec![]),
         ]);
@@ -1517,21 +1676,9 @@ impl Gui {
         let branch = branch.trim().replace(' ', "-");
         if branch.is_empty() { return; }
         let cwd = self.active().map(|p| p.cwd.clone()).unwrap_or_default();
-        let Some(top) = git(&cwd, &["rev-parse", "--show-toplevel"]) else { return self.flash("O pane ativo nao esta num repositorio git") };
-        let top = std::path::PathBuf::from(top.trim());
-        let name = top.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "repo".into());
-        let dest = top.with_file_name(format!("{name}-{}", branch.replace('/', "-")));
-        let dest_s = dest.to_string_lossy().to_string();
-        if git(&top.to_string_lossy(), &["worktree", "add", "-b", &branch, &dest_s]).is_none() {
-            return self.flash(&format!("git worktree add falhou (a branch {branch} ja existe?)"));
-        }
-        let cmd = self.cfg.agent_profiles.get(profile).map(|p| p.cmd.clone()).unwrap_or_else(|| "claude".into());
         // Porta propria e preparo (.duck-worktree.json do repo): dois agentes
         // com servidor de desenvolvimento nao brigam pela mesma porta.
-        let port = worktree_port(&dest_s);
-        let wt = WorktreeCfg::load(&top);
-        let copied = wt.copy_into(&top, &dest);
-        let line = wt.command(port, &cmd);
+        let (dest_s, line, port, copied, _) = match self.make_worktree(&cwd, profile, &branch) { Ok(x) => x, Err(e) => return self.flash(&e) };
         self.cmd(json!({"cmd": "spawn", "where": "tab", "cwd": dest_s, "title": format!("⎇ {branch}"), "type": line}));
         let extra = if copied > 0 { format!(", {copied} arquivo(s) copiado(s)") } else { String::new() };
         self.flash(&format!("Worktree {dest_s} na branch {branch}, porta {port}{extra}; agente subindo"));
@@ -2098,6 +2245,15 @@ impl Gui {
                 let pos = |n: &str| f.workspaces.iter().position(|w| w == n).unwrap_or(0) as f32;
                 self.ws_anim = Some((Instant::now(), if pos(&f.workspace) >= pos(&self.frame.workspace) { 1.0 } else { -1.0 }));
             }
+            for p in &f.panes {
+                if p.scroll > 0 { self.scroll_base.entry(p.id).or_insert(p.history); } else { self.scroll_base.remove(&p.id); }
+            }
+            if let Some(t) = f.tabs.iter().find(|t| t.active) {
+                if t.id != 0 && t.id != self.tab_cur {
+                    if self.tab_cur != 0 { self.tab_prev = self.tab_cur; }
+                    self.tab_cur = t.id;
+                }
+            }
             self.frame = f;
             self.compute_ghost();
             self.compute_ac();
@@ -2269,6 +2425,21 @@ impl Gui {
         let hay = format!("{} {} {} {}", t.title, t.pane_title, t.cwd, t.domain);
         self.cfg.tab_rules.iter().find(|(re, _)| regex::Regex::new(re).is_ok_and(|r| r.is_match(&hay))).map(|x| x.1)
     }
+}
+
+fn palette_rank_path() -> std::path::PathBuf { crate::proto::data_dir().join("palette.json") }
+
+fn load_palette_rank() -> HashMap<String, (u64, u32)> {
+    std::fs::read(palette_rank_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Uso da paleta: guarda os 200 mais recentes.
+fn save_palette_rank(rank: &HashMap<String, (u64, u32)>) {
+    let mut v: Vec<(&String, &(u64, u32))> = rank.iter().collect();
+    v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    v.truncate(200);
+    let m: HashMap<&String, &(u64, u32)> = v.into_iter().collect();
+    if let Ok(s) = serde_json::to_vec(&m) { let _ = std::fs::write(palette_rank_path(), s); }
 }
 
 /// Aplica as linhas alteradas (`rows`) sobre o frame anterior do mesmo pane.
@@ -2993,6 +3164,20 @@ mod tests {
         assert!(fuzzy("dpd", "Dividir pane a direita").is_some());
         assert!(fuzzy("xyz", "Dividir pane").is_none());
         assert!(fuzzy("sal", "Salvar workspace").unwrap() > fuzzy("sal", "Restaurar estado salvo").unwrap());
+    }
+
+    #[test]
+    fn paleta_recentes_primeiro() {
+        let items = ["Dividir pane", "Fechar aba", "Nova aba", "Zoom do pane"].iter().map(|l| Item::new(*l, "", "x", vec![])).collect();
+        let mut o = Overlay::list("p", items);
+        o.rank = HashMap::from([("Zoom do pane".to_string(), (200, 1)), ("Nova aba".to_string(), (300, 5))]);
+        o.filter();
+        // Busca vazia: os usados por ultimo no topo (o mais recente primeiro), o resto na ordem.
+        assert_eq!(o.shown, vec![2, 3, 0, 1]);
+        // Com busca: o frequente desempata ("aba" casa igual em "Fechar aba" e "Nova aba").
+        o.input = "aba".into();
+        o.filter();
+        assert_eq!(o.shown[0], 2);
     }
 
     #[test]

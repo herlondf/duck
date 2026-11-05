@@ -8,6 +8,7 @@
   "command": ["node", "dist/index.js"],
   "settings": [
     { "key": "remind_minutes", "title": "Lembrar quantos minutos antes", "type": "number", "default": 5 },
+    { "key": "join_minutes", "title": "Rodapé vira \"entrar\" quantos minutos antes", "type": "number", "default": 10 },
     { "key": "refresh_minutes", "title": "Baixar a agenda a cada (min)", "type": "number", "default": 15 },
     { "key": "days", "title": "Dias à frente na visão", "type": "number", "default": 7 }
   ],

@@ -521,6 +521,7 @@ function prItem(o: Org, p: PR, reviewing: boolean): Item {
     id: `p|${o.name}|${p.repository.id}|${p.pullRequestId}`, title: `!${p.pullRequestId}  ${p.title}`,
     subtitle: `${p.repository.name} · ${branch(p.sourceRefName)} → ${branch(p.targetRefName)}${reviewing ? ` · ${p.createdBy.displayName}` : ""} · ${ago(p.creationDate)}`,
     icon: p.isDraft ? "pr-draft" : "pr", color: p.mergeStatus === "conflicts" ? "blocked" : p.isDraft ? "muted" : "accent", badge, actions,
+    ts: Date.parse(p.creationDate),
   };
 }
 

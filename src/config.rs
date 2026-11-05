@@ -234,6 +234,12 @@ pub struct Config {
     pub confirm_agent_actions: bool,
     pub audit: bool,
     pub secret_patterns: Vec<String>,
+    /// Token que aparece na tela (ghp_, sk-, AKIA, JWT, PAT do Azure...) vira
+    /// bolinhas e gera um aviso. `secret_mask = false` desliga.
+    pub secret_mask: bool,
+    /// Palavras que nao podem ir num commit/push (duck guard): nomes de
+    /// cliente, de projeto... `guard = { words = {'acme'} }`.
+    pub guard_words: Vec<String>,
     // ---- estabilidade / performance
     pub scrollback_mb: f64,
     pub max_fps: u32,
@@ -301,6 +307,8 @@ pub struct Ui {
     pub footer: bool,
     /// Barra de atalhos abaixo do rodape (lista em `shortcuts`).
     pub shortcuts: bool,
+    /// "comfortable" (padrao) | "compact": barras e respiros menores (notebook).
+    pub density: String,
 }
 
 pub fn home() -> PathBuf {
@@ -499,6 +507,8 @@ pub fn parse(t: &Table) -> Config {
         confirm_agent_actions: t.get::<Option<bool>>("confirm_agent_actions").ok().flatten().unwrap_or(true),
         audit: t.get::<Option<bool>>("audit").ok().flatten().unwrap_or(true),
         secret_patterns: list(t, "secret_patterns").unwrap_or_else(|| DEFAULT_SECRETS.iter().map(|s| s.to_string()).collect()),
+        secret_mask: t.get::<Option<bool>>("secret_mask").ok().flatten().unwrap_or(true),
+        guard_words: t.get::<Table>("guard").ok().and_then(|g| list(&g, "words")).unwrap_or_default(),
         scrollback_mb: n(t, "scrollback_mb", 64.0),
         max_fps: n(t, "max_fps", 0.0) as u32,
         gpu_backend: s(t, "gpu_backend", "dx12"),
@@ -567,6 +577,7 @@ fn parse_ui(u: Option<Table>) -> Ui {
             .filter_map(|(k, v)| Some((k, Rgb::parse(&v)?))).collect()).unwrap_or_default(),
         footer: b("footer", true),
         shortcuts: b("shortcuts", true),
+        density: s(&u, "density", "comfortable"),
     }
 }
 
@@ -576,6 +587,25 @@ pub const DEFAULT_SECRETS: [&str; 7] = [
     r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
     r"(?i)(password|senha|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
 ];
+
+/// Tokens com formato proprio: mascarados na tela, nas gravacoes e no que
+/// vai para agentes. So formatos inequivocos (o "senha=" generico fica de
+/// fora da tela: codigo-fonte cheio de `token:` viraria bolinha).
+pub const SCREEN_SECRETS: [&str; 14] = [
+    r"\bgh[pousr]_[A-Za-z0-9]{30,}", r"\bgithub_pat_[A-Za-z0-9_]{40,}", r"\bglpat-[A-Za-z0-9_\-]{20,}",
+    r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_\-]{24,}", r"\b(?:sk|rk)_live_[A-Za-z0-9]{20,}", r"\bAKIA[0-9A-Z]{16}\b",
+    r"\bxox[abpr]-[A-Za-z0-9-]{10,}", r"\bAIza[0-9A-Za-z_\-]{35}", r"\bnpm_[A-Za-z0-9]{36}\b",
+    r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
+    // PAT do Azure DevOps: o novo (84 com a assinatura AZDO) e o antigo (52 em base32).
+    r"\b[A-Za-z0-9]{52}AZDO[A-Za-z0-9]{28}\b", r"\b[a-z2-7]{52}\b",
+    r"(?i)\b(?:AccountKey|SharedAccessSignature|sig)=[A-Za-z0-9%+/=]{20,}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+];
+
+/// Os padroes de tela juntos numa regex so.
+pub fn screen_secrets() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(&SCREEN_SECRETS.join("|")).unwrap())
+}
 
 /// Padroes do modo "hints" (selecao por teclado): URL, caminho, hash, IP, issue, numero.
 pub const DEFAULT_HINTS: [&str; 6] = [

@@ -31,6 +31,13 @@ doing.
   agents, the panes they opened and their subagents; an inbox of what is
   waiting for you; an agent in a fresh worktree with its own port; Routines
   that send requests to Claude Code on a schedule.
+- **Tabs you don't lose.** Pinned tabs, reopen the last closed one
+  (`Ctrl+Alt+T`, with the agent session), jump back to the previous one
+  (`Alt+Q`), picture-in-picture of a pane over other tabs, and a preview with
+  your last request to the agent and the files it touched.
+- **Secrets protected.** A token that shows up on screen is masked (and kept
+  out of recordings and of what agents read); `duck guard install` blocks
+  secrets and client names in commits and pushes.
 - **Easy to find.** Topic menus (`Ctrl+Shift+1..4`: orchestration,
   extensions, window, settings) and a bar with the main shortcuts; all
   customizable.

@@ -42,6 +42,12 @@ fn send(note: &Value) -> bool {
     s.write_all(format!("{note}\n").as_bytes()).is_ok()
 }
 
+/// Tira os cartoes sobre o pane (o usuario ja foi ate ele). So se o processo
+/// dos cartoes estiver no ar: nunca abre um so para isso.
+pub fn dismiss_pane(pane: u64) {
+    if pane != 0 { let _ = send(&serde_json::json!({"dismiss": pane})); }
+}
+
 /// Tela cheia, jogo ou apresentacao: nao cobrir com um cartao.
 fn busy() -> bool {
     #[cfg(windows)]
@@ -101,6 +107,13 @@ impl App {
     }
 
     fn add(&mut self, v: Value) {
+        if let Some(pane) = v["dismiss"].as_u64() {
+            let mine: Vec<String> = ["approve", "deny", "focus"].iter().map(|k| format!("duck://{k}/{pane}")).collect();
+            let before = self.notes.len();
+            self.notes.retain(|n| !n.actions.iter().any(|(_, u)| mine.contains(u)));
+            if self.notes.len() != before { self.layout(); }
+            return;
+        }
         let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
         let actions = v["actions"].as_array().into_iter().flatten()
             .filter_map(|a| Some((a[0].as_str()?.to_string(), a[1].as_str()?.to_string()))).collect();

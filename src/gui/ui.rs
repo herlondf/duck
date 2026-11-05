@@ -22,6 +22,9 @@ pub(super) struct AgentPanel {
     pub pane: u64, pub name: String, pub profile: String, pub state: String,
     pub ctx: Option<u64>, pub session_tokens: Option<u64>, pub plan: Vec<(String, String)>, pub fetched: Instant,
     pub todo: Option<(u64, u64)>,
+    /// Arquivos mexidos na pasta do agente: (status, caminho, +, -) e a pasta.
+    pub files: Vec<(String, String, i64, i64)>,
+    pub cwd: String,
 }
 
 pub(super) struct Composer {
@@ -181,13 +184,14 @@ impl Gui {
 
     pub(super) fn chrome(&self) -> Chrome {
         let ch = self.r.as_ref().map(|r| r.cell_h).unwrap_or(16.0);
-        let bar_h = (ch + 16.0).max(32.0).round();
-        let margin = if self.cfg.ui.cards { 8.0 } else { self.cfg.padding };
+        let compact = self.cfg.ui.density == "compact";
+        let bar_h = if compact { (ch + 8.0).max(26.0).round() } else { (ch + 16.0).max(32.0).round() };
+        let margin = if compact { if self.cfg.ui.cards { 3.0 } else { self.cfg.padding.min(2.0) } } else if self.cfg.ui.cards { 8.0 } else { self.cfg.padding };
         if self.focus_mode { return Chrome { top: 0.0, bottom: 0.0, left: 0.0, right: 0.0, bar_h, margin, tabs_h: 0.0, foot_h: 0.0, keys_h: 0.0 }; }
         let tb = self.cfg.tab_bar.as_str();
         let tabs_h = if tb == "bottom" { bar_h } else { 0.0 };
-        let foot_h = if self.cfg.ui.footer && !self.quick { (ch + 10.0).max(28.0).round() } else { 0.0 };
-        let keys_h = if self.cfg.ui.shortcuts && !self.quick && !self.shortcuts.is_empty() { (ch * 0.8 + 10.0).max(22.0).round() } else { 0.0 };
+        let foot_h = if self.cfg.ui.footer && !self.quick { if compact { (ch + 4.0).max(22.0).round() } else { (ch + 10.0).max(28.0).round() } } else { 0.0 };
+        let keys_h = if self.cfg.ui.shortcuts && !self.quick && !self.shortcuts.is_empty() { if compact { (ch * 0.8 + 4.0).max(18.0).round() } else { (ch * 0.8 + 10.0).max(22.0).round() } } else { 0.0 };
         Chrome {
             top: if tb == "top" || self.custom_titlebar() { bar_h } else { 0.0 },
             bottom: tabs_h + foot_h + keys_h, tabs_h, foot_h, keys_h,
@@ -216,6 +220,28 @@ impl Gui {
         let rows = ((r.height() - c.top - c.bottom - 2.0 * c.margin) / r.cell_h).floor().max(2.0) as u64;
         self.origin = self.grid_origin();
         self.cmd(json!({"cmd": "resize", "cols": cols, "rows": rows}));
+    }
+
+    /// Pane sob o ponto (em pixels), incluindo a linha do cabecalho.
+    fn pane_at_px(&self, x: f32, y: f32) -> Option<u64> {
+        let r = self.r.as_ref()?;
+        let (ox, oy) = self.origin;
+        self.frame.panes.iter().rev().find(|p| {
+            let hdr = if p.header { r.cell_h } else { 0.0 };
+            let (px, py) = (ox + p.x as f32 * r.cell_w, oy + p.y as f32 * r.cell_h);
+            inside([px, py - hdr, p.w as f32 * r.cell_w, p.h as f32 * r.cell_h + hdr], (x, y))
+        }).map(|p| p.id)
+    }
+
+    /// Pane cujo cabecalho esta sob o ponto (com mais de um pane na aba).
+    fn header_at(&self, x: f32, y: f32) -> Option<u64> {
+        let r = self.r.as_ref()?;
+        let (ox, oy) = self.origin;
+        if self.frame.panes.iter().filter(|p| !p.floating).count() < 2 { return None; }
+        self.frame.panes.iter().filter(|p| p.header && !p.floating).find(|p| {
+            let (px, py) = (ox + p.x as f32 * r.cell_w, oy + p.y as f32 * r.cell_h);
+            inside([px, py - r.cell_h, p.w as f32 * r.cell_w, r.cell_h], (x, y))
+        }).map(|p| p.id)
     }
 
     fn tab_at(&self, x: f32, y: f32) -> Option<usize> {
@@ -310,8 +336,9 @@ impl Gui {
             if ext_badges.iter().any(|b| b.0.starts_with(&format!("{}/", v.ext))) { continue; }
             let label = self.exts.label(&v.ext);
             let sts: Vec<&super::ext::ExtStatus> = self.exts.status.iter().filter(|s| s.ext == v.ext).collect();
-            // O status abre a visao dele; sem status, a 1a visao.
-            let key = sts.first().filter(|s| !s.view.is_empty()).map(|s| format!("{}/{}", s.ext, s.view)).unwrap_or_else(|| v.key());
+            // O status abre a visao dele (ou roda o comando dele: "entrar na reuniao"); sem status, a 1a visao.
+            let key = sts.iter().find(|s| !s.command.is_empty()).map(|s| format!("{}/!{}", s.ext, s.command))
+                .or_else(|| sts.first().filter(|s| !s.view.is_empty()).map(|s| format!("{}/{}", s.ext, s.view))).unwrap_or_else(|| v.key());
             // Tira o glifo do inicio ("⌂ 57" -> "57"): o icone ja esta no badge.
             let chips = sts.iter().map(|s| {
                 let t = s.text.trim();
@@ -341,6 +368,7 @@ impl Gui {
         let mut pulse = false;
         self.hits.clear();
         self.tab_rects.clear();
+        let drag_target = self.pane_drag.filter(|d| d.2).and_then(|(src, _, _)| self.pane_at_px(mouse.0, mouse.1).filter(|t| *t != src));
         let r = self.r.as_mut().unwrap();
         let maximized = r.window.is_maximized();
         let (cw, ch) = (r.cell_w, r.cell_h);
@@ -366,7 +394,7 @@ impl Gui {
         // ---- panes
         let active = self.frame.active_pane;
         let multi = self.frame.panes.iter().filter(|p| !p.floating).count() > 1;
-        let has_float = self.frame.panes.iter().any(|q| q.floating);
+        let has_float = self.frame.panes.iter().any(|q| q.floating && !q.pip);
         let glow_c = tab_labels.iter().find(|t| t.1.active).and_then(|t| t.2).unwrap_or(theme.accent);
         let pix = (cw * 0.5 - 3.0).clamp(1.0, 6.0);
         let piy = (ch * 0.5 - 3.0).clamp(1.0, 6.0);
@@ -738,6 +766,33 @@ impl Gui {
                 pill(&mut over, r, px + pw - lw - 12.0, py + if self.pinned.contains_key(&p.id) { 0.0 } else { 2.0 }, &label, theme.accent, theme.bg);
             }
             if p.private { pill(&mut over, r, px + 4.0, py, "privado", theme.working, theme.bg); }
+            if p.pip { pill(&mut over, r, px + 4.0, py, "PiP · clique volta para a aba", theme.accent, theme.bg); }
+            if p.revealed { pill(&mut over, r, px + 4.0, py + ch, "segredos visiveis", theme.blocked, theme.bg); }
+            // Rolagem pausada: botao para voltar ao fim, com as linhas que chegaram.
+            if p.scroll > 0 && !p.alt_screen {
+                let new = self.scroll_base.get(&p.id).map(|b| (p.history - b).max(0)).unwrap_or(0);
+                let label = if new > 0 { format!("↓ {new} linha(s) nova(s)") } else { format!("↓ voltar ao fim ({} abaixo)", p.scroll) };
+                let lw = r.measure(&label, true, 0.8) + 14.0;
+                let bx = px + (pw - lw) / 2.0;
+                let by = py + ph - ch - 4.0;
+                let hv = inside([bx, by, lw, ch], mouse);
+                over.shapes.push(Shape::shadow(bx, by + 2.0, lw, ch - 4.0, [0.0, 0.0, 0.0, 0.35], (ch - 4.0) / 2.0, 6.0));
+                pill(&mut over, r, bx, by, &label, if new > 0 { theme.accent } else if hv { mix(theme.tab_active, theme.fg, 0.2) } else { theme.tab_active }, if new > 0 { theme.bg } else { theme.fg });
+                self.hits.push(Hit { r: [bx, by, lw, ch], action: Action::Builtin("scroll_bottom".into(), vec![json!(p.id)]) });
+            }
+        }
+        // Arrastando o cabecalho de um pane: o alvo acende.
+        {
+            if let Some(t) = drag_target {
+                if let Some(p) = self.frame.panes.iter().find(|p| p.id == t) {
+                    let (px, py, pw, ph) = (ox + p.x as f32 * cw, oy + p.y as f32 * ch, p.w as f32 * cw, p.h as f32 * ch);
+                    over.shapes.push(Shape::rect(px, py, pw, ph, lin(theme.accent, 0.14), rad));
+                    over.shapes.push(Shape::ring(px, py, pw, ph, lin(theme.accent, 0.9), rad, 2.0));
+                    let label = "soltar aqui troca os dois panes de lugar";
+                    let lw = r.measure(label, true, 0.85);
+                    over.texts.push(uit(px + (pw - lw) / 2.0, py + (ph - ch) / 2.0, label, theme.fg, 0.85));
+                }
+            }
         }
         // Divisor sob o mouse (ou sendo arrastado) engrossa.
         let div = self.div_drag.map(|(id, v, _)| (id, v)).or_else(|| if mouse.1 > chrome.top { None } else { None });
@@ -802,7 +857,7 @@ impl Gui {
 
         // ---- barra de titulo: inicio, abas, sino e botoes da janela
         let bar_h = chrome.bar_h;
-        let ctx = TabCtx { theme: &theme, mouse, t: t_now, drag: self.tab_drag };
+        let ctx = TabCtx { theme: &theme, mouse, t: t_now, drag: self.tab_drag, ui: &ui, wsl: &wsl };
         if chrome.top > 0.0 {
             base.shapes.push(Shape::rect(0.0, 0.0, w, chrome.top, lin(theme.tab_bar, alpha), 0.0));
             let mut x = 8.0;
@@ -938,9 +993,10 @@ impl Gui {
                     base.texts.push(uit(bx + 5.0, cy(cs), t, c, cs));
                     bx += cwid + 4.0;
                 }
-                let action = match key.strip_prefix("duck:") {
-                    Some(a) => Action::Builtin(a.into(), vec![]),
-                    None => Action::Builtin("ext_view".into(), vec![json!(key)]),
+                let action = match (key.strip_prefix("duck:"), key.split_once("/!")) {
+                    (Some(a), _) => Action::Builtin(a.into(), vec![]),
+                    (None, Some((ext, cmd))) => Action::Builtin("ext_command".into(), vec![json!(ext), json!(cmd)]),
+                    (None, None) => Action::Builtin("ext_view".into(), vec![json!(key)]),
                 };
                 if dragging.as_deref() == Some(badge_name(key)) {
                     base.shapes.push(Shape::ring(br[0], br[1], br[2], br[3], lin(theme.accent, 1.0), ph / 2.0, 1.5));
@@ -998,7 +1054,22 @@ impl Gui {
         if let (Some((idx, lines)), Some((_, _, _))) = (&self.tab_preview, self.tab_hover.map(|t| (t.0, 0, 0))) {
             if let Some((a, b, _)) = self.tab_rects.iter().find(|t| t.2 == *idx).copied() {
                 let pwid = (cw * 0.75 * 64.0).min(w - 20.0);
-                let phei = ch * 0.75 * lines.len().max(1) as f32 + 34.0;
+                let ti = tab_labels.iter().find(|t| t.1.index == *idx).map(|t| t.1.clone()).unwrap_or_default();
+                // Contexto do agente no topo: o que voce pediu, o passo atual, o que mudou.
+                let mut head: Vec<(String, Rgb)> = Vec::new();
+                if let Some(p) = &ti.prompt {
+                    let max = ((pwid - 24.0) / (r.cell_w * 0.8)).max(20.0) as usize;
+                    let chars: Vec<char> = format!("Pedido: {p}").chars().collect();
+                    for (k, part) in chars.chunks(max).take(3).enumerate() {
+                        let mut s: String = part.iter().collect();
+                        if k == 2 && chars.len() > max * 3 { s.push('…'); }
+                        head.push((s, theme.fg));
+                    }
+                }
+                if let Some(s) = &ti.step { head.push((format!("▶ {s}"), theme.accent)); }
+                if let Some((n, a, d)) = ti.changes { head.push((format!("{n} arquivo(s) mexido(s)  +{a} −{d}"), theme.muted)); }
+                let hh = if head.is_empty() { 0.0 } else { ch * 0.8 * head.len() as f32 + 10.0 };
+                let phei = ch * 0.75 * lines.len().max(1) as f32 + 34.0 + hh;
                 let px = ((a + b) / 2.0 - pwid / 2.0).clamp(8.0, w - pwid - 8.0);
                 let py = if self.tab_row.0 < h / 2.0 { self.tab_row.0 + self.tab_row.1 + 4.0 } else { self.tab_row.0 - phei - 4.0 };
                 modal.shapes.push(Shape::shadow(px, py + 4.0, pwid, phei, [0.0, 0.0, 0.0, 0.5], 10.0, 12.0));
@@ -1006,8 +1077,12 @@ impl Gui {
                 modal.shapes.push(Shape::ring(px, py, pwid, phei, lin(theme.border, 1.0), 10.0, 1.0));
                 let title = tab_labels.iter().find(|t| t.1.index == *idx).map(|t| t.0.clone()).unwrap_or_default();
                 modal.texts.push(TextItem { bold: true, clip_right: Some(px + pwid - 10.0), ..uit(px + 12.0, py + 6.0, &title, theme.fg, 0.85) });
+                for (k, (l, c)) in head.iter().enumerate() {
+                    modal.texts.push(TextItem { clip_right: Some(px + pwid - 10.0), ..uit(px + 12.0, py + 26.0 + ch * 0.8 * k as f32, l, *c, 0.8) });
+                }
+                if hh > 0.0 { modal.quads.push(Quad { x: px + 10.0, y: py + 22.0 + hh, w: pwid - 20.0, h: 1.0, color: lin(theme.border, 0.8) }); }
                 for (k, l) in lines.iter().enumerate() {
-                    modal.texts.push(TextItem { size: 0.75, clip_right: Some(px + pwid - 10.0), ..txt(px + 12.0, py + 26.0 + ch * 0.75 * k as f32, l, theme.fg) });
+                    modal.texts.push(TextItem { size: 0.75, clip_right: Some(px + pwid - 10.0), ..txt(px + 12.0, py + 26.0 + hh + ch * 0.75 * k as f32, l, theme.fg) });
                 }
             }
         }
@@ -1074,6 +1149,8 @@ impl Gui {
                         let fg = if t.active { theme.fg } else { theme.muted };
                         let (name, sub) = split_subtitle(label);
                         let clip = rr[0] + rr[2] - 34.0;
+                        if t.pinned { base.texts.push(TextItem { alpha: 0.7, ..uit(clip - 14.0, y + (row_h - ch * 0.7) / 2.0, "\u{f08d}", theme.muted, 0.7) }); }
+                        let clip = if t.pinned { clip - 16.0 } else { clip };
                         base.texts.push(TextItem { clip_right: Some(clip), ..uit(tx, y + (row_h - ch * 0.9) / 2.0, name, fg, 0.9) });
                         let sx = tx + r.measure(name, true, 0.9) + 6.0;
                         if !sub.is_empty() && sx < clip {
@@ -1091,7 +1168,7 @@ impl Gui {
                         }
                     }
                     self.hits.push(Hit { r: rr, action: Action::Builtin("tab".into(), vec![json!(t.index)]) });
-                    if hv && !collapsed {
+                    if hv && !collapsed && !t.pinned {
                         let cr = [rr[0] + rr[2] - 20.0, y + (row_h - 16.0) / 2.0, 16.0, 16.0];
                         base.texts.push(uit(cr[0] + 3.0, y + (row_h - ch * 0.7) / 2.0, "✕", if inside(cr, mouse) { theme.fg } else { theme.muted }, 0.7));
                         self.hits.push(Hit { r: cr, action: Action::Builtin("close_tab_idx".into(), vec![json!(t.index)]) });
@@ -1160,7 +1237,33 @@ impl Gui {
                 base.texts.push(TextItem { clip_right: Some(x0 + pw - 12.0), ..uit(x0 + 36.0, y, subject, if st == "completed" { theme.muted } else { theme.fg }, 0.85) });
                 y += ch * 1.25;
             }
-            if ap.plan.is_empty() { base.texts.push(uit(x0 + 16.0, y, if total > 0 { "Itens do plano nao encontrados no transcript" } else { "Sem plano (TaskCreate/TodoWrite) nesta sessao" }, theme.muted, 0.8)); }
+            if ap.plan.is_empty() { base.texts.push(uit(x0 + 16.0, y, if total > 0 { "Itens do plano nao encontrados no transcript" } else { "Sem plano (TaskCreate/TodoWrite) nesta sessao" }, theme.muted, 0.8)); y += ch * 1.25; }
+            // Arquivos mexidos no repo do agente (git), maiores mudancas primeiro.
+            if !ap.files.is_empty() && y < bottom_buttons - ch * 3.0 {
+                y += 10.0;
+                let (ta, td) = ap.files.iter().fold((0, 0), |s, f| (s.0 + f.2, s.1 + f.3));
+                base.texts.push(TextItem { bold: true, ..uit(x0 + 16.0, y, &format!("Arquivos mexidos  {}", ap.files.len()), theme.fg, 0.9) });
+                let tot = format!("+{ta} −{td}");
+                let tw = r.measure(&tot, true, 0.8);
+                base.texts.push(uit(x0 + pw - 16.0 - tw, y + 1.0, &tot, theme.muted, 0.8));
+                y += ch * 1.3;
+                for (st, path, a, d) in &ap.files {
+                    if y > bottom_buttons - ch * 1.3 { break; }
+                    let rr = [x0 + 8.0, y - 2.0, pw - 16.0, ch * 1.15];
+                    if inside(rr, mouse) { base.shapes.push(Shape::rect(rr[0], rr[1], rr[2], rr[3], lin(mix(theme.tab_bar, theme.fg, 0.08), 1.0), 5.0)); }
+                    let sc = match st.as_str() { "??" | "A" => theme.done, "D" => theme.blocked, _ => theme.working };
+                    base.texts.push(uit(x0 + 16.0, y, if st == "??" { "+" } else { st }, sc, 0.8));
+                    let nums = format!("+{a} −{d}");
+                    let nw = r.measure(&nums, true, 0.75);
+                    base.texts.push(uit(x0 + pw - 16.0 - nw, y + 1.0, &nums, theme.muted, 0.75));
+                    // Caminho longo: mostra o fim (o nome do arquivo).
+                    let shown = if path.chars().count() > 46 { format!("…{}", path.chars().rev().take(45).collect::<Vec<_>>().into_iter().rev().collect::<String>()) } else { path.clone() };
+                    base.texts.push(TextItem { clip_right: Some(x0 + pw - 24.0 - nw), ..uit(x0 + 36.0, y, &shown, theme.fg, 0.8) });
+                    let full = std::path::Path::new(&ap.cwd).join(path).to_string_lossy().to_string();
+                    self.hits.push(Hit { r: rr, action: Action::Builtin("preview_file".into(), vec![json!(full)]) });
+                    y += ch * 1.15;
+                }
+            }
             let mut bx = x0 + 12.0;
             for (label, act, args) in [("Linha do tempo", "agent_timeline", vec![]), ("Recado", "queue_message", vec![json!(ap.pane)]), ("Diff", "agent_diff", vec![])] {
                 let bw = r.measure(label, true, 0.8) + 18.0;
@@ -1502,6 +1605,7 @@ impl Gui {
                 match button {
                     MouseButton::Left => { self.cmd(json!({"cmd": "tab", "index": idx})); self.tab_drag = Some((idx, x, false)); }
                     MouseButton::Middle => self.close_tab_asking(idx),
+                    MouseButton::Right => self.builtin("tab_menu", &[json!(idx)]),
                     _ => {}
                 }
                 self.redraw();
@@ -1522,6 +1626,14 @@ impl Gui {
                 return;
             }
             if self.div_drag.take().is_some() { self.redraw(); return; }
+            if let Some((src, _, moved)) = self.pane_drag.take() {
+                match self.pane_at_px(x, y).filter(|t| *t != src) {
+                    Some(t) if moved => if let Err(e) = self.call(json!({"cmd": "swap-panes", "pane": src, "other": t})) { self.flash(&e) },
+                    _ => if !moved { self.cmd(json!({"cmd": "focus", "pane": src})) },
+                }
+                self.redraw();
+                return;
+            }
             if std::mem::take(&mut self.ext_drag) {
                 let _ = set_local_setting("ext_panel_width", &format!("{}", self.ext_w.round()));
                 self.send_size();
@@ -1546,6 +1658,10 @@ impl Gui {
         if pressed && button == MouseButton::Left {
             if let Some((pane, vertical)) = self.divider_at(x, y) {
                 self.div_drag = Some((pane, vertical, if vertical { x } else { y }));
+                return;
+            }
+            if let Some(pane) = self.header_at(x, y) {
+                self.pane_drag = Some((pane, (x, y), false));
                 return;
             }
         }
@@ -1656,6 +1772,11 @@ impl Gui {
         }
         if let Some((idx, x0, moved)) = self.tab_drag {
             if !moved && (x - x0).abs() > 8.0 { self.tab_drag = Some((idx, x0, true)); }
+            self.redraw();
+            return;
+        }
+        if let Some((id, p0, moved)) = self.pane_drag {
+            if !moved && ((x - p0.0).abs() > 6.0 || (y - p0.1).abs() > 6.0) { self.pane_drag = Some((id, p0, true)); }
             self.redraw();
             return;
         }
@@ -1961,8 +2082,12 @@ impl Gui {
     /// Fechar aba pelo ✕ ou clique do meio: com agente, pergunta antes.
     pub(super) fn close_tab_asking(&mut self, idx: usize) {
         let Some(t) = self.frame.tabs.iter().find(|t| t.index == idx).cloned() else { return };
-        if t.profile.is_empty() && t.state.is_empty() { return self.cmd(json!({"cmd": "close-tab", "index": idx})); }
         let title = if t.title.is_empty() { t.pane_title.clone() } else { t.title.clone() };
+        if t.pinned && t.profile.is_empty() && t.state.is_empty() {
+            let items = vec![Item::new("Cancelar", "Esc", "", vec![]), Item::new("Fechar a aba fixada", "", "close_tab_now", vec![json!(idx)])];
+            return self.overlay = Some(Overlay::dialog(&format!("A aba \"{title}\" esta fixada. Fechar mesmo assim? (Ctrl+Alt+T reabre)"), items));
+        }
+        if t.profile.is_empty() && t.state.is_empty() { return self.cmd(json!({"cmd": "close-tab", "index": idx})); }
         let items = vec![
             Item::new("Cancelar", "Esc", "", vec![]),
             Item::new("Fechar e encerrar o agente", "", "close_tab_now", vec![json!(idx)]),
@@ -1975,6 +2100,12 @@ impl Gui {
         match o.kind {
             OverlayKind::List => if let Some(&i) = o.shown.get(o.sel) {
                 let it = o.items[i].clone();
+                if o.palette {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    let e = self.palette_rank.entry(it.label.clone()).or_insert((0, 0));
+                    *e = (now, e.1 + 1);
+                    super::save_palette_rank(&self.palette_rank);
+                }
                 if o.palette && is_shortcut(&it.hint) {
                     if let Action::Builtin(n, _) = &it.action {
                         let c = self.usage.entry(n.clone()).or_insert(0);
@@ -2090,7 +2221,10 @@ impl Gui {
             let b = dir.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("").trim_start_matches(".claude").trim_start_matches(['-', '_']).to_string();
             if b.is_empty() { "pessoal".into() } else { b }
         };
+        let ch = self.call(json!({"cmd": "changes", "pane": pane})).unwrap_or_default();
+        let files = ch["list"].as_array().into_iter().flatten().filter_map(|f| Some((f[0].as_str()?.to_string(), f[1].as_str()?.to_string(), f[2].as_i64().unwrap_or(0), f[3].as_i64().unwrap_or(0)))).collect();
         self.agent_panel = Some(AgentPanel {
+            files, cwd: ch["cwd"].as_str().unwrap_or("").to_string(),
             pane, name: a["name"].as_str().unwrap_or("agente").to_string(), profile,
             state: a["state"].as_str().unwrap_or("").to_string(), ctx: a["context_tokens"].as_u64(),
             session_tokens: a["session_tokens"].as_u64(), plan, fetched: Instant::now(),
@@ -2709,7 +2843,7 @@ impl Gui {
 }
 
 /// Contexto comum para desenhar abas.
-struct TabCtx<'a> { theme: &'a Theme, mouse: (f32, f32), t: f32, drag: Option<(usize, f32, bool)> }
+struct TabCtx<'a> { theme: &'a Theme, mouse: (f32, f32), t: f32, drag: Option<(usize, f32, bool)>, ui: &'a config::Ui, wsl: &'a HashSet<String> }
 
 fn state_glyph(theme: &Theme, t: &TabInfo, now: f32) -> (&'static str, Rgb, f32) {
     match t.state.as_str() {
@@ -2743,19 +2877,60 @@ fn tabs_row(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, rects: &mut Ve
     let pill_h = bar_h - 10.0;
     let ty = y + 5.0;
     let size = 0.9;
-    let n = labels.len().max(1) as f32;
-    // Muitas abas: cada uma encolhe ate caber.
-    let max_w = ((x_max - x0 - 34.0) / n - 4.0).clamp(84.0, 240.0);
+    // Muitas abas: cada uma encolhe ate caber (as fixadas tem largura fixa).
+    let n = labels.iter().filter(|l| !l.1.pinned).count().max(1) as f32;
+    let pinned_w = labels.iter().filter(|l| l.1.pinned).count() as f32 * 40.0;
+    let max_w = ((x_max - x0 - 34.0 - pinned_w) / n - 4.0).clamp(84.0, 240.0);
+    let mut was_pinned = false;
     for (label, t, color) in labels {
         if x > x_max - 40.0 { break; }
+        if was_pinned && !t.pinned { x += 6.0; } // respiro entre as fixadas e as outras
+        was_pinned = t.pinned;
+        if t.pinned {
+            // Fixada: so o icone (avatar do agente ou do shell) e o estado.
+            let tw = 36.0;
+            let rect = [x, ty, tw, pill_h];
+            let hover = inside(rect, c.mouse) && c.drag.is_none();
+            let bg = match (t.active, hover, color) {
+                (true, _, Some(cc)) => mix(theme.tab_active, *cc, 0.30),
+                (true, _, None) => theme.tab_active,
+                (false, true, _) => mix(theme.tab_bar, theme.fg, 0.07),
+                (false, false, Some(cc)) => mix(theme.tab_bar, *cc, 0.14),
+                _ => theme.tab_bar,
+            };
+            if t.active { l.shapes.push(Shape::shadow(x, ty + 1.5, tw, pill_h, [0.0, 0.0, 0.0, 0.30], 8.0, 4.0)); }
+            if t.active || hover || color.is_some() { l.shapes.push(Shape::rect(x, ty, tw, pill_h, lin(bg, 1.0), 8.0)); }
+            if t.attention && !t.active { l.shapes.push(Shape::ring(x, ty, tw, pill_h, lin(theme.blocked, 0.8), 8.0, 1.2)); }
+            let cy = ty + pill_h / 2.0;
+            if !t.profile.is_empty() { draw_avatar(r, l, x + (tw - 16.0) / 2.0, cy - 8.0, 16.0, avatar_color(theme, c.ui, &t.profile), &t.profile); }
+            else {
+                let g = pane_icon(&t.domain, c.wsl.contains(&t.domain));
+                let gw = r.measure(g, true, 0.85);
+                l.texts.push(uit(x + (tw - gw) / 2.0, cy - ch * 0.85 / 2.0, g, if t.active { theme.accent } else { theme.muted }, 0.85));
+            }
+            let (g, gc, a) = state_glyph(theme, t, c.t);
+            if !g.is_empty() {
+                if t.state == "working" { pulse = true; }
+                l.shapes.push(Shape::rect(x + tw - 9.0, ty + 4.0, 6.0, 6.0, lin(gc, a), 3.0));
+            }
+            if let Some((_, f)) = tab_progress(t) {
+                l.shapes.push(Shape::rect(x + 6.0, ty + pill_h - 4.0, (tw - 12.0) * f.clamp(0.0, 1.0), 2.5, lin(theme.done, 1.0), 1.25));
+            }
+            let _ = label;
+            rects.push((x, x + tw, t.index));
+            x += tw + 4.0;
+            continue;
+        }
         let ind = !state_glyph(theme, t, c.t).0.is_empty();
         let (name, sub) = split_subtitle(label);
+        let chg = t.changes.map(|(n, _, _)| format!("{n}±")).unwrap_or_default();
+        let chg_w = if chg.is_empty() { 0.0 } else { r.measure(&chg, true, 0.72) + 6.0 };
         let sub_gap = if sub.is_empty() { 0.0 } else { 6.0 };
         let name_w = r.measure(name, true, size);
         let text_w = name_w + sub_gap + if sub.is_empty() { 0.0 } else { r.measure(sub, true, size * 0.9) };
         // Espaco fixo do ✕: nunca por cima do titulo ou do icone de estado.
         let close_w = 26.0;
-        let tw = (14.0 + text_w + if ind { 16.0 } else { 0.0 } + close_w).clamp(72.0, max_w);
+        let tw = (14.0 + text_w + chg_w + if ind { 16.0 } else { 0.0 } + close_w).clamp(72.0, max_w);
         let rect = [x, ty, tw, pill_h];
         let hover = inside(rect, c.mouse) && c.drag.is_none();
         let dragging = c.drag.is_some_and(|d| d.0 == t.index && d.2);
@@ -2771,7 +2946,8 @@ fn tabs_row(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, rects: &mut Ve
         if t.attention && !t.active { l.shapes.push(Shape::ring(x, ty, tw, pill_h, lin(theme.blocked, 0.8), 8.0, 1.2)); }
         let cy = ty + pill_h / 2.0;
         let fg = if t.active { theme.fg } else if hover { mix(theme.fg, theme.muted, 0.3) } else { theme.muted };
-        let text_right = x + tw - close_w - if ind { 16.0 } else { 0.0 };
+        let text_right = x + tw - close_w - if ind { 16.0 } else { 0.0 } - chg_w;
+        if chg_w > 0.0 { l.texts.push(uit(text_right + 3.0, cy - ch * 0.72 / 2.0, &chg, theme.working, 0.72)); }
         l.texts.push(TextItem { clip_right: Some(text_right), ..uit(x + 12.0, cy - ch * size / 2.0, name, fg, size) });
         if !sub.is_empty() && x + 12.0 + name_w + sub_gap < text_right {
             let ss = size * 0.9;
@@ -2780,7 +2956,7 @@ fn tabs_row(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, rects: &mut Ve
         if ind {
             let (g, gc, a) = state_glyph(theme, t, c.t);
             if t.state == "working" { pulse = true; }
-            l.texts.push(TextItem { alpha: a, ..uit(text_right + 2.0, cy - ch * 0.8 / 2.0, g, gc, 0.8) });
+            l.texts.push(TextItem { alpha: a, ..uit(text_right + chg_w + 2.0, cy - ch * 0.8 / 2.0, g, gc, 0.8) });
         }
         if let Some((s, f)) = tab_progress(t) {
             let (px, pw) = (x + 10.0, tw - 20.0);

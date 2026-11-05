@@ -79,6 +79,14 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
 | `Ctrl+Shift+B` | Broadcast: digitar em todos os panes da aba |
 | `Ctrl+Shift+L` | Pane privado (fora do autosave e da leitura por agentes) |
 | `Ctrl+Shift+T`, `Ctrl+Tab` | Nova aba, próxima aba |
+| `Alt+Q` | Volta para a aba anterior (alterna entre as duas últimas, de qualquer workspace) |
+| `Ctrl+Alt+T` | Reabre a última aba fechada: pasta, splits e, se tinha agente, retoma a sessão |
+| `Ctrl+Alt+P` | Fixa/solta a aba (fica à esquerda, só o ícone, e pede confirmação para fechar) |
+| `Ctrl+Alt+A` | Vai para o agente que pede aprovação (de novo: o próximo; fecha o aviso do canto) |
+| `Ctrl+Alt+F` | PiP: o pane aparece pequeno no canto das outras abas (clique volta para ele) |
+| `Alt+Shift+←↑→↓` | Troca o pane de lugar com o vizinho (ou arraste o cabeçalho sobre outro pane) |
+| `Ctrl+Alt+K` | Densidade compacta / confortável |
+| Clique direito na aba | Menu da aba: fixar, renomear, cor, mover, fechar, reabrir a última fechada |
 | `Ctrl+Shift+S` | Trocar de workspace (inclui as pastas do zoxide) |
 | `Ctrl+Alt+N` | Criar/ir para workspace |
 | `Ctrl+Alt+S` / `R` / `D` | Salvar / restaurar / apagar estado de workspace |
@@ -101,6 +109,11 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
   bordas redimensionam.
 - **Rodape:** o status da config (funcao `status`) e um badge por extensao (sistema, agentes, Azure, Jira...).
   Clique abre o painel; arrastar reordena. `ui = { footer = false }` esconde.
+  A Agenda mostra a próxima reunião com contagem regressiva; faltando 10 min
+  (`join_minutes`) e com link, o clique no badge entra direto na reunião.
+- **Revisões pendentes:** paleta → "Extensões: revisões pendentes" junta os
+  PRs que esperam sua revisão no GitHub e no Azure numa lista só, o que espera
+  há mais tempo primeiro; Enter abre o PR.
 - **Barra de atalhos:** abaixo do rodape, os atalhos principais com as teclas
   (clique tambem funciona). Troque a lista em `shortcuts` e esconda com
   `ui = { shortcuts = false }`. Os menus por assunto (`Ctrl+Shift+1..4`) sao a
@@ -135,6 +148,13 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
   de exit e duracao. No hover: copiar a saida, re-executar, recolher, mandar
   ao agente e fixar no topo do pane. Saida com mais de 300 linhas nasce
   recolhida.
+- **Abas fixadas:** `Ctrl+Alt+P` ou clique direito → "Fixar". Ficam à
+  esquerda, só com o ícone (avatar do agente ou do shell) e o estado, sem o ✕;
+  fechar pede confirmação. A ordem fixadas/soltas se mantém ao arrastar.
+- **Rolagem pausada:** rolou para cima e o comando continua escrevendo? A tela
+  fica parada e aparece o botão "↓ 120 linhas novas"; o clique volta ao fim.
+- **Paleta:** com a busca vazia, os 6 comandos usados por último vêm primeiro;
+  na busca, os mais usados desempatam (fica em `palette.json`).
 - **Minimapa:** a barra de rolagem mostra cada comando (verde ok, vermelho
   falhou) e as ocorrencias da busca; clique pula para o ponto.
 - **Agentes:** painel lateral (`Ctrl+Shift+I`) com plano, tokens e custo;
@@ -200,6 +220,19 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
   a linha, e "Enviar" manda todos os comentários juntos ao agente.
 - **Colar print:** Ctrl+Shift+V com imagem no clipboard salva um PNG e cola o
   caminho; no WSL, o caminho vira `/mnt/c/...`.
+- **Prévia da aba:** parar o mouse sobre a aba de um agente mostra o último
+  pedido que você fez a ele, o passo do plano em andamento e quantos arquivos
+  ele mexeu (`+linhas −linhas`), antes do fim da tela. A aba ganha o selo `12±`.
+- **Arquivos mexidos:** o painel do agente (`Ctrl+Shift+I`) lista o que mudou
+  no repo dele (git, a cada 5 s), as maiores mudanças primeiro; o clique abre
+  a prévia do arquivo.
+- **Melhor de N:** paleta → "Agentes: melhor de N". A mesma tarefa vai para N
+  agentes (2 a 6), cada um numa worktree `<repo>-best-...` com porta própria,
+  lado a lado num workspace. Com um comando de verificação (`3 cargo test`),
+  cada um entra no loop até passar. "Agentes: comparar o melhor de N" mostra,
+  por candidato, o loop, o tamanho da mudança e o estado; Enter num deles
+  abre o diff, vai até o pane ou **escolhe**: commit do que ficou solto, merge
+  na branch base e remoção das outras worktrees e branches.
 - **Orçamento:** `token_budget` avisa (toast e barra) quando a soma de tokens
   das sessões passar do limite.
 
@@ -235,6 +268,9 @@ Para compilar, precisa do Rust (`winget install Rustlang.Rustup`) e do MSVC Buil
 | Auditoria | `%LOCALAPPDATA%\duck\audit.log`: tudo que agentes e scripts mandaram (a digitação da janela fica de fora). |
 | Segredos | Tokens, chaves e `senha=` viram `***` no autosave/checkpoint; pane privado não grava texto. |
 | Pipe | Primeira linha da conexão é um token que só o dono lê; outro usuário da máquina não manda texto para os seus shells. |
+| Segredo na tela | Token com formato conhecido (`ghp_`, `github_pat_`, `sk-`, `AKIA`, `xox`, JWT, PAT do Azure DevOps, chave privada...) vira bolinhas na tela e gera um aviso (uma vez por token). Também sai das gravações. Paleta → "Segredos: mostrar" revela por 30 s. `secret_mask = false` desliga. |
+| Leitura por agentes | O que um agente ou script lê de outro pane pela API (`read`, `last-output`, "corrigir com agente") chega com os segredos trocados por `***`. |
+| Guarda de commit/push | `duck guard install` (ou paleta → "Git: instalar a guarda") põe `pre-commit`, `commit-msg` e `pre-push` no repo: barra segredo e as palavras de `guard.words` (nomes de cliente, de projeto) no diff, nos nomes de arquivo e nas mensagens. Hook que já existia continua rodando depois. `duck guard scan --all` procura no histórico inteiro. Passar por cima: `--no-verify` ou `DUCK_GUARD=off`. |
 
 ## Agentes
 
@@ -249,10 +285,24 @@ duck cli last-failure --pane 7                      # último comando que falhou
 duck cli blocks --pane 7                            # todos os comandos do pane (texto, exit, duração)
 duck cli history --cwd D:/projetos/app --limit 20    # histórico (de todos os panes)
 duck cli queue --pane 7 --text "agora rode os testes"   # recado: entregue quando o agente parar
-duck fleet --agents 3 --cmd claude tarefas.txt      # fila: N agentes, uma tarefa por linha
+duck fleet --agents 3 --cmd claude tarefas.txt      # fila: N agentes, uma tarefa por linha (dependencias abaixo)
 duck run --cmd "npm test" --timeout 600             # sem janela (CI): imprime a saída, devolve o exit
 duck mcp                                            # servidor MCP (stdio): duck_list/spawn/send/read/wait/last_output
 ```
+
+**Fila com dependências (`duck fleet`):** cada linha do arquivo pode ter um
+id, dependências e uma verificação:
+
+```text
+[api]  check:"cargo test"  Criar o endpoint /faturas
+[tela] after:api           Ligar a tela no endpoint
+[docs] after:api,tela      Documentar
+```
+
+A tarefa só começa quando as de `after` passaram. Com `check`, o agente
+trabalha em loop até o comando passar (até 5 voltas); sem `check`, passou =
+o agente parou. Tarefa que depende de uma que falhou é pulada. No fim sai o
+resumo (passou / falhou / pulada) e o exit é 0 só se tudo passou.
 
 Para usar por MCP no Claude Code: `claude mcp add duck -- D:\Tools\Duck\bin\duck.exe mcp`.
 

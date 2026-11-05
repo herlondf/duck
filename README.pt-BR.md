@@ -34,6 +34,13 @@ fazendo.
 - **Blocos de comando.** Com a shell integration (OSC 133), cada comando vira
   um cartão com exit code e duração, botões de copiar, re-executar, recolher e
   fixar, e um minimapa que marca as falhas.
+- **Abas que não se perdem.** Aba fixada, reabrir a última fechada
+  (`Ctrl+Alt+T`, com a sessão do agente), voltar para a anterior (`Alt+Q`),
+  PiP de um pane no canto das outras abas e prévia com o último pedido feito
+  ao agente e os arquivos que ele mexeu.
+- **Segredos protegidos.** Token que aparece na tela vira bolinhas (e some das
+  gravações e do que vai para agentes); `duck guard install` barra segredo e
+  nome de cliente no commit e no push.
 - **Fácil de achar.** Menus por assunto (`Ctrl+Shift+1..4`: orquestração,
   extensões, janela, configuração) e uma barra com os atalhos principais;
   tudo personalizável.

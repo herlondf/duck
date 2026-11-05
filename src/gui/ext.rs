@@ -20,6 +20,8 @@ pub(super) struct ExtItem {
     #[serde(default)] pub badge: String,
     #[serde(default)] pub color: String,
     #[serde(default)] pub unread: bool,
+    /// Desde quando (epoch ms): ordena listas que juntam extensoes (revisoes).
+    #[serde(default)] pub ts: Option<f64>,
     #[serde(default)] pub actions: Vec<ExtAction>,
 }
 
@@ -39,7 +41,7 @@ pub(super) struct ExtView {
 impl ExtView { pub fn key(&self) -> String { format!("{}/{}", self.ext, self.id) } }
 
 #[derive(Clone, Default)]
-pub(super) struct ExtStatus { pub ext: String, pub id: String, pub text: String, pub color: String, pub view: String }
+pub(super) struct ExtStatus { pub ext: String, pub id: String, pub text: String, pub color: String, pub view: String, pub command: String }
 
 /// Extensao rodando no server (a lista vem dele na mensagem "running").
 #[derive(Deserialize, Clone, Default)]
@@ -177,7 +179,7 @@ impl Gui {
             }
             "status" => {
                 let id = s("id");
-                let st = ExtStatus { ext: ext.into(), id: id.clone(), text: s("text"), color: s("color"), view: s("view") };
+                let st = ExtStatus { ext: ext.into(), id: id.clone(), text: s("text"), color: s("color"), view: s("view"), command: s("command") };
                 match self.exts.status.iter_mut().find(|x| x.ext == ext && x.id == id) { Some(x) => *x = st, None => self.exts.status.push(st) }
                 self.exts.status.retain(|x| !x.text.is_empty());
             }
@@ -262,6 +264,7 @@ impl Gui {
                 self.stats.lock().unwrap().want_procs = self.sys_panel;
                 self.send_size();
             }
+            "reviews" => self.open_reviews(),
             "ext_action" => {
                 let view = self.ext_panel.as_deref().and_then(|k| k.split_once('/')).map(|x| x.1.to_string()).unwrap_or_default();
                 self.exts.send(&s(0), json!({"type": "action", "action": s(1), "item": s(2), "view": view}));
@@ -682,4 +685,31 @@ pub(super) fn draw_view(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, v:
     }
     // Altura total do conteudo (para limitar a rolagem).
     y + scroll - top
+}
+
+impl Gui {
+    /// Revisoes pendentes de todas as extensoes numa lista so (GitHub:
+    /// "Revisao pedida"; Azure: a visao de revisao), a mais antiga primeiro.
+    pub(super) fn open_reviews(&mut self) {
+        let mut found: Vec<(f64, Item)> = Vec::new();
+        for v in &self.exts.views {
+            let label = self.exts.label(&v.ext);
+            for sec in &v.sections {
+                let take = (v.ext == "github" && sec.title.contains("Revisao pedida")) || (v.ext == "azure" && v.id == "review");
+                if !take { continue; }
+                for it in &sec.items {
+                    let Some(a) = it.actions.iter().find(|a| a.primary).or(it.actions.first()) else { continue };
+                    let hint = format!("{label} · {}", it.subtitle);
+                    found.push((it.ts.unwrap_or(f64::MAX), Item::new(it.title.clone(), hint, "ext_action", vec![json!(v.ext), json!(a.id), json!(it.id)])));
+                }
+            }
+        }
+        if found.is_empty() {
+            let on: Vec<&str> = ["github", "azure"].into_iter().filter(|e| self.exts.views.iter().any(|v| v.ext == *e)).collect();
+            return self.flash(if on.is_empty() { "Ligue a extensao GitHub ou Azure para ver as revisoes pendentes" } else { "Nenhuma revisao esperando voce" });
+        }
+        found.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let n = found.len();
+        self.overlay = Some(Overlay::list(&format!("Revisoes pendentes ({n}): a que espera ha mais tempo primeiro"), found.into_iter().map(|x| x.1).collect()));
+    }
 }

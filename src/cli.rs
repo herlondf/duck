@@ -88,8 +88,16 @@ pub fn hook() -> i32 {
         "session": ev["session_id"], "cwd": ev["cwd"],
         "config_dir": std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_default(),
     });
+    if name == "UserPromptSubmit" {
+        if let Some(p) = ev["prompt"].as_str() { req["prompt"] = json!(p.chars().take(400).collect::<String>()); }
+    }
     if let Some(path) = ev["transcript_path"].as_str() {
         if let Some(t) = context_tokens(path) { req["context_tokens"] = json!(t); }
+        // Passo do plano em andamento (previa da aba).
+        if matches!(ev["tool_name"].as_str().unwrap_or(""), "TaskCreate" | "TaskUpdate" | "TodoWrite") {
+            let plan = transcript_plan(path);
+            req["step"] = plan.iter().find(|p| p.0 == "in_progress").map(|p| json!(p.1)).unwrap_or(Value::Null);
+        }
         // Plano do agente: so quando uma ferramenta de tarefas rodou (le o transcript inteiro).
         let tool = ev["tool_name"].as_str().unwrap_or("");
         if matches!(tool, "TaskCreate" | "TaskUpdate" | "TodoWrite") || name == "Stop" {
@@ -286,6 +294,14 @@ pub fn doctor() -> i32 {
         println!("{}shell integration bash/zsh{}", ok(has),
             if has { String::new() } else { format!("  (no ~/.bashrc ou ~/.zshrc ponha  . {})", script.display()) });
     }
+    let (cfg, _) = crate::config::load_config();
+    let here = std::env::current_dir().unwrap_or_default();
+    let repo = std::process::Command::new("git").arg("-C").arg(&here).args(["rev-parse", "--is-inside-work-tree"]).output().is_ok_and(|o| o.status.success());
+    if repo {
+        let on = crate::guard::installed(&here);
+        println!("{}guarda de commit/push neste repo{}", ok(on), if on { format!(" ({} palavra(s) proibida(s))", cfg.guard_words.len()) } else { "  (duck guard install)".into() });
+    }
+    println!("{}mascara de segredos na tela{}", ok(cfg.secret_mask), if cfg.secret_mask { "" } else { "  (secret_mask = false na config)" });
     doctor_extensions();
     0
 }
@@ -385,11 +401,76 @@ pub fn run_headless(args: &[String]) -> i32 {
 /// `duck fleet --agents 3 --cmd "claude" tarefas.txt`: abre N agentes em
 /// panes e distribui as tarefas (uma por linha); cada agente pega a proxima
 /// quando para (done/idle/blocked e avisado no painel).
+/// Tarefa do `duck fleet`. Linha do arquivo:
+///   [id] after:a,b check:"cargo test"  texto da tarefa
+/// Tudo opcional menos o texto: sem [id], o id e o numero da linha; `after`
+/// espera essas tarefas passarem; `check` poe o agente em loop ate o comando
+/// passar (sem check, passou = o agente parou).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FleetTask { pub id: String, pub text: String, pub after: Vec<String>, pub check: Option<String>, pub status: String, pub pane: u64 }
+
+pub fn parse_fleet_line(line: &str, n: usize) -> FleetTask {
+    let mut rest = line.trim();
+    let mut id = n.to_string();
+    if let Some(r) = rest.strip_prefix('[') {
+        if let Some((i, r2)) = r.split_once(']') { id = i.trim().to_string(); rest = r2; }
+    }
+    let (mut after, mut check) = (Vec::new(), None);
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix("after:") {
+            let (tok, r2) = r.split_once(char::is_whitespace).unwrap_or((r, ""));
+            after = tok.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            rest = r2;
+        } else if let Some(r) = rest.strip_prefix("check:") {
+            let (val, r2) = match r.chars().next() {
+                Some(q @ ('"' | '\'')) => match r[1..].split_once(q) { Some((v, r2)) => (v.to_string(), r2), None => (r[1..].to_string(), "") },
+                _ => { let (v, r2) = r.split_once(char::is_whitespace).unwrap_or((r, "")); (v.to_string(), r2) }
+            };
+            check = Some(val).filter(|v| !v.trim().is_empty());
+            rest = r2;
+        } else { break; }
+    }
+    FleetTask { id, text: rest.trim().to_string(), after, check, status: "pendente".into(), pane: 0 }
+}
+
+/// Proxima tarefa pronta (dependencias passaram). Tarefa que depende de uma
+/// que falhou (ou de um ciclo) e pulada. None + false = acabou tudo.
+fn fleet_next(tasks: &mut [FleetTask]) -> (Option<usize>, bool) {
+    loop {
+        let st = |id: &str, t: &[FleetTask]| t.iter().find(|x| x.id == id).map(|x| x.status.clone()).unwrap_or_default();
+        let mut changed = false;
+        for i in 0..tasks.len() {
+            if tasks[i].status != "pendente" { continue; }
+            if tasks[i].after.iter().any(|d| matches!(st(d, tasks).as_str(), "falhou" | "pulada")) {
+                tasks[i].status = "pulada".into();
+                changed = true;
+            }
+        }
+        if let Some(i) = tasks.iter().position(|t| t.status == "pendente" && t.after.iter().all(|d| st(d, tasks) == "passou")) {
+            return (Some(i), true);
+        }
+        let pending = tasks.iter().any(|t| t.status == "pendente");
+        let running = tasks.iter().any(|t| t.status == "rodando");
+        if pending && !running && !changed {
+            // Ninguem rodando e nada pronto: dependencia circular.
+            for t in tasks.iter_mut().filter(|t| t.status == "pendente") { t.status = "pulada".into(); }
+            continue;
+        }
+        if !changed { return (None, pending || running); }
+    }
+}
+
 pub fn fleet(args: &[String]) -> i32 {
     let a = parse_args("fleet", args);
     let file = args.iter().rev().find(|x| !x.starts_with("--") && std::path::Path::new(x).is_file());
-    let Some(file) = file else { eprintln!("uso: duck fleet [--agents 3] [--cmd claude] [--cwd D] tarefas.txt"); return 2 };
-    let tasks: Vec<String> = std::fs::read_to_string(file).unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+    let Some(file) = file else { eprintln!("uso: duck fleet [--agents 3] [--cmd claude] [--cwd D] tarefas.txt\n  linha: [id] after:a,b check:\"cargo test\"  texto da tarefa"); return 2 };
+    let tasks: Vec<FleetTask> = std::fs::read_to_string(file).unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .enumerate().map(|(i, l)| parse_fleet_line(l, i + 1)).collect();
+    for t in &tasks {
+        if let Some(d) = t.after.iter().find(|d| !tasks.iter().any(|x| &x.id == *d)) { eprintln!("tarefa [{}] depende de [{d}], que nao existe", t.id); return 2; }
+        if t.text.is_empty() { eprintln!("tarefa [{}] sem texto", t.id); return 2; }
+    }
     let n = a["agents"].as_u64().unwrap_or(2).max(1) as usize;
     let cmd = a["argv"].as_str().unwrap_or("claude").to_string();
     let mut c = match Conn::connect_or_spawn() { Ok(c) => c, Err(e) => { eprintln!("{e}"); return 1 } };
@@ -400,34 +481,82 @@ pub fn fleet(args: &[String]) -> i32 {
         if let Some(cwd) = a.get("cwd") { req["cwd"] = cwd.clone(); }
         match c.call(req) { Ok(v) => panes.push(v["pane"].as_u64().unwrap_or(0)), Err(e) => { eprintln!("{e}"); return 1 } }
     }
-    println!("fleet: {} agentes ({cmd}) para {} tarefas no workspace 'fleet'", panes.len(), tasks.len());
+    let deps = tasks.iter().filter(|t| !t.after.is_empty()).count();
+    println!("fleet: {} agentes ({cmd}) para {} tarefas ({deps} com dependencia) no workspace 'fleet'", panes.len(), tasks.len());
     std::thread::sleep(std::time::Duration::from_secs(6)); // agente subindo
-    let queue = std::sync::Arc::new(std::sync::Mutex::new(tasks.into_iter().enumerate().collect::<std::collections::VecDeque<_>>()));
+    let state = std::sync::Arc::new((std::sync::Mutex::new(tasks), std::sync::Condvar::new()));
     let handles: Vec<_> = panes.into_iter().map(|pane| {
-        let q = queue.clone();
+        let st = state.clone();
         std::thread::spawn(move || {
             let Ok(mut c) = Conn::connect() else { return };
             loop {
-                let Some((i, task)) = q.lock().unwrap().pop_front() else { return };
-                println!("[pane {pane}] tarefa {}: {task}", i + 1);
-                let _ = c.call(json!({"cmd": "send", "pane": pane, "text": task}));
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                let _ = c.call(json!({"cmd": "send", "pane": pane, "text": "\r"}));
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                match c.call(json!({"cmd": "wait", "pane": pane, "state": "done,idle,blocked", "timeout": 3600})) {
-                    Ok(v) => println!("[pane {pane}] tarefa {} -> {}", i + 1, v["state"]),
-                    Err(e) => { println!("[pane {pane}] {e}"); return; }
-                }
-                if c.call(json!({"cmd": "list"})).map(|v| v.to_string().contains("\"blocked\"")).unwrap_or(false) {
-                    println!("[pane {pane}] agente bloqueado: responda no painel (Alt+A) para seguir");
-                    let _ = c.call(json!({"cmd": "wait", "pane": pane, "state": "done,idle", "timeout": 3600}));
-                }
+                let task = {
+                    let (lock, cv) = &*st;
+                    let mut ts = lock.lock().unwrap();
+                    loop {
+                        match fleet_next(&mut ts) {
+                            (Some(i), _) => { ts[i].status = "rodando".into(); ts[i].pane = pane; break ts[i].clone(); }
+                            (None, false) => { cv.notify_all(); return; }
+                            (None, true) => { ts = cv.wait_timeout(ts, std::time::Duration::from_secs(2)).unwrap().0; }
+                        }
+                    }
+                };
+                println!("[pane {pane}] [{}] {}", task.id, task.text);
+                let ok = match &task.check {
+                    Some(check) => fleet_loop(&mut c, pane, check, &task.text),
+                    None => fleet_plain(&mut c, pane, &task.text),
+                };
+                println!("[pane {pane}] [{}] {}", task.id, if ok { "passou" } else { "falhou" });
+                let (lock, cv) = &*st;
+                if let Some(t) = lock.lock().unwrap().iter_mut().find(|t| t.id == task.id) { t.status = if ok { "passou" } else { "falhou" }.into(); }
+                cv.notify_all();
             }
         })
     }).collect();
     for h in handles { let _ = h.join(); }
-    println!("fleet: todas as tarefas entregues");
-    0
+    let ts = state.0.lock().unwrap();
+    println!("fleet: fim");
+    for t in ts.iter() { println!("  [{}] {:<8} {}", t.id, t.status, t.text.chars().take(70).collect::<String>()); }
+    if ts.iter().all(|t| t.status == "passou") { 0 } else { 1 }
+}
+
+/// Tarefa sem verificacao: manda e espera o agente parar.
+fn fleet_plain(c: &mut Conn, pane: u64, text: &str) -> bool {
+    let _ = c.call(json!({"cmd": "send", "pane": pane, "text": text}));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = c.call(json!({"cmd": "send", "pane": pane, "text": "\r"}));
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    loop {
+        match c.call(json!({"cmd": "wait", "pane": pane, "state": "done,idle,blocked", "timeout": 3600})) {
+            Ok(v) if v["state"] == "blocked" => {
+                println!("[pane {pane}] agente pede aprovacao: responda (Ctrl+Alt+A vai ate ele)");
+                let _ = c.call(json!({"cmd": "wait", "pane": pane, "state": "done,idle", "timeout": 3600}));
+                return true;
+            }
+            Ok(_) => return true,
+            Err(e) => { println!("[pane {pane}] {e}"); return false; }
+        }
+    }
+}
+
+/// Tarefa com verificacao: loop do Duck ate o comando passar (ou acabar as voltas).
+fn fleet_loop(c: &mut Conn, pane: u64, check: &str, text: &str) -> bool {
+    let t0 = std::time::Instant::now();
+    // O agente pode ainda nao ter sido detectado: tenta por ate 1 min.
+    while let Err(e) = c.call(json!({"cmd": "loop-start", "pane": pane, "check": check, "max": 5, "task": text})) {
+        if t0.elapsed() > std::time::Duration::from_secs(60) { println!("[pane {pane}] loop nao comecou: {e}"); return false; }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let Ok(v) = c.call(json!({"cmd": "loops"})) else { return false };
+        let phase = v["loops"].as_array().into_iter().flatten().find(|l| l["pane"].as_u64() == Some(pane)).and_then(|l| l["phase"].as_str().map(String::from)).unwrap_or_default();
+        match phase.as_str() {
+            "passed" => return true,
+            "failed" | "stopped" | "" => return false,
+            _ => {}
+        }
+    }
 }
 
 /// `duck mcp`: servidor MCP (stdio) para agentes controlarem o terminal
@@ -674,6 +803,33 @@ pub fn play(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn fleet_lines_and_order() {
+        let t = parse_fleet_line("[api] check:\"cargo test --lib\" Criar o endpoint", 1);
+        assert_eq!((t.id.as_str(), t.check.as_deref(), t.text.as_str()), ("api", Some("cargo test --lib"), "Criar o endpoint"));
+        let t2 = parse_fleet_line("[tela] after:api,docs  Ligar a tela", 2);
+        assert_eq!(t2.after, vec!["api", "docs"]);
+        assert_eq!(parse_fleet_line("so o texto", 7).id, "7");
+        // b depende de a; c depende de b; a falha -> b e c pulam.
+        let mut ts = vec![parse_fleet_line("[a] x", 1), parse_fleet_line("[b] after:a y", 2), parse_fleet_line("[c] after:b z", 3), parse_fleet_line("[d] w", 4)];
+        assert_eq!(fleet_next(&mut ts).0, Some(0));
+        ts[0].status = "rodando".into();
+        assert_eq!(fleet_next(&mut ts).0, Some(3));
+        ts[3].status = "rodando".into();
+        assert_eq!(fleet_next(&mut ts), (None, true));
+        ts[0].status = "falhou".into();
+        ts[3].status = "passou".into();
+        assert_eq!(fleet_next(&mut ts), (None, false));
+        assert_eq!(ts[1].status, "pulada");
+        assert_eq!(ts[2].status, "pulada");
+        // Ciclo: ninguem fica esperando para sempre.
+        let mut cy = vec![parse_fleet_line("[a] after:b x", 1), parse_fleet_line("[b] after:a y", 2)];
+        assert_eq!(fleet_next(&mut cy), (None, false));
+        assert!(cy.iter().all(|t| t.status == "pulada"));
+    }
+
     #[test]
     fn counts_tasks_and_tokens() {
         let path = std::env::temp_dir().join(format!("duck-transcript-{}.jsonl", std::process::id()));

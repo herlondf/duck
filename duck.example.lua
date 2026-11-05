@@ -38,6 +38,7 @@ return {
     font_features = {},        -- { '-calt', '-liga' } desliga ligaduras; { 'ss01' } variante
     collapse_lines = 300,      -- saida maior que isso nasce recolhida (0 = nunca)
     token_price = 0,           -- US$ por milhao de tokens: estimativa de custo no painel do agente
+    density = 'comfortable',   -- 'compact' (barras e respiros menores; Ctrl+Alt+K alterna)
     sidebar_width = 230,
     -- agent_colors = { trabalho = '#f38ba8', pessoal = '#a6e3a1' },  -- cor do avatar por perfil (~/.claude-<perfil>)
   },
@@ -82,6 +83,10 @@ return {
   confirm_agent_actions = true,-- agente fechando pane alheio / matando o server pede OK
   audit = true,                -- %LOCALAPPDATA%\duck\audit.log com o que agentes/scripts mandaram
   -- secret_patterns = { ... },-- regex que viram *** no autosave (padrao: tokens, chaves, senha=)
+  secret_mask = true,          -- token na tela (ghp_, sk-, AKIA, JWT, PAT do Azure...) vira bolinhas e gera aviso
+  -- Guarda de commit/push (duck guard install no repo): barra segredo e estas palavras
+  -- (nomes de cliente, de projeto...). Fica aqui, fora do repositorio.
+  -- guard = { words = { 'cliente-x', 'projeto-secreto' } },
 
   ------------------------------------------------------------------ agentes
   -- Processos/titulos reconhecidos como agente (estado working/blocked/idle).
@@ -244,6 +249,7 @@ return {
   --   }, queries = { 'Erros API={service_name="api"} |= "ERROR"' } },
   --   rollbar = { enabled = true, accounts = { { name = 'app' } } },   -- token: rollbar/app
   --   calendar = { enabled = true, accounts = { { name = 'trabalho' } } }, -- token: calendar/trabalho = URL .ics secreta
+  --              -- join_minutes = 10: perto da reuniao, o clique no rodape entra direto
   --   homeassistant = { enabled = true, accounts = { { name = 'casa', url = 'http://homeassistant.local:8123' } } },
   --   containers = { enabled = true, engines = { 'docker' } },   -- ou o nome da distro do WSL com podman
   --   database = { enabled = true, accounts = { { name = 'local', kind = 'postgres', database = 'app', user = 'postgres' } } },

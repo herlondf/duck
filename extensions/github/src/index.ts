@@ -180,7 +180,7 @@ function issueItem(login: string, i: Issue): Item {
     id: `i|${login}|${repo}#${i.number}`, title: `#${i.number} ${i.title}`,
     subtitle: `${repo} · ${ago(i.updated_at)}${i.comments ? ` · ${i.comments} coment.` : ""}`,
     icon: pr ? (i.draft ? "pr-draft" : "pr") : "issue", color: pr ? "accent" : "done",
-    badge: i.draft ? "rascunho" : (i.labels[0]?.name ?? ""), actions,
+    badge: i.draft ? "rascunho" : (i.labels[0]?.name ?? ""), actions, ts: Date.parse(i.updated_at),
   };
 }
 

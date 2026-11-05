@@ -10,12 +10,14 @@
 //!   duck cli <comando> [--chave valor]              API para agentes e scripts
 //!   duck hook                                       hook do Claude Code
 //!   duck doctor | run | fleet | mcp | view          ferramentas
+//!   duck guard install|check|scan                   barra segredo/palavra no commit e no push
 //!   duck init | install | plugin                    config, boot e plugins
 
 pub mod cli;
 pub mod config;
 pub mod ext;
 pub mod gui;
+pub mod guard;
 pub mod plugins;
 pub mod proto;
 pub mod ptyhost;
@@ -61,10 +63,11 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("play") => cli::play(&args[1..]),
         Some("url") => cli::url(&args[1..]),
         Some("secret") => cli::secret(&args[1..]),
+        Some("guard") => guard::main(&args[1..]),
         Some("toast") => toast::run(args.get(1).map(String::as_str).unwrap_or("")),
         Some("--version" | "-V") => { println!("duck {}", env!("CARGO_PKG_VERSION")); 0 }
         Some("--help" | "-h") => {
-            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update");
+            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan");
             0
         }
         _ => {

@@ -4,7 +4,7 @@
 //
 // Config (~/.duck.lua):
 //   extensions = { calendar = { accounts = { { name = 'trabalho' }, { name = 'pessoal' } },
-//     remind_minutes = 5, refresh_minutes = 15, days = 7 } }
+//     remind_minutes = 5, refresh_minutes = 15, days = 7, join_minutes = 10 } }
 // URL: echo <url .ics> | duck secret set calendar/<name>
 
 import { readFile } from "node:fs/promises";
@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { duck, run, Item, Section, Action } from "./duck";
 
 type AccountCfg = { name: string; secret?: string };
-type Settings = { accounts?: AccountCfg[]; remind_minutes?: number; refresh_minutes?: number; days?: number };
+type Settings = { accounts?: AccountCfg[]; remind_minutes?: number; refresh_minutes?: number; days?: number; join_minutes?: number };
 export type Ev = {
   id: string; uid: string; cal: string; title: string; start: number; end: number; allDay: boolean;
   location: string; description: string; url: string;
@@ -364,8 +364,10 @@ function render(): void {
   duck.view("agenda", secs, { error: err || undefined });
 
   const next = list.find((e) => !e.allDay && e.end > now && e.start < t1);
-  const label = next ? `📅 ${hhmm(next.start)} ${next.title.slice(0, 30)} (${next.start <= now ? "agora" : until(next.start - now)})` : "";
-  duck.status("agenda", label, { color: next && next.start - now < 15 * 60000 ? "working" : "accent", view: "agenda" });
+  // Perto da hora (ou ja comecou) e com link: o clique no rodape entra direto.
+  const soon = !!next && next.start - now < (settings.join_minutes ?? 10) * 60000 && !!meetingLink(next);
+  const label = next ? `📅 ${hhmm(next.start)} ${next.title.slice(0, 30)} (${next.start <= now ? "agora" : until(next.start - now)})${soon ? " · entrar" : ""}` : "";
+  duck.status("agenda", label, { color: next && next.start - now < 15 * 60000 ? "working" : "accent", view: "agenda", command: soon ? "join" : undefined });
 }
 
 function remind(): void {

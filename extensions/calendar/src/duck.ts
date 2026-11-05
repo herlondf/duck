@@ -19,6 +19,8 @@ export type Item = {
   /** Nome de icone (github, bell, issue, issue-closed, pr, pr-merged, pr-draft, repo, comment, tag, check...) ou um glifo. */
   icon?: string;
   badge?: string;
+  /** Desde quando (epoch ms): ordena listas que juntam extensoes. */
+  ts?: number;
   /** Cor do tema: accent, done, working, blocked, muted, fg, ou #rrggbb. */
   color?: string;
   unread?: boolean;
@@ -121,7 +123,7 @@ export const duck = {
     send({ type: "view", id, sections, ...opts });
   },
   /** Item na barra de titulo; clicar abre a visao `view`. text vazio remove. */
-  status(id: string, text: string, opts: { color?: string; view?: string } = {}) { send({ type: "status", id, text, ...opts }); },
+  status(id: string, text: string, opts: { color?: string; view?: string; command?: string } = {}) { send({ type: "status", id, text, ...opts }); },
   /** Aviso: cartao no Duck (janela em foco) ou no canto da tela, com botoes. */
   notify(n: { title: string; body?: string; item?: string; actions?: Action[]; color?: string; seconds?: number }) { send({ type: "notify", ...n }); },
   /** Painel flutuante com texto rolavel e botoes. */
