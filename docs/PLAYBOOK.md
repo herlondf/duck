@@ -55,6 +55,8 @@ command when Rust, the MSVC Build Tools or Node is missing.
 ```bash
 curl https://sh.rustup.rs -sSf | sh
 sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev   # Debian/Ubuntu
+sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel                # Fedora
+sudo pacman -S --needed base-devel pkgconf libxkbcommon wayland libx11                     # Arch
 git clone https://github.com/herlondf/duck.git && cd duck
 ./install.sh --all
 ```

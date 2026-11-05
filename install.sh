@@ -30,15 +30,35 @@ done
 
 os="$(uname -s)"
 if [ "$build" = 1 ]; then
+  # rustup instala em ~/.cargo/bin, mas so entra no PATH num terminal novo.
+  if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+    . "$HOME/.cargo/env"
+  fi
   if ! command -v cargo >/dev/null 2>&1; then
     say "Rust nao encontrado. Instale com: curl https://sh.rustup.rs -sSf | sh" \
         "Rust not found. Install it with: curl https://sh.rustup.rs -sSf | sh"
     exit 1
   fi
   if [ "$os" = Linux ]; then
-    # Bibliotecas de janela/teclado que o winit e o wgpu carregam.
-    say "Linux: precisa de gcc, pkg-config e libs de X11/Wayland (ex.: sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev)" \
-        "Linux: needs gcc, pkg-config and X11/Wayland libs (e.g. sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev)"
+    # Compilador C (linker e Lua embutido), pkg-config e libs de janela/teclado do winit/wgpu.
+    if command -v apt-get >/dev/null 2>&1; then
+      deps="sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev"
+    elif command -v dnf >/dev/null 2>&1; then
+      deps="sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel libX11-devel"
+    elif command -v pacman >/dev/null 2>&1; then
+      deps="sudo pacman -S --needed base-devel pkgconf libxkbcommon wayland libx11"
+    elif command -v zypper >/dev/null 2>&1; then
+      deps="sudo zypper install gcc pkg-config libxkbcommon-devel wayland-devel libX11-devel"
+    else
+      deps="gcc, pkg-config, libxkbcommon, wayland, libX11 (dev packages)"
+    fi
+    missing=""
+    command -v cc >/dev/null 2>&1 || missing="$missing cc"
+    command -v pkg-config >/dev/null 2>&1 || missing="$missing pkg-config"
+    if [ -n "$missing" ]; then
+      say "Faltando:$missing. Instale com: $deps" "Missing:$missing. Install with: $deps"
+      exit 1
+    fi
   fi
   say "Compilando (release, ~5 min na primeira vez)..." "Building (release, ~5 min the first time)..."
   cargo build --release --manifest-path "$root/Cargo.toml"
