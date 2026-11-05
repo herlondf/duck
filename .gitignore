@@ -1,4 +1,4 @@
 target/
-bin/
+/bin/
 node_modules/
 extensions/*/dist/
