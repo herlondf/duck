@@ -285,10 +285,36 @@ duck cli last-failure --pane 7                      # último comando que falhou
 duck cli blocks --pane 7                            # todos os comandos do pane (texto, exit, duração)
 duck cli history --cwd D:/projetos/app --limit 20    # histórico (de todos os panes)
 duck cli queue --pane 7 --text "agora rode os testes"   # recado: entregue quando o agente parar
+duck msg fedora "rode X e me diga Y"                 # para o agente de outro computador (abaixo)
 duck fleet --agents 3 --cmd claude tarefas.txt      # fila: N agentes, uma tarefa por linha (dependencias abaixo)
 duck run --cmd "npm test" --timeout 600             # sem janela (CI): imprime a saída, devolve o exit
 duck mcp                                            # servidor MCP (stdio): duck_list/spawn/send/read/wait/last_output
 ```
+
+**Mensagens entre computadores (`duck msg`):** o agente de um computador manda
+texto para o agente de outro, sem copiar e colar. Vai por TCP direto entre os
+dois Duck (use o Tailscale; na rede local o token passa sem criptografia).
+
+```lua
+-- ~/.duck.lua nos dois computadores
+peer = { listen = '100.x.y.z:7878', trust = false, max_hops = 10 },
+peers = { fedora = '100.a.b.c:7878' },
+```
+
+```powershell
+duck peer token                  # no fedora: mostra o token dele
+duck peer add fedora <token>     # aqui: guarda no cofre (duck secret)
+duck msg fedora "texto"          # ou: Get-Content x.txt | duck msg fedora
+duck msg fedora --conv 4929def2 "resposta"   # continua a conversa
+```
+
+A mensagem vai para o agente da conversa. Se for a primeira, vai para o
+agente do pane aberto na janela de lá. O usuário de lá aprova antes da
+entrega (`trust = true` entrega direto). Um agente não aprova pela API. A
+entrega espera o agente parar. A resposta volta para o pane que mandou.
+Segredos conhecidos saem mascarados. Depois de `max_hops` mensagens na mesma
+conversa, o Duck recusa e pede o usuário. No Windows, libere a porta no
+firewall. No Fedora: `sudo firewall-cmd --add-port=7878/tcp --permanent && sudo firewall-cmd --reload`.
 
 **Fila com dependências (`duck fleet`):** cada linha do arquivo pode ter um
 id, dependências e uma verificação:

@@ -256,6 +256,14 @@ pub struct Config {
     pub shader: Option<String>,
     pub visual_bell: bool,
     pub token_budget: u64,
+    /// Mensagens entre computadores (`duck msg`): onde escutar ("" = desligado),
+    /// nome deste computador, entrega sem aprovacao e limite de idas e voltas.
+    pub peer_listen: String,
+    pub peer_name: String,
+    pub peer_trust: bool,
+    pub peer_max_hops: u32,
+    /// Outros computadores: nome -> "ip:porta" (o token fica em `duck secret`).
+    pub peers: Vec<(String, String)>,
     pub agent_profiles: Vec<AgentProfile>,
     pub popups: Vec<Popup>,
     /// Editor para links arquivo:linha (padrao: VS Code).
@@ -528,6 +536,12 @@ pub fn parse(t: &Table) -> Config {
         shader: t.get::<Option<String>>("shader").ok().flatten(),
         visual_bell: t.get::<Option<bool>>("visual_bell").ok().flatten().unwrap_or(true),
         token_budget: n(t, "token_budget", 0.0) as u64,
+        peer_listen: t.get::<Table>("peer").ok().map(|p| s(&p, "listen", "")).unwrap_or_default(),
+        peer_name: t.get::<Table>("peer").ok().map(|p| s(&p, "name", "")).filter(|n| !n.is_empty())
+            .unwrap_or_else(|| std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "duck".into()).to_lowercase()),
+        peer_trust: t.get::<Table>("peer").ok().and_then(|p| p.get::<Option<bool>>("trust").ok().flatten()).unwrap_or(false),
+        peer_max_hops: t.get::<Table>("peer").ok().map(|p| n(&p, "max_hops", 10.0) as u32).unwrap_or(10),
+        peers: t.get::<Table>("peers").map(|p| p.pairs::<String, String>().flatten().collect()).unwrap_or_default(),
         agent_profiles: t.get::<Table>("agent_profiles").map(|p| p.sequence_values::<Table>().flatten()
             .map(|x| AgentProfile { name: s(&x, "name", "agente"), cmd: s(&x, "cmd", "claude") }).collect())
             .unwrap_or_else(|_| vec![

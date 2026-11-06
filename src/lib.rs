@@ -63,11 +63,13 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("play") => cli::play(&args[1..]),
         Some("url") => cli::url(&args[1..]),
         Some("secret") => cli::secret(&args[1..]),
+        Some("msg") => cli::msg(&args[1..]),
+        Some("peer") => cli::peer(&args[1..]),
         Some("guard") => guard::main(&args[1..]),
         Some("toast") => toast::run(args.get(1).map(String::as_str).unwrap_or("")),
         Some("--version" | "-V") => { println!("duck {}", env!("CARGO_PKG_VERSION")); 0 }
         Some("--help" | "-h") => {
-            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan");
+            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan | msg <peer> texto | peer token|add");
             0
         }
         _ => {

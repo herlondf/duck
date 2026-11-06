@@ -88,6 +88,12 @@ pub fn hook() -> i32 {
         "session": ev["session_id"], "cwd": ev["cwd"],
         "config_dir": std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_default(),
     });
+    // Rodando no WSL (duck.exe pelo interop): de qual distro.
+    // O perfil so vale com caminho do Linux (o do Windows vem herdado do pwsh).
+    if let Ok(d) = std::env::var("WSL_DISTRO_NAME") {
+        req["distro"] = json!(d);
+        if !req["config_dir"].as_str().unwrap_or("").starts_with('/') { req["config_dir"] = json!(""); }
+    }
     if name == "UserPromptSubmit" {
         if let Some(p) = ev["prompt"].as_str() { req["prompt"] = json!(p.chars().take(400).collect::<String>()); }
     }
@@ -841,5 +847,71 @@ mod stats_tests {
         std::fs::write(&path, lines.join("\n")).unwrap();
         assert_eq!(super::transcript_stats(path.to_str().unwrap()), Some((1, 2, 15)));
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// `duck msg <peer> [--conv ID] "texto"` (ou texto no stdin): manda para o
+/// agente de outro computador. O server prepara; a rede sai daqui.
+pub fn msg(args: &[String]) -> i32 {
+    let mut conv = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--conv" { conv = it.next().cloned(); } else { rest.push(a.clone()); }
+    }
+    let Some(peer) = rest.first().cloned() else { eprintln!("uso: duck msg <peer> [--conv ID] \"texto\"   (sem texto: le do stdin)"); return 2 };
+    let mut text = rest[1..].join(" ");
+    if text.trim().is_empty() { let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text); }
+    let mut c = match Conn::connect_or_spawn() { Ok(c) => c, Err(e) => { eprintln!("duck: {e}"); return 1 } };
+    let out = match c.call(json!({"cmd": "peer-out", "peer": peer, "text": text, "conv": conv})) {
+        Ok(v) => v, Err(e) => { eprintln!("duck msg: {e}"); return 1 }
+    };
+    let Some(token) = crate::secret::get(&format!("peer/{peer}")) else {
+        eprintln!("duck msg: sem o token de {peer}. No {peer} rode `duck peer token` e aqui `duck peer add {peer} <token>`");
+        return 1;
+    };
+    let addr = out["addr"].as_str().unwrap_or("").to_string();
+    let req = json!({"token": token, "from": out["from"], "conv": out["conv"], "hops": out["hops"], "to": out["to"], "reply_pane": out["reply_pane"], "text": out["text"]});
+    match peer_send(&addr, &req) {
+        Ok(v) if v["ok"].as_bool() == Some(true) => {
+            let how = if v["approval"].as_bool() == Some(true) { "chegou, espera o usuario de la aprovar" } else { "entregue" };
+            println!("{peer}: {how} (conversa {}). A resposta chega neste pane.", out["conv"].as_str().unwrap_or(""));
+            0
+        }
+        Ok(v) => { eprintln!("duck msg: {peer} recusou: {}", v["error"].as_str().unwrap_or("?")); 1 }
+        Err(e) => { eprintln!("duck msg: {peer} ({addr}) nao respondeu: {e}"); 1 }
+    }
+}
+
+fn peer_send(addr: &str, req: &Value) -> Result<Value, String> {
+    use std::io::{BufRead, Write};
+    use std::net::ToSocketAddrs;
+    let sa = addr.to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("endereco invalido")?;
+    let mut s = std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+    s.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    std::io::BufReader::new(s).read_line(&mut line).map_err(|e| e.to_string())?;
+    serde_json::from_str(&line).map_err(|e| format!("resposta invalida: {e}"))
+}
+
+/// `duck peer token` (o token deste computador, cria na 1a vez) e
+/// `duck peer add <nome> <token>` (o token do outro).
+pub fn peer(args: &[String]) -> i32 {
+    match (args.first().map(String::as_str), args.get(1), args.get(2)) {
+        (Some("token"), _, _) => {
+            let t = crate::secret::get("peer/self").filter(|t| !t.is_empty()).unwrap_or_else(|| {
+                let t = crate::proto::random_hex(32);
+                let _ = crate::secret::set("peer/self", &t);
+                t
+            });
+            println!("{t}");
+            0
+        }
+        (Some("add"), Some(name), Some(token)) => match crate::secret::set(&format!("peer/{name}"), token.trim()) {
+            Ok(_) => { println!("ok. Na config: peers = {{ {name} = 'ip:porta' }}"); 0 }
+            Err(e) => { eprintln!("{e}"); 1 }
+        },
+        _ => { eprintln!("uso: duck peer token | duck peer add <nome> <token>"); 2 }
     }
 }

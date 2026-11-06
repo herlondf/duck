@@ -2218,7 +2218,11 @@ impl Gui {
             if self.overlay.is_none() {
                 if let Some(a) = f.approvals.iter().find(|a| !self.asked.contains(&a.id)).cloned() {
                     self.asked.insert(a.id);
-                    let (yes, title) = if a.kind == "clipboard" { ("Permitir copiar", "Clipboard") } else { ("Permitir", "Agente pede confirmacao") };
+                    let (yes, title) = match a.kind.as_str() {
+                        "clipboard" => ("Permitir copiar", "Clipboard"),
+                        "peer" => ("Entregar ao agente", "Mensagem de outro computador"),
+                        _ => ("Permitir", "Agente pede confirmacao"),
+                    };
                     // Negar primeiro: Enter distraido nao libera nada.
                     let items = vec![
                         Item::new("Negar", "Esc", "approve", vec![json!(a.id), json!(false)]),

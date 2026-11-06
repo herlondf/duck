@@ -11,7 +11,8 @@ they appear on screen, with a translation the first time.
 - [3. Extensions: the basics](#3-extensions-the-basics)
 - [4. Recipes per extension](#4-recipes-per-extension)
 - [5. Routines](#5-routines)
-- [6. Troubleshooting](#6-troubleshooting)
+- [6. Messages between computers](#6-messages-between-computers)
+- [7. Troubleshooting](#7-troubleshooting)
 
 ---
 
@@ -577,7 +578,97 @@ Routines send the answer to a Home Assistant automation through a webhook.
 
 ---
 
-## 6. Troubleshooting
+## 6. Messages between computers
+
+`duck msg` lets the agent on one computer send a message to the agent on
+another. Use it when you work on two machines and keep copying text from one
+session to the other. The two Duck servers talk directly over TCP; there is no
+outside server.
+
+### Before you start
+
+- Both computers run Duck, at the same version.
+- They can reach each other: same local network, or both on
+  [Tailscale](https://tailscale.com) (recommended).
+- On the local network without Tailscale, the token travels unencrypted. Use it
+  only on a network you trust.
+
+### Turn on
+
+Do this on **both** computers.
+
+1. Find the address. With Tailscale: `tailscale ip -4` (it starts with `100.`).
+   On the local network: `ipconfig` (Windows) or `ip -4 addr` (Linux).
+2. In `~/.duck.lua`, inside `config`, tell Duck where to listen and who the
+   other computer is:
+   ```lua
+   peer = { listen = '100.64.0.1:7878', trust = false, max_hops = 10 },
+   peers = { fedora = '100.64.0.2:7878' },   -- name = address of the OTHER one
+   ```
+   `listen = '0.0.0.0:7878'` listens on every network; prefer the Tailscale IP.
+3. Open the port in the firewall.
+   - Windows (an admin prompt):
+     ```powershell
+     New-NetFirewallRule -DisplayName 'Duck peers (7878)' -Direction Inbound -Protocol TCP -LocalPort 7878 -Profile Private -Action Allow
+     ```
+   - Fedora:
+     ```sh
+     sudo firewall-cmd --add-port=7878/tcp --permanent && sudo firewall-cmd --reload
+     ```
+4. Restart the server so it starts listening (the config reload is not enough).
+   Run it in a terminal outside Duck: from inside a pane it is refused.
+   ```sh
+   duck cli restart-server
+   ```
+   The log (`server.log`) shows `peers: escutando em ...` (peers: listening on).
+
+### Pair
+
+Each computer has its own token. Each side keeps the token of the other.
+
+1. On the Fedora: `duck peer token`. Copy what it prints.
+2. On the Windows: `duck peer add fedora <token>`.
+3. Do the reverse: `duck peer token` on the Windows, `duck peer add windows <token>`
+   on the Fedora.
+
+The name in `duck peer add` must be the same name used in `peers`. Tokens go
+to the secret vault (`duck secret`), never to a file.
+
+### Use
+
+From an agent (or from you, in any pane):
+
+```sh
+duck msg fedora "Install the Fedora package for X and tell me the version"
+cat config.toml | duck msg fedora          # text from stdin
+```
+
+On the other computer:
+
+1. A dialog asks "Mensagem de outro computador" (message from another
+   computer). **Entregar ao agente** (deliver to the agent) or **Negar** (deny).
+   The message also goes to the inbox.
+2. It goes to the agent of the conversation. If it is the first message, it
+   goes to the agent of the pane open in the window. A pane without an agent
+   does not receive it: the sender gets an error.
+3. If the agent is working, the message waits until it stops.
+4. The delivered text tells the agent how to answer
+   (`duck msg <name> --conv <id> "..."`). The answer comes back to the pane that
+   sent the first message.
+
+### Limits and safety
+
+- **You approve.** An agent cannot approve through the API. `trust = true`
+  skips the dialog; use it only between your own computers.
+- **No endless ping-pong.** After `max_hops` messages (10) in the same
+  conversation, Duck refuses and asks for you. Start a new conversation by
+  sending without `--conv`.
+- **Secrets masked.** Known tokens are masked before leaving.
+- **Up to 16,000 characters per message.**
+
+---
+
+## 7. Troubleshooting
 
 | Symptom | What to do |
 |---|---|
@@ -593,6 +684,9 @@ Routines send the answer to a Home Assistant automation through a webhook.
 | Agent notices don't show | Check `notify = true` in `~/.duck.lua` (the default). A notice only goes out when you aren't looking at that pane. In full screen it goes to the Windows notification center. |
 | Agents show no state in tabs | `install.ps1 -SkipBuild -ClaudeHooks`, then reopen Claude. |
 | I updated and nothing changed | Close and reopen the Duck window (the server was already restarted). |
+| `duck msg`: "nao respondeu" (did not answer) | The other server is not listening or the firewall blocks it. On the other side: `peer = { listen = ... }`, `duck cli restart-server` (outside Duck), the port open. Test: `Test-NetConnection <ip> -Port 7878` (Windows) or `nc -zv <ip> 7878`. |
+| `duck msg`: "token errado" (wrong token) | Pair again: `duck peer token` on the other side, `duck peer add <name> <token>` here. |
+| `duck msg`: "nenhum agente para receber" (no agent to receive) | On the other computer, open the tab of an agent (Claude running) and send again. |
 
 Still stuck? The server log is at `%LOCALAPPDATA%\duck\server.log` and the
 extensions log at `%LOCALAPPDATA%\duck\ext-host.log`.

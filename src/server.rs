@@ -356,6 +356,8 @@ pub struct Mux {
     event_seq: u64,
     /// Central de avisos: o que apareceu (extensoes, agentes), lido ou nao.
     inbox: Inbox,
+    /// Conversas com outros computadores (`duck msg`), pelo id.
+    convs: HashMap<String, Conv>,
     /// Loops "ate passar": pane do agente -> verificacao e voltas.
     loops: HashMap<Id, LoopRun>,
     approvals: Vec<Approval>,
@@ -522,8 +524,9 @@ fn spawn_pane(srv: &Arc<Server>, m: &mut Mux, o: SpawnOpts) -> Result<Id, String
         ("TERM".into(), "xterm-256color".into()),
         ("TERM_PROGRAM".into(), "Duck".into()),
         ("COLORTERM".into(), "truecolor".into()),
-        // WSL so recebe as variaveis listadas no WSLENV.
-        ("WSLENV".into(), format!("{}{}DUCK_PANE:DUCK_TOKEN:TERM_PROGRAM", wslenv, if wslenv.is_empty() { "" } else { ":" })),
+        // WSL so recebe as variaveis listadas no WSLENV. As /w voltam do WSL
+        // para o duck.exe do hook: distro e perfil do Claude de quem rodou `wsl`.
+        ("WSLENV".into(), format!("{}{}DUCK_PANE:DUCK_TOKEN:TERM_PROGRAM:WSL_DISTRO_NAME/w:CLAUDE_CONFIG_DIR/w", wslenv, if wslenv.is_empty() { "" } else { ":" })),
     ];
     let user = std::env::var("USERNAME").unwrap_or_default().to_lowercase();
     let pipe = format!("duck-pty-{user}-{}", proto::random_hex(10));
@@ -928,6 +931,103 @@ fn load_history() -> Vec<Value> {
 
 /// Entrega um texto ao agente como se fosse colado e aperta Enter: varias
 /// linhas chegam inteiras (bracketed paste) e o Enter vai depois do paste.
+const PEER_MAX_TEXT: usize = 16_000;
+
+#[derive(Default)]
+struct Conv { peer: String, remote_pane: Option<Id>, local_pane: Option<Id>, hops: u32 }
+
+/// Agente parado recebe ja; trabalhando, quando parar.
+fn queue_or_deliver(p: &mut Pane, text: String) {
+    if p.agent.as_ref().is_some_and(|a| a.state == "done" || a.state == "idle") { deliver(p, &text); } else { p.queue.push(text); }
+}
+
+/// Pane que o usuario esta olhando (janela focada primeiro).
+fn front_pane(m: &Mux) -> Option<Id> {
+    let mut cs: Vec<&ClientView> = m.clients.values().collect();
+    cs.sort_by_key(|c| !c.focused);
+    cs.iter().find_map(|c| m.workspaces.iter().find(|w| w.name == c.workspace).and_then(|w| w.tabs.get(w.active)).map(|t| t.active))
+}
+
+/// Escuta mensagens de outros computadores (`peer = { listen = 'ip:porta' }`).
+/// Uma linha JSON por conexao, com o token deste computador (`duck peer token`).
+/// ponytail: TCP sem TLS; o Tailscale criptografa. Na rede local aberta o token
+/// passa em claro: HMAC por mensagem se for usar fora do Tailscale.
+fn peer_listen(srv: Arc<Server>, addr: String) {
+    let l = match std::net::TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => { proto::log(&format!("peers: nao escutou em {addr}: {e}")); return; }
+    };
+    proto::log(&format!("peers: escutando em {addr}"));
+    for s in l.incoming().flatten() {
+        let srv = srv.clone();
+        std::thread::spawn(move || peer_conn(&srv, s));
+    }
+}
+
+fn peer_conn(srv: &Arc<Server>, s: std::net::TcpStream) {
+    use std::io::{BufRead, Read, Write};
+    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+    let ip = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let mut line = String::new();
+    let _ = std::io::BufReader::new((&s).take(64 * 1024)).read_line(&mut line);
+    let res = match serde_json::from_str::<Value>(&line) {
+        Err(e) => Err(format!("json: {e}")),
+        Ok(v) => {
+            let mine = crate::secret::get("peer/self").unwrap_or_default();
+            if mine.is_empty() || !same(mine.as_bytes(), v["token"].as_str().unwrap_or("").as_bytes()) {
+                proto::log(&format!("peers: token errado de {ip}"));
+                std::thread::sleep(Duration::from_millis(500));
+                Err("token errado".into())
+            } else { peer_in(srv, &v, &ip) }
+        }
+    };
+    let out = res.unwrap_or_else(|e| json!({"ok": false, "error": e}));
+    let _ = (&s).write_all(format!("{out}\n").as_bytes());
+}
+
+/// Comparacao em tempo constante (o token nao vaza pelo tempo de resposta).
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |x, (p, q)| x | (p ^ q)) == 0
+}
+
+/// Mensagem que chegou: vai para o agente da conversa (ou o do pane que o
+/// usuario esta olhando), com aprovacao, a menos que `peer.trust`.
+fn peer_in(srv: &Arc<Server>, v: &Value, ip: &str) -> Result<Value, String> {
+    let mut m = srv.lock();
+    let hops = v["hops"].as_u64().unwrap_or(1) as u32;
+    if hops > m.cfg.peer_max_hops { return Err(format!("limite de {} idas e voltas", m.cfg.peer_max_hops)); }
+    // Quem mandou: pelo IP na lista de peers; senao, o nome que ele diz.
+    let from = m.cfg.peers.iter().find(|(_, a)| a.rsplit_once(':').map(|x| x.0) == Some(ip)).map(|(n, _)| n.clone())
+        .unwrap_or_else(|| clean(v["from"].as_str().unwrap_or("?"), 40));
+    let conv = clean(v["conv"].as_str().unwrap_or(""), 16);
+    if conv.is_empty() { return Err("falta conv".into()); }
+    let text: String = v["text"].as_str().unwrap_or("").chars().take(PEER_MAX_TEXT).collect();
+    if text.trim().is_empty() { return Err("falta text".into()); }
+    let has_agent = |m: &Mux, id: Id| m.panes.get(&id).is_some_and(|p| p.agent.is_some());
+    let local = m.convs.get(&conv).and_then(|c| c.local_pane);
+    let to = v["to"].as_u64().filter(|&id| has_agent(&m, id))
+        .or(local.filter(|&id| has_agent(&m, id)))
+        .or(front_pane(&m).filter(|&id| has_agent(&m, id)));
+    let preview = clean(&text.replace('\n', " "), 160);
+    m.inbox.push(json!({"kind": "peer", "pane": to.unwrap_or(0), "title": format!("Mensagem de {from}"), "body": preview, "color": "working"}));
+    srv.notify();
+    let Some(to) = to else { return Err("nenhum agente para receber: o pane aberto la nao tem agente".into()) };
+    let c = m.convs.entry(conv.clone()).or_default();
+    c.peer = from.clone();
+    c.hops = c.hops.max(hops);
+    c.local_pane = Some(to);
+    if let Some(r) = v["reply_pane"].as_u64() { c.remote_pane = Some(r); }
+    let body = format!("[Duck · mensagem de {from} · conversa {conv}]\n{text}\n\n(Para responder: duck msg {from} --conv {conv} \"sua resposta\")");
+    if m.cfg.peer_trust {
+        if let Some(p) = m.panes.get_mut(&to) { queue_or_deliver(p, body); }
+        Ok(proto::ok(json!({"pane": to, "approval": false})))
+    } else {
+        let title = m.panes.get(&to).map(|p| p.title.clone()).unwrap_or_default();
+        ask(&mut m, "peer", to, format!("{from} quer mandar para o agente do pane {to} ({title}): {preview}"), body);
+        Ok(proto::ok(json!({"pane": to, "approval": true})))
+    }
+}
+
 fn deliver(p: &Pane, text: &str) {
     let bracketed = p.term.mode().contains(TermMode::BRACKETED_PASTE);
     let clean_text: String = text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
@@ -1746,6 +1846,9 @@ fn check_scope(m: &Mux, caller: Caller, cmd: &str, a: &Value) -> Result<(), Stri
     }
     // set-state no proprio pane e o hook do agente: sempre pode.
     if cmd == "set-state" && arg_id(a, "pane").is_none_or(|t| t == me) { return Ok(()); }
+    // Aprovar e do usuario: um agente nao libera o proprio pedido nem a
+    // mensagem que chegou de outro computador.
+    if cmd == "approve" { return Err("so o usuario aprova (janela ou toast)".into()); }
     match m.cfg.api_scope.as_str() {
         "read" => Err(format!("api_scope=read: o pane {me} so pode ler")),
         "children" => {
@@ -1907,6 +2010,10 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
                 m.clipboard.0 += 1;
                 m.clipboard.1 = text;
             }
+            if ok && ap.kind == "peer" {
+                let (pane, text) = (ap.pane, ap.payload.clone());
+                if let Some(p) = m.panes.get_mut(&pane) { queue_or_deliver(p, text); }
+            }
             // Clipboard ninguem espera: sai ja. Acao: quem pediu le e remove.
             m.approvals.retain(|x| x.decided.is_none() || x.kind == "action");
             proto::ok(json!({}))
@@ -2005,6 +2112,25 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
                 .filter(|h| seen.insert(h["cmd"].as_str().unwrap_or("").to_string()))
                 .take(limit).collect();
             proto::ok(json!({"history": out}))
+        }
+        // Mensagem para outro computador: o server prepara (conversa, limite,
+        // segredos mascarados); quem envia pela rede e a CLI (sem travar o server).
+        "peer-out" => {
+            let peer = arg_str(a, "peer").ok_or("falta peer")?.to_string();
+            let addr = m.cfg.peers.iter().find(|(n, _)| *n == peer).map(|(_, a)| a.clone()).ok_or_else(|| {
+                let known: Vec<&str> = m.cfg.peers.iter().map(|(n, _)| n.as_str()).collect();
+                format!("peer desconhecido: {peer} (conhecidos: {}; peers = {{ {peer} = 'ip:porta' }} na config)", known.join(", "))
+            })?;
+            let text = arg_str(a, "text").filter(|t| !t.trim().is_empty()).ok_or("falta text")?.chars().take(PEER_MAX_TEXT).collect();
+            let text = scrub(m, text);
+            let max = m.cfg.peer_max_hops;
+            let conv = arg_str(a, "conv").map(|c| clean(c, 16)).filter(|c| !c.is_empty()).unwrap_or_else(|| proto::random_hex(4));
+            let from = m.cfg.peer_name.clone();
+            let c = m.convs.entry(conv.clone()).or_insert_with(|| Conv { peer: peer.clone(), ..Default::default() });
+            if c.hops >= max { return Err(format!("conversa {conv}: limite de {max} idas e voltas. Peça ao usuário para continuar.")); }
+            c.hops += 1;
+            if caller.0.is_some() { c.local_pane = caller.0; }
+            proto::ok(json!({"addr": addr, "from": from, "conv": conv, "hops": c.hops, "to": c.remote_pane, "reply_pane": c.local_pane, "text": text}))
         }
         "queue" => {
             let id = target(srv, m, a)?;
@@ -2455,6 +2581,11 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
                     if let Some(t) = a.get("step") { ag.step = t.as_str().map(|t| clean(t, 200)).filter(|t| !t.is_empty()); }
                 }
                 if let Some(c) = arg_str(a, "cwd") { if !c.is_empty() { p.cwd = clean(c, 1024); } }
+                // Agente no WSL aberto com `wsl` num pane do Windows: o pane passa a
+                // ser do dominio da distro (a restauracao abre o WSL, nao o pwsh).
+                if p.domain.is_empty() {
+                    if let Some(d) = arg_str(a, "distro").and_then(|d| wsl_domain(&m.cfg.domains, d)) { p.domain = d; }
+                }
             }
             // Orcamento de tokens: avisa uma vez quando a soma passa do limite.
             let total: u64 = m.panes.values().filter_map(|p| p.agent.as_ref()?.session_tokens).sum();
@@ -2840,6 +2971,13 @@ fn checkpoint(m: &Mux) -> Result<(Vec<String>, usize), String> {
     let cp = json!({"saved_at": now_secs(), "workspaces": names, "agents": agents});
     std::fs::write(proto::state_dir().join("checkpoint.json"), serde_json::to_vec_pretty(&cp).unwrap()).map_err(|e| e.to_string())?;
     Ok((names, n))
+}
+
+/// Dominio do Duck que abre a distro do WSL (`wsl.exe -d <distro>`).
+fn wsl_domain(domains: &[config::Domain], distro: &str) -> Option<String> {
+    domains.iter().find(|d| d.cmd.first().is_some_and(|c| c.to_lowercase().contains("wsl"))
+        && d.cmd.windows(2).any(|w| (w[0] == "-d" || w[0] == "--distribution") && w[1].eq_ignore_ascii_case(distro)))
+        .map(|d| d.name.clone())
 }
 
 /// Comando que retoma a sessao do agente, no shell do pane (o shell fica
@@ -3311,7 +3449,7 @@ pub fn run() {
     let srv = Arc::new(Server {
         mux: Mutex::new(Mux {
             panes: HashMap::new(), workspaces: Vec::new(), next: 1, size: (100, 30),
-            clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0, inbox: Inbox::default(), loops: HashMap::new(),
+            clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0, inbox: Inbox::default(), convs: HashMap::new(), loops: HashMap::new(),
             approvals: Vec::new(), approval_seq: 0, secrets, recovered: 0, resurrect: false, light: false,
             history: load_history(), budget_warned: false, ext: Default::default(), subs: 0, closed: Vec::new(), pip: None, changes: HashMap::new(),
         }),
@@ -3322,6 +3460,8 @@ pub fn run() {
     });
     proto::log(&format!("server {} iniciado (pid {})", env!("CARGO_PKG_VERSION"), std::process::id()));
     recover(&srv);
+    let listen = srv.lock().cfg.peer_listen.clone();
+    if !listen.is_empty() { let s = srv.clone(); std::thread::spawn(move || peer_listen(s, listen)); }
     { let s = srv.clone(); std::thread::spawn(move || event_loop(s, rx)); }
     { let s = srv.clone(); std::thread::spawn(move || agent_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || autosave_loop(s)); }
@@ -3346,6 +3486,7 @@ mod tests {
         l.iter = 2; l.phase = "passed".into();
         assert_eq!(l.label(), "✓ 2/5");
         assert!(!l.active());
+        assert!(same(b"abc", b"abc") && !same(b"abc", b"abd") && !same(b"abc", b"ab"));
         let cmd = if cfg!(windows) { "Write-Output ok; exit 3" } else { "echo ok; exit 3" };
         let (code, out) = run_check(cmd, ".", &[]);
         assert_eq!((code, out.trim()), (3, "ok"));
@@ -3384,6 +3525,9 @@ mod tests {
         assert_eq!(resume_line(&[], &ag, "").unwrap(), format!("{env}claude --resume abc\r"));
         let wsl = vec!["wsl.exe".to_string()];
         assert_eq!(resume_line(&wsl, &ag, "").unwrap(), "CLAUDE_CONFIG_DIR='C:/p' claude --resume abc\r");
+        let doms = vec![config::Domain { name: "Linux".into(), cmd: ["wsl.exe", "-d", "Ubuntu", "--cd", "~"].map(String::from).to_vec(), background: None, tab_color: None, reconnect: false }];
+        assert_eq!(wsl_domain(&doms, "ubuntu").as_deref(), Some("Linux"));
+        assert_eq!(wsl_domain(&doms, "Debian"), None);
         assert_eq!(percent_decode("/C:/My%20Dir"), "/C:/My Dir");
     }
 
@@ -3459,13 +3603,15 @@ mod tests {
         let m = Mux {
             panes: HashMap::new(), workspaces: vec![], next: 1, size: (10, 10), clients: HashMap::new(),
             cfg: config::parse(&t),
-            clipboard: (0, String::new()), events: vec![], event_seq: 0, inbox: Inbox::default(), loops: HashMap::new(), approvals: vec![], approval_seq: 0,
+            clipboard: (0, String::new()), events: vec![], event_seq: 0, inbox: Inbox::default(), convs: HashMap::new(), loops: HashMap::new(), approvals: vec![], approval_seq: 0,
             secrets: vec![], recovered: 0, resurrect: false, light: false, history: vec![], budget_warned: false, ext: Default::default(), subs: 0, closed: Vec::new(), pip: None, changes: HashMap::new(),
         };
         assert!(check_scope(&m, Caller(Some(5)), "send", &json!({"pane": 9})).is_err());
         assert!(check_scope(&m, Caller(Some(5)), "read", &json!({"pane": 9})).is_ok());
         assert!(check_scope(&m, Caller(None), "kill-server", &json!({})).is_ok());
         assert!(check_scope(&m, Caller(Some(5)), "set-state", &json!({"state": "working"})).is_ok());
+        assert!(check_scope(&m, Caller(Some(5)), "approve", &json!({"id": 1, "ok": true})).is_err());
+        assert!(check_scope(&m, Caller(None), "approve", &json!({"id": 1, "ok": true})).is_ok());
     }
 }
 
