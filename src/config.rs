@@ -745,3 +745,44 @@ return { oi = function() return 'oi ' .. duck.os end }").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Grava `chave = valor` (Lua) num bloco gerenciado do ~/.duck-local.lua; o
+/// hot reload aplica. Chave com ponto vira campo aninhado (font.size).
+pub fn set_local_setting(key: &str, value: &str) -> Result<(), String> {
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')) {
+        return Err(format!("chave invalida: {key}"));
+    }
+    // Nome com hifen (claude-usage) nao e identificador Lua: vira ["claude-usage"].
+    let lua_path = |ps: &[&str]| -> String {
+        ps.iter().fold("config".to_string(), |acc, p| {
+            let ident = p.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && p.chars().all(|c| c.is_alphanumeric() || c == '_');
+            if ident { format!("{acc}.{p}") } else { format!("{acc}[\"{p}\"]") }
+        })
+    };
+    let path = local_path();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let (begin, end) = ("-- duck:configuracoes (gerado pela tela de configuracoes)", "-- duck:fim");
+    let (head, mut block, tail) = match (text.find(begin), text.find(end)) {
+        (Some(a), Some(b)) if b > a => (text[..a].to_string(), text[a + begin.len()..b].to_string(), text[b + end.len()..].to_string()),
+        _ => (text.clone(), String::new(), String::new()),
+    };
+    let full = lua_path(&parts);
+    let line_key = format!("{full} =");
+    block = block.lines().filter(|l| !l.trim_start().starts_with(&line_key) && !l.trim().is_empty()).map(|l| format!("{l}\n")).collect();
+    // Garante as tabelas pai, em todos os niveis (config.extensions.jira...).
+    // As guardas ficam no topo, a mais curta primeiro: o pai vem antes do filho.
+    let is_guard = |l: &str| l.split_once(" = ").is_some_and(|(a, b)| b == format!("{a} or {{}}"));
+    let mut guards: Vec<String> = block.lines().filter(|l| is_guard(l)).map(str::to_string).collect();
+    let rest: String = block.lines().filter(|l| !is_guard(l)).map(|l| format!("{l}\n")).collect();
+    for k in 1..parts.len() {
+        let parent = lua_path(&parts[..k]);
+        let guard = format!("{parent} = {parent} or {{}}");
+        if !guards.contains(&guard) { guards.push(guard); }
+    }
+    guards.sort_by_key(|g| g.len());
+    block = guards.iter().map(|g| format!("{g}\n")).collect::<String>() + &rest;
+    block.push_str(&format!("{full} = {value}\n"));
+    let out = format!("{}{begin}\n{block}{end}{}", head.trim_end().to_string() + if head.trim().is_empty() { "" } else { "\n\n" }, tail);
+    std::fs::write(&path, out).map_err(|e| e.to_string())
+}

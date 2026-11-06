@@ -295,15 +295,17 @@ duck mcp                                            # servidor MCP (stdio): duck
 texto para o agente de outro, sem copiar e colar. Vai por TCP direto entre os
 dois Duck (use o Tailscale; na rede local o token passa sem criptografia).
 
-```lua
--- ~/.duck.lua nos dois computadores
-peer = { listen = '100.x.y.z:7878', trust = false, max_hops = 10 },
-peers = { fedora = '100.a.b.c:7878' },
-```
+Para ligar e parear: **Ctrl+Shift+P > Computadores** nos dois. Enter em
+**Desligado** liga a escuta na rede local. Depois, **Copiar o código** num e
+**Colar o código** no outro, ou **Procurar Ducks na rede** e aceitar o pedido
+do outro lado. O mesmo pelo terminal:
 
 ```powershell
-duck peer token                  # no fedora: mostra o token dele
-duck peer add fedora <token>     # aqui: guarda no cofre (duck secret)
+duck peer code                   # o código deste computador (trate como senha)
+duck peer join <código>          # no outro: conecta os dois de uma vez
+duck peer find                   # Ducks escutando na rede local
+duck peer connect 192.168.0.7    # pede conexão; o outro aceita na janela
+duck peer list                   # pareados e se respondem
 duck msg fedora "texto"          # ou: Get-Content x.txt | duck msg fedora
 duck msg fedora --to MinhasCompras "texto"   # para a sessão MinhasCompras de lá
 duck msg fedora --conv 4929def2 "resposta"   # continua a conversa
@@ -316,8 +318,8 @@ achar mais de um, o erro lista os agentes abertos lá. O usuário de lá aprova 
 entrega (`trust = true` entrega direto). Um agente não aprova pela API. A
 entrega espera o agente parar. A resposta volta para o pane que mandou.
 Segredos conhecidos saem mascarados. Depois de `max_hops` mensagens na mesma
-conversa, o Duck recusa e pede o usuário. No Windows, libere a porta no
-firewall. No Fedora: `sudo firewall-cmd --add-port=7878/tcp --permanent && sudo firewall-cmd --reload`.
+conversa, o Duck recusa e pede o usuário. No Windows, libere a porta (TCP e UDP 7878): item **Firewall do Windows** no painel.
+À mão: `config.peer = { listen = 'ip:7878' }` e `config.peers = { nome = 'ip:7878' }` no `~/.duck-local.lua`.
 
 **Fila com dependências (`duck fleet`):** cada linha do arquivo pode ter um
 id, dependências e uma verificação:

@@ -585,45 +585,48 @@ servidor externo.
 - Na rede local sem Tailscale, o token passa sem criptografia. Use só numa rede
   em que você confia.
 
-### Ligar
+### Ligar e parear pelo painel
 
-Faça nos **dois** computadores.
+1. Nos dois computadores: **Ctrl+Shift+P > Computadores**.
+2. Se a primeira linha diz **Desligado**, Enter. O Duck passa a escutar no IP
+   da rede local (porta 7878) e reinicia o server. Os shells continuam.
+   - No Windows, libere a porta: item **Firewall do Windows** no painel (copia
+     o comando; cole num terminal de administrador). Ele libera a TCP e a UDP 7878.
+   - No Fedora a zona padrão do firewall já libera portas acima de 1024.
+3. Conecte de um dos dois jeitos:
+   - **Pelo código.** Num computador: **Copiar o código deste computador**. No
+     outro: **Colar o código do outro computador**. Pronto: os dois lados ficam
+     pareados, sem pergunta. O código leva o token: trate como senha.
+   - **Pela rede.** Num computador: **Procurar Ducks na rede local** e depois
+     **Conectar com ...**. No outro aparece **Pedido de conexão**. Em
+     **Conectar**, os dois lados ficam pareados.
+4. Cada computador pareado aparece no painel com o estado (online e o tempo de
+   resposta). Enter nele: testar, mandar uma mensagem de teste ou remover.
 
-1. Descubra o endereço. Com Tailscale: `tailscale ip -4` (começa com `100.`).
-   Na rede local: `ipconfig` (Windows) ou `ip -4 addr` (Linux).
-2. No `~/.duck.lua`, dentro de `config`, diga onde escutar e quem é o outro:
-   ```lua
-   peer = { listen = '100.64.0.1:7878', trust = false, max_hops = 10 },
-   peers = { fedora = '100.64.0.2:7878' },   -- nome = endereço do OUTRO
-   ```
-   `listen = '0.0.0.0:7878'` escuta em todas as redes. Prefira o IP do Tailscale.
-3. Libere a porta no firewall.
-   - Windows (num terminal de admin):
-     ```powershell
-     New-NetFirewallRule -DisplayName 'Duck peers (7878)' -Direction Inbound -Protocol TCP -LocalPort 7878 -Profile Private -Action Allow
-     ```
-   - Fedora:
-     ```sh
-     sudo firewall-cmd --add-port=7878/tcp --permanent && sudo firewall-cmd --reload
-     ```
-4. Reinicie o server para ele começar a escutar (recarregar a config não basta).
-   Rode num terminal fora do Duck: de dentro de um pane ele é recusado.
-   ```sh
-   duck cli restart-server
-   ```
-   O log (`server.log`) mostra `peers: escutando em ...`.
+Pelo terminal é o mesmo:
 
-### Parear
+```sh
+duck peer code              # o código deste computador
+duck peer join <código>     # cola o código do outro
+duck peer find              # procura Ducks na rede local
+duck peer connect <ip>      # pede conexão; o outro aceita na janela
+duck peer list              # pareados e se respondem
+duck peer remove <nome>
+```
 
-Cada computador tem o próprio token. Cada lado guarda o token do outro.
+### Ligar à mão (Tailscale, outra porta)
 
-1. No Fedora: `duck peer token`. Copie o que aparecer.
-2. No Windows: `duck peer add fedora <token>`.
-3. Faça o contrário: `duck peer token` no Windows e `duck peer add windows <token>`
-   no Fedora.
+No `~/.duck-local.lua` (o painel grava no mesmo arquivo):
 
-O nome no `duck peer add` precisa ser o mesmo nome usado em `peers`. Os tokens
-vão para o cofre de segredos (`duck secret`), nunca para arquivo.
+```lua
+config.peer = { listen = '100.64.0.1:7878', trust = false, max_hops = 10 }
+config.peers = { fedora = '100.64.0.2:7878' }   -- nome = endereço do OUTRO
+```
+
+`listen = '0.0.0.0:7878'` escuta em todas as redes; prefira o IP do Tailscale.
+Depois, **Ctrl+Shift+P > Reiniciar server** (recarregar a config não basta). O
+log (`server.log`) mostra `peers: escutando em ...`. O token do outro vai para
+o cofre com `duck peer add <nome> <token>` (o token sai de `duck peer token` lá).
 
 ### Usar
 

@@ -872,7 +872,7 @@ pub fn msg(args: &[String]) -> i32 {
     };
     let addr = out["addr"].as_str().unwrap_or("").to_string();
     let req = json!({"token": token, "from": out["from"], "conv": out["conv"], "hops": out["hops"], "to": out["to"], "reply_pane": out["reply_pane"], "to_name": to, "text": out["text"]});
-    match peer_send(&addr, &req) {
+    match crate::peer::send(&addr, &req) {
         Ok(v) if v["ok"].as_bool() == Some(true) => {
             let how = if v["approval"].as_bool() == Some(true) { "chegou, espera o usuario de la aprovar" } else { "entregue" };
             println!("{peer}: {how} (conversa {}). A resposta chega neste pane.", out["conv"].as_str().unwrap_or(""));
@@ -883,35 +883,70 @@ pub fn msg(args: &[String]) -> i32 {
     }
 }
 
-fn peer_send(addr: &str, req: &Value) -> Result<Value, String> {
-    use std::io::{BufRead, Write};
-    use std::net::ToSocketAddrs;
-    let sa = addr.to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("endereco invalido")?;
-    let mut s = std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(15)));
-    s.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
-    let mut line = String::new();
-    std::io::BufReader::new(s).read_line(&mut line).map_err(|e| e.to_string())?;
-    serde_json::from_str(&line).map_err(|e| format!("resposta invalida: {e}"))
-}
-
-/// `duck peer token` (o token deste computador, cria na 1a vez) e
-/// `duck peer add <nome> <token>` (o token do outro).
+/// `duck peer ...`: token, codigo de pareamento, conectar, procurar, listar e
+/// remover. O mesmo que o painel Computadores (Ctrl+Shift+P).
 pub fn peer(args: &[String]) -> i32 {
+    let cfg = crate::config::load_config().0;
+    let me = cfg.peer_name.clone();
+    let mine = || crate::peer::advertised(&cfg.peer_listen);
+    let off = "este computador nao escuta. Ligue no painel Computadores (Ctrl+Shift+P) ou ponha peer = { listen = 'ip:7878' } no ~/.duck-local.lua";
     match (args.first().map(String::as_str), args.get(1), args.get(2)) {
-        (Some("token"), _, _) => {
-            let t = crate::secret::get("peer/self").filter(|t| !t.is_empty()).unwrap_or_else(|| {
-                let t = crate::proto::random_hex(32);
-                let _ = crate::secret::set("peer/self", &t);
-                t
-            });
-            println!("{t}");
-            0
-        }
+        (Some("token"), _, _) => { println!("{}", crate::peer::self_token()); 0 }
         (Some("add"), Some(name), Some(token)) => match crate::secret::set(&format!("peer/{name}"), token.trim()) {
             Ok(_) => { println!("ok. Na config: peers = {{ {name} = 'ip:porta' }}"); 0 }
             Err(e) => { eprintln!("{e}"); 1 }
         },
-        _ => { eprintln!("uso: duck peer token | duck peer add <nome> <token>"); 2 }
+        (Some("code"), _, _) => match mine() {
+            Some(addr) => { println!("{}", crate::peer::code(&me, &addr, &crate::peer::self_token())); 0 }
+            None => { eprintln!("duck peer code: {off}"); 1 }
+        },
+        (Some("join"), Some(code), _) => {
+            let c = match crate::peer::parse_code(code) { Ok(c) => c, Err(e) => { eprintln!("duck peer join: {e}"); return 2 } };
+            if c.name == me { eprintln!("duck peer join: esse e o codigo deste computador ({me}). Cole o do outro."); return 1; }
+            let Some(my_addr) = mine() else { eprintln!("duck peer join: {off}"); return 1 };
+            if let Err(e) = crate::peer::save(&c.name, &c.addr, &c.token) { eprintln!("duck peer join: {e}"); return 1; }
+            match crate::peer::pair_request(&me, &my_addr, &c.addr, Some(&c.token)) {
+                Ok(_) => { println!("conectado com {} ({}). Teste: duck msg {} \"oi\"", c.name, c.addr, c.name); 0 }
+                Err(e) => { eprintln!("duck peer join: {} ({}) nao aceitou: {e}", c.name, c.addr); 1 }
+            }
+        }
+        (Some("find"), _, _) => {
+            let port = crate::peer::port_of(&cfg.peer_listen);
+            let mut ports = vec![crate::peer::DEFAULT_PORT];
+            if port != ports[0] { ports.push(port); }
+            let found = crate::peer::discover(&ports, std::time::Duration::from_millis(1500));
+            let mine = mine().unwrap_or_default();
+            let found: Vec<_> = found.into_iter().filter(|f| f["addr"] != mine.as_str()).collect();
+            if found.is_empty() { println!("nenhum Duck respondeu na rede local (o outro precisa estar escutando, e no Windows com a porta UDP liberada)"); }
+            for f in &found { println!("{}  {}  {}", f["name"].as_str().unwrap_or(""), f["addr"].as_str().unwrap_or(""), f["os"].as_str().unwrap_or("")); }
+            0
+        }
+        (Some("connect"), Some(addr), _) => {
+            let Some(my_addr) = mine() else { eprintln!("duck peer connect: {off}"); return 1 };
+            let addr = if addr.contains(':') { addr.clone() } else { format!("{addr}:{}", crate::peer::DEFAULT_PORT) };
+            match crate::peer::pair_request(&me, &my_addr, &addr, None) {
+                Ok(v) => { println!("pedido enviado para {} ({addr}): aceite la. Quando aceitar, ele aparece em duck peer list.", v["name"].as_str().unwrap_or("?")); 0 }
+                Err(e) => { eprintln!("duck peer connect: {addr}: {e}"); 1 }
+            }
+        }
+        (Some("list"), _, _) => {
+            match mine() { Some(a) => println!("este computador: {me} em {a}"), None => println!("este computador: {me} (nao escuta)") }
+            for (name, addr) in &cfg.peers {
+                let tok = if crate::secret::get(&format!("peer/{name}")).is_some() { "" } else { "  (sem token)" };
+                match crate::peer::ping(addr) {
+                    Ok(ms) => println!("  online  {name}  {addr}  {ms} ms{tok}"),
+                    Err(e) => println!("  offline {name}  {addr}  {e}{tok}"),
+                }
+            }
+            0
+        }
+        (Some("remove"), Some(name), _) => match crate::peer::remove(name) {
+            Ok(_) => { println!("{name} removido"); 0 }
+            Err(e) => { eprintln!("{e}"); 1 }
+        },
+        _ => {
+            eprintln!("uso: duck peer code | join <codigo> | find | connect <ip[:porta]> | list | remove <nome> | token | add <nome> <token>");
+            2
+        }
     }
 }

@@ -20,13 +20,14 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, UserAttentionType, Window, WindowId, WindowLevel};
 
-use crate::config::{self, Config, Rgb, Theme};
+use crate::config::{self, set_local_setting, Config, Rgb, Theme};
 use crate::proto::Conn;
 use crate::render::{lin, Layer, Quad, Renderer, TextItem};
 
 mod ext;
 mod best;
 mod graph;
+mod peers;
 mod ui;
 use ui::{Ac, AgentPanel, Composer, Hit};
 
@@ -256,6 +257,8 @@ struct Overlay {
     gallery: Option<Theme>,
     /// Campo de token: mostra bolinhas no lugar do texto.
     secret: bool,
+    /// Painel Computadores: um pedido de conexao pode abrir por cima dele.
+    peers: bool,
     /// Paleta: uso por rotulo (ultimo uso em segundos, vezes). Recentes
     /// primeiro com a busca vazia; frequentes sobem no desempate.
     rank: HashMap<String, (u64, u32)>,
@@ -293,13 +296,13 @@ fn fuzzy(q: &str, s: &str) -> Option<i32> {
 impl Overlay {
     fn list(title: &str, items: Vec<Item>) -> Overlay {
         let mut o = Overlay { title: title.into(), input: String::new(), items, shown: vec![], sel: 0, kind: OverlayKind::List, agents: false,
-            dialog: false, home: false, palette: false, gallery: None, secret: false, rank: HashMap::new() };
+            dialog: false, home: false, palette: false, gallery: None, secret: false, peers: false, rank: HashMap::new() };
         o.filter();
         o
     }
     fn prompt(title: &str, initial: &str, action: &str, args: Vec<Value>) -> Overlay {
         Overlay { title: title.into(), input: initial.into(), items: vec![], shown: vec![], sel: 0, kind: OverlayKind::Prompt(action.into(), args), agents: false,
-            dialog: false, home: false, palette: false, gallery: None, secret: false, rank: HashMap::new() }
+            dialog: false, home: false, palette: false, gallery: None, secret: false, peers: false, rank: HashMap::new() }
     }
     fn dialog(title: &str, items: Vec<Item>) -> Overlay {
         let mut o = Overlay::list(title, items);
@@ -363,6 +366,9 @@ struct Stats {
 }
 
 pub struct Gui {
+    /// Painel Computadores: estado de cada peer ("online 4 ms"...) e o que a descoberta achou.
+    peer_status: HashMap<String, String>,
+    peer_found: Option<Vec<Value>>,
     proxy: EventLoopProxy<UserEv>,
     client: String,
     conn: Arc<Mutex<Option<Conn>>>,
@@ -556,6 +562,7 @@ impl Gui {
             collapsed: HashMap::new(), pinned: HashMap::new(), search_hits: None, composer: None, ac: None, ac_dismissed: String::new(),
             usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), last_loop_check: String::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
             tab_cur: 0, tab_prev: 0, palette_rank: load_palette_rank(), scroll_base: HashMap::new(), pane_drag: None,
+            peer_status: HashMap::new(), peer_found: None,
         };
         g.load_config();
         g
@@ -1429,6 +1436,7 @@ impl Gui {
             b("Fonte padrao", "font_size", vec![json!(0)]),
             b("Recarregar config", "reload_config", vec![]),
             b("Desanexar (fecha a janela, shells continuam)", "detach", vec![]),
+            b("Computadores: conectar outro computador (mensagens entre agentes)", "peers", vec![]),
             b("Reiniciar server (atualiza o Duck; os shells continuam)", "restart_server", vec![]),
             b("Encerrar server (fecha todos os shells)", "kill_server", vec![]),
             b("Inicio: projetos, sessoes e acoes", "home", vec![]),
@@ -2215,18 +2223,21 @@ impl Gui {
                 r.window.set_title(&if title.is_empty() { format!("Duck · {}", f.workspace) } else { format!("{title} · Duck") });
             }
             // Pedido de aprovacao (OSC 52, acao de agente): pergunta uma vez.
-            if self.overlay.is_none() {
+            // O painel Computadores fica aberto esperando o outro lado: o pedido abre por cima.
+            if self.overlay.as_ref().is_none_or(|o| o.peers) {
                 if let Some(a) = f.approvals.iter().find(|a| !self.asked.contains(&a.id)).cloned() {
                     self.asked.insert(a.id);
                     let (yes, title) = match a.kind.as_str() {
                         "clipboard" => ("Permitir copiar", "Clipboard"),
                         "peer" => ("Entregar ao agente", "Mensagem de outro computador"),
+                        "pair" => ("Conectar", "Pedido de conexao"),
                         _ => ("Permitir", "Agente pede confirmacao"),
                     };
                     // Negar primeiro: Enter distraido nao libera nada.
                     let items = vec![
                         Item::new("Negar", "Esc", "approve", vec![json!(a.id), json!(false)]),
-                        Item::new(yes, "", "approve", vec![json!(a.id), json!(true)]),
+                        if a.kind == "pair" { Item::new(yes, "guarda o outro computador dos dois lados", "peer_accept", vec![json!(a.id)]) }
+                        else { Item::new(yes, "", "approve", vec![json!(a.id), json!(true)]) },
                     ];
                     self.overlay = Some(Overlay::dialog(&format!("{title}: {}", a.text), items));
                     if !self.focused { toast("Duck pede confirmacao", &a.text); }
@@ -2585,47 +2596,6 @@ fn read_head(path: &str, max: usize) -> String {
     let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)).unwrap_or(0);
     buf.truncate(n);
     String::from_utf8_lossy(&buf).to_string()
-}
-
-/// Grava `chave = valor` (Lua) num bloco gerenciado do ~/.duck-local.lua; o
-/// hot reload aplica. Chave com ponto vira campo aninhado (font.size).
-fn set_local_setting(key: &str, value: &str) -> Result<(), String> {
-    let parts: Vec<&str> = key.split('.').collect();
-    if parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')) {
-        return Err(format!("chave invalida: {key}"));
-    }
-    // Nome com hifen (claude-usage) nao e identificador Lua: vira ["claude-usage"].
-    let lua_path = |ps: &[&str]| -> String {
-        ps.iter().fold("config".to_string(), |acc, p| {
-            let ident = p.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && p.chars().all(|c| c.is_alphanumeric() || c == '_');
-            if ident { format!("{acc}.{p}") } else { format!("{acc}[\"{p}\"]") }
-        })
-    };
-    let path = config::local_path();
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let (begin, end) = ("-- duck:configuracoes (gerado pela tela de configuracoes)", "-- duck:fim");
-    let (head, mut block, tail) = match (text.find(begin), text.find(end)) {
-        (Some(a), Some(b)) if b > a => (text[..a].to_string(), text[a + begin.len()..b].to_string(), text[b + end.len()..].to_string()),
-        _ => (text.clone(), String::new(), String::new()),
-    };
-    let full = lua_path(&parts);
-    let line_key = format!("{full} =");
-    block = block.lines().filter(|l| !l.trim_start().starts_with(&line_key) && !l.trim().is_empty()).map(|l| format!("{l}\n")).collect();
-    // Garante as tabelas pai, em todos os niveis (config.extensions.jira...).
-    // As guardas ficam no topo, a mais curta primeiro: o pai vem antes do filho.
-    let is_guard = |l: &str| l.split_once(" = ").is_some_and(|(a, b)| b == format!("{a} or {{}}"));
-    let mut guards: Vec<String> = block.lines().filter(|l| is_guard(l)).map(str::to_string).collect();
-    let rest: String = block.lines().filter(|l| !is_guard(l)).map(|l| format!("{l}\n")).collect();
-    for k in 1..parts.len() {
-        let parent = lua_path(&parts[..k]);
-        let guard = format!("{parent} = {parent} or {{}}");
-        if !guards.contains(&guard) { guards.push(guard); }
-    }
-    guards.sort_by_key(|g| g.len());
-    block = guards.iter().map(|g| format!("{g}\n")).collect::<String>() + &rest;
-    block.push_str(&format!("{full} = {value}\n"));
-    let out = format!("{}{begin}\n{block}{end}{}", head.trim_end().to_string() + if head.trim().is_empty() { "" } else { "\n\n" }, tail);
-    std::fs::write(&path, out).map_err(|e| e.to_string())
 }
 
 fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb { config::mix_rgb(a, b, t) }
@@ -3049,9 +3019,13 @@ impl Gui {
                 self.load_config();
                 self.cmd(json!({"cmd": "reload"}));
                 if self.cfg_error.is_none() { self.flash("Config recarregada"); }
+                if self.overlay.as_ref().is_some_and(|o| o.peers) { self.open_peers(false); }
                 self.send_size();
             }
             UserEv::Tick => {
+                // Resultados de threads (painel Computadores) chegam pela fila.
+                let pending: Vec<_> = std::mem::take(&mut *self.queue.lock().unwrap());
+                for (n, args) in pending { self.builtin(&n, &args); }
                 if self.grid.is_some() { self.refresh_grid(); }
                 if self.graph.is_some() { self.refresh_graph(); }
                 if self.agent_panel.is_some() { self.refresh_agent_panel(false); }

@@ -593,46 +593,52 @@ outside server.
 - On the local network without Tailscale, the token travels unencrypted. Use it
   only on a network you trust.
 
-### Turn on
+### Turn on and pair from the panel
 
-Do this on **both** computers.
+1. On both computers: **Ctrl+Shift+P > Computadores** (Computers).
+2. If the first line says **Desligado** (off), press Enter. Duck starts
+   listening on the local network IP (port 7878) and restarts the server. The
+   shells keep running.
+   - On Windows, open the port: the **Firewall do Windows** item in the panel
+     copies the command; paste it in an admin terminal. It opens TCP and UDP 7878.
+   - On Fedora the default firewall zone already allows ports above 1024.
+3. Connect in one of two ways:
+   - **With the code.** On one computer: **Copiar o código deste computador**
+     (copy this computer's code). On the other: **Colar o código do outro
+     computador** (paste the other one's code). Done: both sides are paired, no
+     question asked. The code carries the token: treat it like a password.
+   - **Over the network.** On one computer: **Procurar Ducks na rede local**
+     (find Ducks on the local network), then **Conectar com ...** (connect to).
+     The other one shows **Pedido de conexão** (connection request). On
+     **Conectar**, both sides are paired.
+4. Each paired computer shows in the panel with its state (online and the
+   response time). Enter on it: test, send a test message or remove.
 
-1. Find the address. With Tailscale: `tailscale ip -4` (it starts with `100.`).
-   On the local network: `ipconfig` (Windows) or `ip -4 addr` (Linux).
-2. In `~/.duck.lua`, inside `config`, tell Duck where to listen and who the
-   other computer is:
-   ```lua
-   peer = { listen = '100.64.0.1:7878', trust = false, max_hops = 10 },
-   peers = { fedora = '100.64.0.2:7878' },   -- name = address of the OTHER one
-   ```
-   `listen = '0.0.0.0:7878'` listens on every network; prefer the Tailscale IP.
-3. Open the port in the firewall.
-   - Windows (an admin prompt):
-     ```powershell
-     New-NetFirewallRule -DisplayName 'Duck peers (7878)' -Direction Inbound -Protocol TCP -LocalPort 7878 -Profile Private -Action Allow
-     ```
-   - Fedora:
-     ```sh
-     sudo firewall-cmd --add-port=7878/tcp --permanent && sudo firewall-cmd --reload
-     ```
-4. Restart the server so it starts listening (the config reload is not enough).
-   Run it in a terminal outside Duck: from inside a pane it is refused.
-   ```sh
-   duck cli restart-server
-   ```
-   The log (`server.log`) shows `peers: escutando em ...` (peers: listening on).
+The same from the terminal:
 
-### Pair
+```sh
+duck peer code              # this computer's code
+duck peer join <code>       # paste the other one's code
+duck peer find              # find Ducks on the local network
+duck peer connect <ip>      # ask to connect; the other accepts in its window
+duck peer list              # paired computers and whether they answer
+duck peer remove <name>
+```
 
-Each computer has its own token. Each side keeps the token of the other.
+### Turn on by hand (Tailscale, another port)
 
-1. On the Fedora: `duck peer token`. Copy what it prints.
-2. On the Windows: `duck peer add fedora <token>`.
-3. Do the reverse: `duck peer token` on the Windows, `duck peer add windows <token>`
-   on the Fedora.
+In `~/.duck-local.lua` (the panel writes to the same file):
 
-The name in `duck peer add` must be the same name used in `peers`. Tokens go
-to the secret vault (`duck secret`), never to a file.
+```lua
+config.peer = { listen = '100.64.0.1:7878', trust = false, max_hops = 10 }
+config.peers = { fedora = '100.64.0.2:7878' }   -- name = address of the OTHER one
+```
+
+`listen = '0.0.0.0:7878'` listens on every network; prefer the Tailscale IP.
+Then **Ctrl+Shift+P > Reiniciar server** (restart server; a config reload is
+not enough). The log (`server.log`) shows `peers: escutando em ...`. The other
+one's token goes to the vault with `duck peer add <name> <token>` (the token
+comes from `duck peer token` over there).
 
 ### Use
 

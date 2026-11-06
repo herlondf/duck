@@ -18,6 +18,7 @@ pub mod config;
 pub mod ext;
 pub mod gui;
 pub mod guard;
+pub mod peer;
 pub mod plugins;
 pub mod proto;
 pub mod ptyhost;
