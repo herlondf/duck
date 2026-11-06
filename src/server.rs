@@ -543,7 +543,7 @@ fn spawn_pane(srv: &Arc<Server>, m: &mut Mux, o: SpawnOpts) -> Result<Id, String
     let client = client.ok_or_else(|| format!("ptyhost nao respondeu ({})", argv[0]))?;
     attach(srv, m, id, client, Some(pid), PaneMeta {
         title: String::new(), cwd: o.cwd.unwrap_or(cwd), domain, cmd: o.cmd.unwrap_or_default(),
-        agent: None, token, parent: o.parent, private: false,
+        agent: None, token, parent: o.parent, private: false, size: (cols, rows),
     }, o.text.as_deref(), cols, rows);
     emit(m, "pane-created", id);
     Ok(id)
@@ -559,6 +559,10 @@ struct PaneMeta {
     token: String,
     parent: Option<Id>,
     private: bool,
+    /// Tamanho do pane (colunas, linhas). O server seguinte refaz o terminal
+    /// nesse tamanho antes de repetir a saida guardada: noutro, o texto embaralha.
+    #[serde(default)]
+    size: (u16, u16),
 }
 
 /// Liga um host (novo ou recuperado) ao mux: Term, fila de escrita e leitora.
@@ -1703,6 +1707,10 @@ fn mask_row(runs: &mut [Value], re: &regex::Regex) -> Vec<String> {
 fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64, bool)) -> Value {
     p.resolve_marks();
     if p.cols != r.w || p.rows != r.h {
+        // Pane recuperado de um server anterior (cols = 0): o pty ja tem este
+        // tamanho, e o mesmo tamanho nao avisa ninguem. Uma linha a menos e
+        // de volta manda o SIGWINCH (no Windows, o ConPTY repinta a tela).
+        if p.cols == 0 { let _ = p.io.send(Io::Resize(r.w, r.h.saturating_sub(1).max(1))); }
         p.cols = r.w;
         p.rows = r.h;
         p.term.resize(Dims { cols: r.w as usize, lines: r.h as usize });
@@ -3284,7 +3292,7 @@ fn live_snapshot(m: &Mux) -> Live {
         }).collect(),
         panes: m.panes.iter().map(|(id, p)| (*id, PaneMeta {
             title: p.title.clone(), cwd: p.cwd.clone(), domain: p.domain.clone(), cmd: p.cmd.clone(),
-            agent: p.agent.clone(), token: p.token.clone(), parent: p.parent, private: p.private,
+            agent: p.agent.clone(), token: p.token.clone(), parent: p.parent, private: p.private, size: (if p.cols == 0 { p.term.columns() as u16 } else { p.cols }, p.rows),
         })).collect(),
     }
 }
@@ -3321,7 +3329,11 @@ fn recover(srv: &Arc<Server>) {
         let meta = live.as_ref().and_then(|l| l.panes.get(&h.id).cloned()).unwrap_or_else(|| PaneMeta {
             cwd: h.cwd.clone(), token: proto::random_hex(16), ..Default::default()
         });
-        attach(srv, &mut m, h.id, c, Some(h.pid), meta, None, cols, rows);
+        let (c_, r_) = if meta.size.0 >= 2 && meta.size.1 >= 2 { meta.size } else { (cols, rows) };
+        attach(srv, &mut m, h.id, c, Some(h.pid), meta, None, c_, r_);
+        // Recuperado: o primeiro layout cutuca o tamanho (pane_json) para os
+        // programas de tela cheia (Claude Code, vim) se redesenharem.
+        if let Some(p) = m.panes.get_mut(&h.id) { p.cols = 0; }
         attached.push(h.id);
         m.next = m.next.max(h.id + 1);
     }

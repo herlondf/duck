@@ -148,7 +148,7 @@ impl Gui {
             "peer_copy_code" => {
                 let Some(a) = peer::advertised(&self.cfg.peer_listen) else { return true };
                 let code = peer::code(&self.cfg.peer_name, &a, &peer::self_token());
-                match arboard::Clipboard::new().and_then(|mut c| c.set_text(code)) {
+                match clip_set(&code) {
                     Ok(_) => self.flash("Código copiado. No outro computador: Computadores > Colar o código. Trate como senha."),
                     Err(e) => self.flash(&format!("clipboard: {e}")),
                 }
@@ -268,7 +268,7 @@ impl Gui {
             }
             "peer_firewall" => {
                 let cmd = peer::windows_firewall_cmd(peer::port_of(&self.cfg.peer_listen));
-                match arboard::Clipboard::new().and_then(|mut c| c.set_text(cmd)) {
+                match clip_set(&cmd) {
                     Ok(_) => self.flash("Comando copiado: cole num terminal de administrador"),
                     Err(e) => self.flash(&format!("clipboard: {e}")),
                 }

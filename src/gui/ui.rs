@@ -2002,7 +2002,7 @@ impl Gui {
                         let cmd = v["cmd"].as_str().unwrap_or("").to_string();
                         match name {
                             "block_copy" => {
-                                if let Ok(mut c) = arboard::Clipboard::new() { let _ = c.set_text(text.replace('\n', "\r\n")); }
+                                let _ = clip_set(&text);
                                 self.flash(&format!("Saida copiada ({} linhas)", text.lines().count()));
                             }
                             "block_pin" => {
@@ -2576,7 +2576,6 @@ impl Gui {
             }
             _ => {}
         }
-        let clip = arboard::Clipboard::new().ok();
         let Some(c) = self.composer.as_mut() else { return };
         let snap = |c: &mut Composer| { c.undo.push((c.text.clone(), c.cur)); if c.undo.len() > 200 { c.undo.remove(0); } c.redo.clear(); };
         let sel = |c: &Composer| c.anchor.filter(|a| *a != c.cur).map(|a| (a.min(c.cur), a.max(c.cur)));
@@ -2626,10 +2625,10 @@ impl Gui {
                 "y" => if let Some((t, cur)) = c.redo.pop() { c.undo.push((c.text.clone(), c.cur)); c.text = t; c.cur = cur; c.anchor = None; },
                 "c" | "x" => if let Some((a, b)) = sel(c) {
                     let t: String = c.text[a..b].iter().collect();
-                    if let Some(mut cb) = clip { let _ = cb.set_text(t); }
+                    let _ = clip_set(&t);
                     if k.eq_ignore_ascii_case("x") { snap(c); del_sel(c); }
                 },
-                "v" => if let Some(t) = clip.and_then(|mut cb| cb.get_text().ok()) {
+                "v" => if let Some(t) = Some(clip_get()).filter(|t| !t.is_empty()) {
                     snap(c);
                     del_sel(c);
                     for ch in t.replace("\r\n", "\n").chars() { c.text.insert(c.cur, ch); c.cur += 1; }

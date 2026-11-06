@@ -215,6 +215,42 @@ fn key_name(ev: &KeyEvent) -> String {
     }
 }
 
+// ------------------------------------------------------------------ clipboard
+
+thread_local! {
+    /// Um clipboard so, vivo enquanto a janela vive. No Linux quem copiou e
+    /// quem entrega o texto: criar e soltar um a cada copia perdia o conteudo
+    /// (a outra aba achava o clipboard vazio).
+    static CLIP: std::cell::RefCell<Option<arboard::Clipboard>> = const { std::cell::RefCell::new(None) };
+}
+
+fn with_clip<T>(f: impl Fn(&mut arboard::Clipboard) -> Result<T, arboard::Error>) -> Result<T, String> {
+    CLIP.with(|cell| {
+        let mut c = cell.borrow_mut();
+        if c.is_none() { *c = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?); }
+        match f(c.as_mut().unwrap()) {
+            Ok(v) => Ok(v),
+            // Vazio nao e falha. Outro erro (conexao com o X caiu): tenta com um novo.
+            Err(arboard::Error::ContentNotAvailable) => Err("clipboard vazio".into()),
+            Err(_) => {
+                *c = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+                f(c.as_mut().unwrap()).map_err(|e| e.to_string())
+            }
+        }
+    })
+}
+
+/// Copia texto. No Windows, quebra de linha vira CRLF (o Bloco de Notas e afins esperam).
+fn clip_set(text: &str) -> Result<(), String> {
+    let t = if cfg!(windows) { text.replace("\r\n", "\n").replace('\n', "\r\n") } else { text.to_string() };
+    with_clip(|c| c.set_text(t.clone()))
+}
+
+/// Texto do clipboard ("" se vazio).
+fn clip_get() -> String { with_clip(|c| c.get_text()).unwrap_or_default() }
+
+fn clip_image() -> Option<arboard::ImageData<'static>> { with_clip(|c| c.get_image()).ok() }
+
 // ------------------------------------------------------------------ overlay
 
 #[derive(Clone)]
@@ -1061,7 +1097,7 @@ impl Gui {
             "copy_last_output" => match self.call(json!({"cmd": "last-output", "pane": ap})) {
                 Ok(v) => {
                     let t = v["text"].as_str().unwrap_or("").to_string();
-                    if let Ok(mut c) = arboard::Clipboard::new() { let _ = c.set_text(t.replace('\n', "\r\n")); }
+                    let _ = clip_set(&t);
                     self.flash(&format!("Saida do ultimo comando copiada ({} linhas, exit {})", t.lines().count(), v["exit"]));
                 }
                 Err(e) => self.flash(&e),
@@ -1115,7 +1151,7 @@ impl Gui {
             }
             "copy" => self.copy_selection(),
             "paste" => {
-                let text = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+                let text = clip_get();
                 if text.is_empty() {
                     // Print no clipboard: vira PNG e cola o caminho (o Claude Code le imagens por caminho).
                     match self.clipboard_image() {
@@ -1886,7 +1922,7 @@ impl Gui {
     /// Print no clipboard -> PNG temporario; devolve o caminho (do jeito que o
     /// pane ativo enxerga: caminho Linux no WSL).
     fn clipboard_image(&self) -> Option<String> {
-        let img = arboard::Clipboard::new().ok()?.get_image().ok()?;
+        let img = clip_image()?;
         let buf = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())?;
         let dir = std::env::temp_dir().join("duck-imagens");
         let _ = std::fs::create_dir_all(&dir);
@@ -1991,7 +2027,7 @@ impl Gui {
 
     fn copy_selection(&mut self) {
         if let Some(t) = self.selection_text().filter(|t| !t.trim().is_empty()) {
-            if let Ok(mut c) = arboard::Clipboard::new() { let _ = c.set_text(t.clone()); }
+            let _ = clip_set(&t);
             self.ext_clipboard(&t);
             self.flash("Copiado");
         }
@@ -2094,7 +2130,7 @@ impl Gui {
                     if upper {
                         open_url(&text);
                     } else {
-                        if let Ok(mut c) = arboard::Clipboard::new() { let _ = c.set_text(text.clone()); }
+                        let _ = clip_set(&text);
                         self.flash(&format!("Copiado: {text}"));
                     }
                 }
@@ -2146,7 +2182,7 @@ impl Gui {
             }
             _ => {
                 if ctrl && key_name(ev) == "v" {
-                    let t = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+                    let t = clip_get();
                     o.input.push_str(t.lines().next().unwrap_or(""));
                     o.filter();
                 } else if let Some(t) = &ev.text {
@@ -2211,7 +2247,7 @@ impl Gui {
             let f = merge_frame(Some(&self.frame), f);
             if f.clipboard.0 > self.clip_seq {
                 if self.clip_seq != 0 && !f.clipboard.1.is_empty() {
-                    if let Ok(mut c) = arboard::Clipboard::new() { let _ = c.set_text(f.clipboard.1.clone()); }
+                    let _ = clip_set(&f.clipboard.1);
                 }
                 self.clip_seq = f.clipboard.0;
             }
