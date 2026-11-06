@@ -69,7 +69,7 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("toast") => toast::run(args.get(1).map(String::as_str).unwrap_or("")),
         Some("--version" | "-V") => { println!("duck {}", env!("CARGO_PKG_VERSION")); 0 }
         Some("--help" | "-h") => {
-            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan | msg <peer> texto | peer token|add");
+            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan | msg <peer> [--to sessao] texto | peer token|add");
             0
         }
         _ => {

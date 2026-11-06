@@ -305,11 +305,14 @@ peers = { fedora = '100.a.b.c:7878' },
 duck peer token                  # no fedora: mostra o token dele
 duck peer add fedora <token>     # aqui: guarda no cofre (duck secret)
 duck msg fedora "texto"          # ou: Get-Content x.txt | duck msg fedora
+duck msg fedora --to MinhasCompras "texto"   # para a sessão MinhasCompras de lá
 duck msg fedora --conv 4929def2 "resposta"   # continua a conversa
 ```
 
 A mensagem vai para o agente da conversa. Se for a primeira, vai para o
-agente do pane aberto na janela de lá. O usuário de lá aprova antes da
+agente do pane aberto na janela de lá. Com `--to`, vai para o agente cujo nome
+da aba, título, pasta ou número do pane bate com o texto. Se não achar ou
+achar mais de um, o erro lista os agentes abertos lá. O usuário de lá aprova antes da
 entrega (`trust = true` entrega direto). Um agente não aprova pela API. A
 entrega espera o agente parar. A resposta volta para o pane que mandou.
 Segredos conhecidos saem mascarados. Depois de `max_hops` mensagens na mesma

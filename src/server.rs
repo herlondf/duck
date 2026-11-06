@@ -1005,9 +1005,14 @@ fn peer_in(srv: &Arc<Server>, v: &Value, ip: &str) -> Result<Value, String> {
     if text.trim().is_empty() { return Err("falta text".into()); }
     let has_agent = |m: &Mux, id: Id| m.panes.get(&id).is_some_and(|p| p.agent.is_some());
     let local = m.convs.get(&conv).and_then(|c| c.local_pane);
-    let to = v["to"].as_u64().filter(|&id| has_agent(&m, id))
-        .or(local.filter(|&id| has_agent(&m, id)))
-        .or(front_pane(&m).filter(|&id| has_agent(&m, id)));
+    let want = clean(v["to_name"].as_str().unwrap_or(""), 80);
+    let to = if !want.is_empty() {
+        Some(pick_agent(&agent_names(&m), &want)?)
+    } else {
+        v["to"].as_u64().filter(|&id| has_agent(&m, id))
+            .or(local.filter(|&id| has_agent(&m, id)))
+            .or(front_pane(&m).filter(|&id| has_agent(&m, id)))
+    };
     let preview = clean(&text.replace('\n', " "), 160);
     m.inbox.push(json!({"kind": "peer", "pane": to.unwrap_or(0), "title": format!("Mensagem de {from}"), "body": preview, "color": "working"}));
     srv.notify();
@@ -1026,6 +1031,42 @@ fn peer_in(srv: &Arc<Server>, v: &Value, ip: &str) -> Result<Value, String> {
         ask(&mut m, "peer", to, format!("{from} quer mandar para o agente do pane {to} ({title}): {preview}"), body);
         Ok(proto::ok(json!({"pane": to, "approval": true})))
     }
+}
+
+/// Panes com agente e os nomes que servem para achar cada um (`duck msg --to`):
+/// aba, titulo, pasta e sessao.
+fn agent_names(m: &Mux) -> Vec<(Id, Vec<String>)> {
+    let mut v: Vec<(Id, Vec<String>)> = m.panes.iter().filter(|(_, p)| p.agent.is_some()).map(|(&id, p)| {
+        let tab = locate(m, id).map(|(w, t)| m.workspaces[w].tabs[t].title.clone()).unwrap_or_default();
+        let dir = p.cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("").to_string();
+        let sess = p.agent.as_ref().and_then(|a| a.session.clone()).unwrap_or_default();
+        (id, [tab, p.title.clone(), dir, sess].into_iter().filter(|n| !n.is_empty()).collect())
+    }).collect();
+    v.sort_by_key(|x| x.0);
+    v
+}
+
+/// Acha o agente pelo nome: id do pane, nome igual ou, se so um bater, parte do nome.
+fn pick_agent(cands: &[(Id, Vec<String>)], want: &str) -> Result<Id, String> {
+    if let Ok(id) = want.parse::<Id>() { if cands.iter().any(|c| c.0 == id) { return Ok(id); } }
+    let w = want.to_lowercase();
+    for exact in [true, false] {
+        let hit: Vec<Id> = cands.iter().filter(|(_, ns)| ns.iter().any(|n| {
+            let n = n.to_lowercase();
+            if exact { n == w } else { n.contains(&w) }
+        })).map(|c| c.0).collect();
+        match hit.len() {
+            0 => continue,
+            1 => return Ok(hit[0]),
+            _ => return Err(format!("mais de um agente com '{want}': {}. Use um nome mais exato ou o numero do pane.", list_agents(cands, &hit))),
+        }
+    }
+    let all: Vec<Id> = cands.iter().map(|c| c.0).collect();
+    Err(format!("nenhum agente com '{want}'. Abertos: {}", if all.is_empty() { "nenhum".into() } else { list_agents(cands, &all) }))
+}
+
+fn list_agents(cands: &[(Id, Vec<String>)], ids: &[Id]) -> String {
+    cands.iter().filter(|c| ids.contains(&c.0)).map(|(id, ns)| format!("{id} ({})", ns.iter().take(2).cloned().collect::<Vec<_>>().join(" / "))).collect::<Vec<_>>().join(", ")
 }
 
 fn deliver(p: &Pane, text: &str) {
@@ -3528,6 +3569,12 @@ mod tests {
         let doms = vec![config::Domain { name: "Linux".into(), cmd: ["wsl.exe", "-d", "Ubuntu", "--cd", "~"].map(String::from).to_vec(), background: None, tab_color: None, reconnect: false }];
         assert_eq!(wsl_domain(&doms, "ubuntu").as_deref(), Some("Linux"));
         assert_eq!(wsl_domain(&doms, "Debian"), None);
+        let c = vec![(3, vec!["ComponentesUI".into(), "rails".into()]), (5, vec!["MinhasCompras".into()]), (7, vec!["Componentes".into()])];
+        assert_eq!(pick_agent(&c, "componentes"), Ok(7));
+        assert_eq!(pick_agent(&c, "compras"), Ok(5));
+        assert_eq!(pick_agent(&c, "3"), Ok(3));
+        assert!(pick_agent(&c, "comp").unwrap_err().contains("mais de um"));
+        assert!(pick_agent(&c, "xyz").unwrap_err().contains("Abertos: 3"));
         assert_eq!(percent_decode("/C:/My%20Dir"), "/C:/My Dir");
     }
 

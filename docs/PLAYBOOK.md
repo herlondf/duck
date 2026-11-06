@@ -641,6 +641,7 @@ From an agent (or from you, in any pane):
 ```sh
 duck msg fedora "Install the Fedora package for X and tell me the version"
 cat config.toml | duck msg fedora          # text from stdin
+duck msg fedora --to MinhasCompras "..."   # to a specific session over there
 ```
 
 On the other computer:
@@ -651,6 +652,9 @@ On the other computer:
 2. It goes to the agent of the conversation. If it is the first message, it
    goes to the agent of the pane open in the window. A pane without an agent
    does not receive it: the sender gets an error.
+   With `--to <name>`, it goes to the agent whose tab name, title, folder or
+   pane number matches. No match, or more than one: the error lists the agents
+   open there.
 3. If the agent is working, the message waits until it stops.
 4. The delivered text tells the agent how to answer
    (`duck msg <name> --conv <id> "..."`). The answer comes back to the pane that

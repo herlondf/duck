@@ -850,16 +850,16 @@ mod stats_tests {
     }
 }
 
-/// `duck msg <peer> [--conv ID] "texto"` (ou texto no stdin): manda para o
+/// `duck msg <peer> [--to SESSAO] [--conv ID] "texto"` (ou texto no stdin): manda para o
 /// agente de outro computador. O server prepara; a rede sai daqui.
 pub fn msg(args: &[String]) -> i32 {
-    let mut conv = None;
+    let (mut conv, mut to) = (None, None);
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--conv" { conv = it.next().cloned(); } else { rest.push(a.clone()); }
+        if a == "--conv" { conv = it.next().cloned(); } else if a == "--to" { to = it.next().cloned(); } else { rest.push(a.clone()); }
     }
-    let Some(peer) = rest.first().cloned() else { eprintln!("uso: duck msg <peer> [--conv ID] \"texto\"   (sem texto: le do stdin)"); return 2 };
+    let Some(peer) = rest.first().cloned() else { eprintln!("uso: duck msg <peer> [--to SESSAO] [--conv ID] \"texto\"   (sem texto: le do stdin)"); return 2 };
     let mut text = rest[1..].join(" ");
     if text.trim().is_empty() { let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text); }
     let mut c = match Conn::connect_or_spawn() { Ok(c) => c, Err(e) => { eprintln!("duck: {e}"); return 1 } };
@@ -871,7 +871,7 @@ pub fn msg(args: &[String]) -> i32 {
         return 1;
     };
     let addr = out["addr"].as_str().unwrap_or("").to_string();
-    let req = json!({"token": token, "from": out["from"], "conv": out["conv"], "hops": out["hops"], "to": out["to"], "reply_pane": out["reply_pane"], "text": out["text"]});
+    let req = json!({"token": token, "from": out["from"], "conv": out["conv"], "hops": out["hops"], "to": out["to"], "reply_pane": out["reply_pane"], "to_name": to, "text": out["text"]});
     match peer_send(&addr, &req) {
         Ok(v) if v["ok"].as_bool() == Some(true) => {
             let how = if v["approval"].as_bool() == Some(true) { "chegou, espera o usuario de la aprovar" } else { "entregue" };
