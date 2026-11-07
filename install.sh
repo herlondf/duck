@@ -11,6 +11,10 @@
 #   ./install.sh --yes           answer yes to every question (unattended install)
 #   ./install.sh --no-shell      leave ~/.bashrc and ~/.zshrc alone
 #
+# From a release package (duck-linux-x86_64.tar.gz) the binaries are already built:
+# nothing is compiled and the bundled extensions are installed as they are.
+# Num pacote de release os binarios ja vem prontos: nada e compilado.
+#
 # Only system packages (with sudo, after asking) change anything outside your home.
 # So os pacotes do sistema (com sudo, depois de perguntar) mexem fora do seu home.
 set -euo pipefail
@@ -43,6 +47,10 @@ ask() {
   read -r r || return 1
   case "$r" in ""|[sSyY]*) return 0 ;; *) return 1 ;; esac
 }
+
+# Pacote de release: binarios prontos ao lado deste script, sem Cargo.toml.
+prebuilt=0; src="$root/target/release"
+if [ -x "$root/duck" ] && [ ! -f "$root/Cargo.toml" ]; then prebuilt=1; build=0; src="$root"; fi
 
 os="$(uname -s)"
 if [ "$build" = 1 ]; then
@@ -109,8 +117,8 @@ fi
 
 bin="$HOME/.local/bin"
 mkdir -p "$bin"
-install -m 755 "$root/target/release/duck" "$bin/duck"
-install -m 755 "$root/target/release/duckw" "$bin/duckw"
+install -m 755 "$src/duck" "$bin/duck"
+install -m 755 "$src/duckw" "$bin/duckw"
 
 # PATH e shell integration no ~/.bashrc e ~/.zshrc, num bloco que e trocado
 # a cada instalacao (rodar de novo nao duplica).
@@ -201,7 +209,13 @@ if [ "$hooks" = 1 ]; then
   done
 fi
 
-if [ "$exts" = 1 ]; then
+if [ "$prebuilt" = 1 ]; then
+  # As extensoes do pacote ja vem compiladas; o Duck procura em ~/.local/share/duck/extensions.
+  mkdir -p "$HOME/.local/share/duck"
+  rm -rf "$HOME/.local/share/duck/extensions"
+  cp -R "$root/extensions" "$HOME/.local/share/duck/extensions"
+  say "Extensoes instaladas; ative no Duck: Ctrl+Shift+P > Extensoes." "Extensions installed; enable them in Duck: Ctrl+Shift+P > Extensions."
+elif [ "$exts" = 1 ]; then
   command -v npm >/dev/null || { say "Node.js nao encontrado (precisa do 18+)" "Node.js not found (18+ required)"; exit 1; }
   for e in "$root"/extensions/*/; do
     [ -f "$e/duck-extension.json" ] || continue

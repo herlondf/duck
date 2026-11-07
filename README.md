@@ -61,6 +61,25 @@ doing.
 
 ## Install
 
+### Ready-made (no Rust needed)
+
+Downloads the latest [release](https://github.com/herlondf/duck/releases) for
+Linux x86_64 or Windows x64, checks it and runs the installer. Running it again
+updates Duck.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/herlondf/duck/main/get.sh | sh
+```
+
+```powershell
+irm https://raw.githubusercontent.com/herlondf/duck/main/get.ps1 | iex   # installs to %LOCALAPPDATA%\Duck; needs PowerShell 7
+```
+
+Installer options go after `sh -s --` (Linux) or through
+`& ([scriptblock]::Create((irm .../get.ps1))) -Boot` (Windows).
+
+### From source
+
 You need [Rust](https://rustup.rs) (stable); on Linux and macOS the installer
 offers to install it. The first build takes about 5
 minutes. The **[playbook](docs/PLAYBOOK.md)** has the full step by step:

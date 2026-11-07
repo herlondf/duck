@@ -14,6 +14,9 @@
   -SkipBuild     reuse target\release / usa o binario ja compilado
   -Extensions    build the bundled extensions (Node 18+); enable them in Ctrl+Shift+P / compila as extensoes; ative no Ctrl+Shift+P
   -All           same as -Boot -ClaudeHooks -Extensions / tudo acima
+  From a release package (duck-windows-x86_64.zip) the binaries are already built:
+  nothing is compiled and the bundled extensions are used as they are.
+  Num pacote de release os binarios ja vem prontos: nada e compilado.
 .EXAMPLE
   pwsh -File .\install.ps1 -All
 #>
@@ -23,6 +26,11 @@ $root = $PSScriptRoot
 $pt = (Get-UICulture).Name -like 'pt*'
 function Say([string] $ptText, [string] $enText, [string] $color = 'Green') { Write-Host ($pt ? $ptText : $enText) -ForegroundColor $color }
 if ($All) { $Boot = $true; $ClaudeHooks = $true; $Extensions = $true }
+
+# Pacote de release: binarios prontos ao lado deste script, sem Cargo.toml.
+$prebuilt = (Test-Path "$root\duck.exe") -and -not (Test-Path "$root\Cargo.toml")
+$src = $prebuilt ? $root : "$root\target\release"
+if ($prebuilt) { $SkipBuild = $true; $Extensions = $false }
 
 if (-not $SkipBuild) {
   $cargo = (Get-Command cargo -ErrorAction SilentlyContinue)?.Source ?? "$env:USERPROFILE\.cargo\bin\cargo.exe"
@@ -46,7 +54,7 @@ New-Item -ItemType Directory -Force $bin | Out-Null
 $stamp = Get-Date -Format 'yyyyMMddHHmmss'
 foreach ($n in 'duck', 'duckw') {
   if (Test-Path "$bin\$n.exe") { Rename-Item "$bin\$n.exe" "$n.old-$stamp.exe" }
-  Copy-Item "$root\target\release\$n.exe" "$bin\$n.exe"
+  Copy-Item "$src\$n.exe" "$bin\$n.exe"
 }
 Get-ChildItem $bin -Filter '*.old-*.exe' | ForEach-Object { try { Remove-Item $_.FullName -ErrorAction Stop } catch {} }
 Copy-Item "$root\assets\duck.ico" "$bin\duck.ico" -Force

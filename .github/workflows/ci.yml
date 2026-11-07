@@ -1,0 +1,43 @@
+name: CI
+
+# Checagem rapida da develop e dos pull requests: compila e testa no Linux e no
+# Windows, e compila as extensoes. Nao gera release (isso e o release.yml, na main).
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Extensions build
+        shell: bash
+        run: |
+          for d in extensions/*/; do
+            [ -f "$d/package.json" ] || continue
+            (cd "$d" && npm ci --no-audit --no-fund --loglevel=error && npm run build)
+          done

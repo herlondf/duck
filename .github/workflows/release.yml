@@ -1,0 +1,122 @@
+name: Release
+
+# Cada merge na main vira um release: le a versao do Cargo.toml, compila Linux e
+# Windows, empacota com as extensoes prontas e publica a tag vX.Y.Z com os pacotes.
+# Versao ja publicada = falha (suba a versao na develop antes do merge: /release).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$v" ] || { echo "::error::versao nao encontrada no Cargo.toml"; exit 1; }
+          if git rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
+            echo "::error::v$v ja foi publicada. Suba a versao no Cargo.toml na develop (skill /release) e faca o merge de novo."
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-22.04, name: linux-x86_64 }
+          - { os: windows-latest, name: windows-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Extensions (built, runtime dependencies only)
+        shell: bash
+        run: |
+          for d in extensions/*/; do
+            [ -f "$d/package.json" ] || continue
+            (cd "$d" && npm ci --no-audit --no-fund --loglevel=error && npm run build && npm prune --omit=dev --loglevel=error)
+          done
+      - name: Package
+        shell: bash
+        run: |
+          dir="duck-${{ matrix.name }}"
+          mkdir -p "$dir"
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; else exe=; fi
+          cp "target/release/duck$exe" "target/release/duckw$exe" "$dir/"
+          cp -R assets extensions docs LICENSE README.md README.pt-BR.md duck.example.lua "$dir/"
+          mkdir -p dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp install.ps1 "$dir/"
+            # Zip sem pasta de cima: o get.ps1 extrai direto em %LOCALAPPDATA%\Duck.
+            pwsh -NoProfile -Command "Compress-Archive -Path '$dir/*' -DestinationPath 'dist/$dir.zip'"
+          else
+            cp install.sh "$dir/"
+            tar czf "dist/$dir.tar.gz" "$dir"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and notes
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS)
+          prev=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          {
+            echo "## Instalar / Install"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/get.sh | sh"
+            echo '```'
+            echo
+            echo '```powershell'
+            echo "irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/get.ps1 | iex"
+            echo '```'
+            echo
+            echo "## Mudancas / Changes"
+            echo
+            git log --no-merges --format='- %s' ${prev:+$prev..}HEAD
+          } > notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="v${{ needs.version.outputs.version }}"
+          gh release create "$v" dist/* --target "$GITHUB_SHA" --title "Duck $v" --notes-file notes.md
