@@ -516,8 +516,11 @@ fn spawn_pane(srv: &Arc<Server>, m: &mut Mux, o: SpawnOpts) -> Result<Id, String
     let exe = proto::current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string();
     let cli_exe = proto::current_exe().ok().map(|p| p.with_file_name(if cfg!(windows) { "duck.exe" } else { "duck" }))
         .filter(|p| p.is_file()).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| exe.clone());
-    let wslenv = std::env::var("WSLENV").unwrap_or_default();
-    let env = vec![
+    // Windows: PATH e variaveis do registro de agora, nao os de quando o server subiu.
+    let fresh = if m.cfg.refresh_env { proto::fresh_env() } else { Vec::new() };
+    let wslenv = fresh.iter().find(|(k, _)| k.eq_ignore_ascii_case("WSLENV")).map(|(_, v)| v.clone())
+        .unwrap_or_else(|| std::env::var("WSLENV").unwrap_or_default());
+    let mut env = vec![
         ("DUCK_PANE".to_string(), id.to_string()),
         ("DUCK_TOKEN".into(), token.clone()),
         ("DUCK_BIN".into(), cli_exe),
@@ -528,6 +531,8 @@ fn spawn_pane(srv: &Arc<Server>, m: &mut Mux, o: SpawnOpts) -> Result<Id, String
         // para o duck.exe do hook: distro e perfil do Claude de quem rodou `wsl`.
         ("WSLENV".into(), format!("{}{}DUCK_PANE:DUCK_TOKEN:TERM_PROGRAM:WSL_DISTRO_NAME/w:CLAUDE_CONFIG_DIR/w", wslenv, if wslenv.is_empty() { "" } else { ":" })),
     ];
+    let ours: Vec<String> = env.iter().map(|(k, _)| k.to_uppercase()).collect();
+    env.extend(fresh.into_iter().filter(|(k, _)| !ours.contains(&k.to_uppercase())));
     let user = std::env::var("USERNAME").unwrap_or_default().to_lowercase();
     let pipe = format!("duck-pty-{user}-{}", proto::random_hex(10));
     let spec = ptyhost::Spec { id, argv: argv.clone(), cwd: cwd.clone(), cols, rows, pipe: pipe.clone() };

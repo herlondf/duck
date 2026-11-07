@@ -58,6 +58,9 @@ Legenda: `[x]` pronto e testado · `[~]` pronto, teste parcial · `[ ]` a fazer.
       ponta (`DUCK_PANE`/`TERM_PROGRAM` chegam ao Linux via WSLENV); ssh e cmd por config.
 - [x] Env limpo ao criar pane (sem `CLAUDECODE`, `CLAUDE_CODE_*` e o
       `NO_COLOR` injetado pela sessão do Claude)
+- [x] Windows: pane novo relê PATH e variáveis do registro (`refresh_env`).
+      Um programa instalado com o Duck aberto já aparece na aba nova, sem
+      reiniciar o server, como no Windows Terminal.
 - [x] Pipe autenticado por token (outro usuário local não manda texto para os seus shells)
 
 ## Fase 2 — Config e personalização

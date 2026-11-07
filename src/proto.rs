@@ -228,6 +228,113 @@ pub fn leaked_env(k: &str) -> bool {
         || (from_claude && ["NO_COLOR", "CLAUDE_CONFIG_DIR", "CLAUDE_BROWSER_PROFILE", "CLAUDE_PID"].contains(&k.as_str()))
 }
 
+/// Variavel lida do registro: (nome, valor cru, REG_EXPAND_SZ).
+pub type RegVar = (String, String, bool);
+
+/// Variaveis de sessao do logon: o registro da maquina tem USERNAME=SYSTEM e
+/// estas sempre vem certas do processo pai (como no Explorer).
+const SESSION_VARS: &[&str] = &["USERNAME", "USERPROFILE", "USERDOMAIN", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "LOGONSERVER", "SESSIONNAME", "COMPUTERNAME"];
+
+/// Troca %NOME% pelo valor em `vars` (sem diferenciar maiusculas); o que nao
+/// existe fica como esta, igual ao ExpandEnvironmentStrings.
+fn expand_vars(s: &str, vars: &[(String, String)]) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.find('%') {
+            Some(j) if j > 0 => {
+                let name = &after[..j];
+                match vars.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                    Some((_, v)) => out.push_str(v),
+                    None => { out.push('%'); out.push_str(name); out.push('%'); }
+                }
+                rest = &after[j + 1..];
+            }
+            _ => { out.push('%'); rest = after; }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Ambiente de uma aba nova no Windows: o que ela herdaria do server mais o
+/// que esta no registro agora (maquina, depois usuario). Um programa instalado
+/// com o Duck aberto muda o registro, mas o server ficou com o env de quando
+/// subiu; o Windows Terminal resolve igual, relendo o registro a cada aba.
+/// PATH = maquina;usuario e depois as pastas herdadas que nao estao la.
+/// Devolve so as variaveis que vem do registro (o resto continua herdado).
+pub fn merge_registry_env(inherited: &[(String, String)], machine: &[RegVar], user: &[RegVar]) -> Vec<(String, String)> {
+    let is_path = |k: &str| k.eq_ignore_ascii_case("PATH");
+    let skip = |k: &str| SESSION_VARS.iter().any(|s| s.eq_ignore_ascii_case(k)) || leaked_env(k);
+    let mut lookup: Vec<(String, String)> = inherited.to_vec();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v, expand) in machine.iter().chain(user) {
+        if is_path(k) || skip(k) { continue; }
+        let v = if *expand { expand_vars(v, &lookup) } else { v.clone() };
+        out.retain(|(o, _)| !o.eq_ignore_ascii_case(k));
+        out.push((k.clone(), v.clone()));
+        lookup.push((k.clone(), v));
+    }
+    let reg_path: Vec<String> = machine.iter().chain(user).filter(|(k, _, _)| is_path(k))
+        .map(|(_, v, expand)| if *expand { expand_vars(v, &lookup) } else { v.clone() }).collect();
+    if !reg_path.is_empty() {
+        let norm = |p: &str| p.trim().trim_end_matches('\\').to_lowercase();
+        let mut dirs: Vec<String> = Vec::new();
+        let inherited_path = inherited.iter().rev().find(|(k, _)| is_path(k)).map(|(_, v)| v.as_str()).unwrap_or("");
+        for d in reg_path.iter().flat_map(|p| p.split(';')).chain(inherited_path.split(';')) {
+            if d.trim().is_empty() || dirs.iter().any(|x| norm(x) == norm(d)) { continue; }
+            dirs.push(d.to_string());
+        }
+        let name = inherited.iter().find(|(k, _)| is_path(k)).map(|(k, _)| k.clone()).unwrap_or_else(|| "Path".into());
+        out.push((name, dirs.join(";")));
+    }
+    out
+}
+
+/// Variaveis do registro para uma aba nova (vazio se a leitura falhar: a aba
+/// abre com o env herdado, como antes).
+#[cfg(windows)]
+pub fn fresh_env() -> Vec<(String, String)> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    let machine = read_reg_env(HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment");
+    let user = read_reg_env(HKEY_CURRENT_USER, "Environment");
+    if machine.is_none() && user.is_none() { return Vec::new(); }
+    let inherited: Vec<(String, String)> = std::env::vars().collect();
+    merge_registry_env(&inherited, &machine.unwrap_or_default(), &user.unwrap_or_default())
+}
+
+#[cfg(not(windows))]
+pub fn fresh_env() -> Vec<(String, String)> { Vec::new() }
+
+#[cfg(windows)]
+fn read_reg_env(root: windows_sys::Win32::System::Registry::HKEY, sub: &str) -> Option<Vec<RegVar>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::{RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY, KEY_READ, REG_EXPAND_SZ, REG_SZ};
+    let wsub: Vec<u16> = std::ffi::OsStr::new(sub).encode_wide().chain([0]).collect();
+    let mut key: HKEY = std::ptr::null_mut();
+    if unsafe { RegOpenKeyExW(root, wsub.as_ptr(), 0, KEY_READ, &mut key) } != 0 { return None; }
+    let mut vars = Vec::new();
+    let mut i = 0u32;
+    loop {
+        let mut name = vec![0u16; 16384];
+        let mut name_len = name.len() as u32;
+        let mut data = vec![0u8; 65536];
+        let mut data_len = data.len() as u32;
+        let mut kind = 0u32;
+        let r = unsafe { RegEnumValueW(key, i, name.as_mut_ptr(), &mut name_len, std::ptr::null(), &mut kind, data.as_mut_ptr(), &mut data_len) };
+        if r != 0 { break; } // ERROR_NO_MORE_ITEMS (ou valor grande demais: para por aqui)
+        i += 1;
+        if kind != REG_SZ && kind != REG_EXPAND_SZ { continue; }
+        let wide: Vec<u16> = data[..data_len as usize].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let value = String::from_utf16_lossy(&wide).trim_end_matches('\0').to_string();
+        vars.push((String::from_utf16_lossy(&name[..name_len as usize]), value, kind == REG_EXPAND_SZ));
+    }
+    unsafe { RegCloseKey(key) };
+    Some(vars)
+}
+
 /// Atalho para respostas: {"ok":true,...}.
 pub fn ok(extra: Value) -> Value {
     let mut v = json!({"ok": true});
@@ -243,5 +350,44 @@ mod tests {
     fn exe_path_after_reinstall() {
         assert_eq!(undeleted("/home/u/.local/bin/duckw (deleted)".into()), PathBuf::from("/home/u/.local/bin/duckw"));
         assert_eq!(undeleted("/home/u/.local/bin/duckw".into()), PathBuf::from("/home/u/.local/bin/duckw"));
+    }
+
+    fn kv(v: &[(&str, &str)]) -> Vec<(String, String)> { v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
+    fn reg(v: &[(&str, &str, bool)]) -> Vec<RegVar> { v.iter().map(|(k, v, e)| (k.to_string(), v.to_string(), *e)).collect() }
+    fn get<'a>(v: &'a [(String, String)], k: &str) -> Option<&'a str> { v.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str()) }
+
+    #[test]
+    fn registry_path_new_dirs_and_inherited_kept() {
+        let inh = kv(&[("Path", r"C:\Windows;C:\Users\u\AppData\Local\Duck\bin"), ("USERPROFILE", r"C:\Users\u")]);
+        let machine = reg(&[("Path", r"C:\Windows;C:\Program Files\nodejs\", false)]);
+        let user = reg(&[("Path", r"%USERPROFILE%\AppData\Roaming\npm;C:\windows\", true)]);
+        let out = merge_registry_env(&inh, &machine, &user);
+        assert_eq!(get(&out, "PATH").unwrap(), r"C:\Windows;C:\Program Files\nodejs\;C:\Users\u\AppData\Roaming\npm;C:\Users\u\AppData\Local\Duck\bin");
+        // O nome fica como o processo ja usa (Path), sem duplicar.
+        assert_eq!(out.iter().filter(|(k, _)| k.eq_ignore_ascii_case("path")).count(), 1);
+        assert_eq!(out.iter().find(|(k, _)| k.eq_ignore_ascii_case("path")).unwrap().0, "Path");
+    }
+
+    #[test]
+    fn registry_vars_override_and_expand() {
+        let inh = kv(&[("Path", r"C:\Windows"), ("TEMP", r"C:\old"), ("USERPROFILE", r"C:\Users\u"), ("KEEP", "1")]);
+        let machine = reg(&[("TEMP", r"%SystemRoot%\TEMP", true), ("USERNAME", "SYSTEM", false), ("JAVA_HOME", r"C:\jdk", false)]);
+        let user = reg(&[("TEMP", r"%USERPROFILE%\AppData\Local\Temp", true), ("Path", r"%JAVA_HOME%\bin;%NADA%\x", true)]);
+        let out = merge_registry_env(&inh, &machine, &user);
+        assert_eq!(get(&out, "TEMP"), Some(r"C:\Users\u\AppData\Local\Temp"));   // usuario ganha da maquina
+        assert_eq!(get(&out, "JAVA_HOME"), Some(r"C:\jdk"));                      // variavel nova aparece
+        assert_eq!(get(&out, "USERNAME"), None);                                  // a da maquina (SYSTEM) nao entra
+        assert_eq!(get(&out, "KEEP"), None);                                      // so herdada: continua herdada
+        assert_eq!(get(&out, "PATH"), Some(r"C:\jdk\bin;%NADA%\x;C:\Windows"));  // sem valor: fica literal
+    }
+
+    #[test]
+    fn registry_without_path_and_claude_vars() {
+        let inh = kv(&[("Path", r"C:\Windows")]);
+        let out = merge_registry_env(&inh, &reg(&[("CLAUDECODE", "1", false), ("CLAUDE_CODE_X", "1", false), ("FOO", "%%", true)]), &[]);
+        assert_eq!(get(&out, "CLAUDECODE"), None);
+        assert_eq!(get(&out, "CLAUDE_CODE_X"), None);
+        assert_eq!(get(&out, "PATH"), None);
+        assert_eq!(get(&out, "FOO"), Some("%%"));
     }
 }

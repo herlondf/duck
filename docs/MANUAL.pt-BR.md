@@ -363,6 +363,11 @@ Para usar por MCP no Claude Code: `claude mcp add duck -- D:\Tools\Duck\bin\duck
   `%LOCALAPPDATA%\duck\server.log` e não derruba o resto.
 - Se a GPU for perdida (driver reiniciou), a janela se recria.
 - O scrollback tem teto em memória por pane (`scrollback_mb`).
+- No Windows, cada pane novo relê o PATH e as variáveis do registro (do
+  usuário e da máquina) e junta com o que herdaria do server. Um programa
+  instalado com o Duck aberto (gemini, node, um SDK) aparece na próxima aba
+  sem reiniciar nada. As abas já abertas ficam como estão. Se a leitura falhar,
+  a aba abre com o env herdado. Desliga com `refresh_env = false`.
 - Um pane despejando saída sem parar não trava a janela: o intervalo entre
   frames se adapta.
 
