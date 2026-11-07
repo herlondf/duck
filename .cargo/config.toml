@@ -1,0 +1,7 @@
+# Windows: runtime do C dentro do .exe, para rodar num Windows limpo sem o
+# Visual C++ Redistributable (sem isso: "VCRUNTIME140.dll nao foi encontrada").
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

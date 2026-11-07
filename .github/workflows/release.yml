@@ -51,6 +51,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
+      - name: Windows exe without VC++ runtime dependency
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          foreach ($n in 'duck', 'duckw') {
+            $deps = & $dumpbin.FullName /dependents "target\release\$n.exe" | Out-String
+            if ($deps -match '(?i)vcruntime|msvcp|api-ms-win-crt') { Write-Host $deps; throw "$n.exe depende do runtime do Visual C++ (crt-static em .cargo/config.toml)" }
+          }
       - uses: actions/setup-node@v7
         with:
           node-version: 22
