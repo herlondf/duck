@@ -250,6 +250,8 @@ pub struct Config {
     /// Windows: aba nova rele PATH e variaveis do registro (programa instalado
     /// com o Duck aberto ja aparece, sem reiniciar nada).
     pub refresh_env: bool,
+    /// Procura versao nova do Duck (uma vez por dia) e avisa na janela.
+    pub update_check: bool,
     pub theme_light: Option<Theme>,
     pub background: Background,
     pub tab_rules: Vec<(String, Rgb)>,
@@ -526,6 +528,7 @@ pub fn parse(t: &Table) -> Config {
         notify_command_secs: n(t, "notify_command_secs", 30.0) as u64,
         shell_integration: t.get::<Option<bool>>("shell_integration").ok().flatten().unwrap_or(true),
         refresh_env: t.get::<Option<bool>>("refresh_env").ok().flatten().unwrap_or(true),
+        update_check: t.get::<Option<bool>>("update_check").ok().flatten().unwrap_or(true),
         theme_light,
         background: t.get::<Table>("background").map(|b| Background {
             image: b.get::<Option<String>>("image").ok().flatten(),

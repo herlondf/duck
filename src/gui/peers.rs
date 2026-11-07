@@ -84,7 +84,7 @@ impl Gui {
     }
 
     /// Roda `f` numa thread e devolve `{ok, ...}`/`{error}` como acao `done`.
-    fn peers_bg(&self, done: &str, extra: Vec<Value>, f: impl FnOnce() -> Result<Value, String> + Send + 'static) {
+    pub(super) fn peers_bg(&self, done: &str, extra: Vec<Value>, f: impl FnOnce() -> Result<Value, String> + Send + 'static) {
         let (q, proxy, done) = (self.queue.clone(), self.proxy.clone(), done.to_string());
         std::thread::spawn(move || {
             let r = f().unwrap_or_else(|e| json!({"error": e}));

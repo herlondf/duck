@@ -154,6 +154,10 @@ fi
 
 "$bin/duck" init
 
+# Tipo da instalacao para o `duck update`: so a do release se atualiza sozinha.
+mkdir -p "$HOME/.local/share/duck"
+if [ "$prebuilt" = 1 ]; then echo release; else echo "source $root"; fi > "$HOME/.local/share/duck/install-kind"
+
 if [ "$os" = Linux ]; then
   icons="$HOME/.local/share/icons/hicolor/256x256/apps"
   apps="$HOME/.local/share/applications"

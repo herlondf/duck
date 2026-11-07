@@ -64,6 +64,8 @@ return {
   -- Windows: aba nova rele PATH e variaveis do registro (programa instalado com
   -- o Duck aberto ja aparece, sem reiniciar o server). false = env do server.
   refresh_env = true,
+  -- Procura versao nova uma vez por dia e avisa (Ctrl+Shift+P > Atualizar o Duck).
+  update_check = true,
   notify_command_secs = 30,    -- avisa quando um comando longo termina fora de foco
   -- Dominio = comando que abre o shell. Aparece na paleta ("Novo pane: ...").
   -- Perfil visual: {cmd=..., background='#2b1111', tab_color='#f38ba8'}.

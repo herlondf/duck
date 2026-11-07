@@ -28,6 +28,7 @@ mod ext;
 mod best;
 mod graph;
 mod peers;
+mod update;
 mod ui;
 use ui::{Ac, AgentPanel, Composer, Hit};
 
@@ -405,6 +406,9 @@ pub struct Gui {
     /// Painel Computadores: estado de cada peer ("online 4 ms"...) e o que a descoberta achou.
     peer_status: HashMap<String, String>,
     peer_found: Option<Vec<Value>>,
+    /// Versao nova publicada (aviso e item "Atualizar o Duck").
+    update_ver: Option<String>,
+    updating: bool,
     proxy: EventLoopProxy<UserEv>,
     client: String,
     conn: Arc<Mutex<Option<Conn>>>,
@@ -598,9 +602,10 @@ impl Gui {
             collapsed: HashMap::new(), pinned: HashMap::new(), search_hits: None, composer: None, ac: None, ac_dismissed: String::new(),
             usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), last_loop_check: String::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
             tab_cur: 0, tab_prev: 0, palette_rank: load_palette_rank(), scroll_base: HashMap::new(), pane_drag: None,
-            peer_status: HashMap::new(), peer_found: None,
+            peer_status: HashMap::new(), peer_found: None, update_ver: None, updating: false,
         };
         g.load_config();
+        g.update_watch();
         g
     }
 
@@ -1473,6 +1478,7 @@ impl Gui {
             b("Recarregar config", "reload_config", vec![]),
             b("Desanexar (fecha a janela, shells continuam)", "detach", vec![]),
             b("Computadores: conectar outro computador (mensagens entre agentes)", "peers", vec![]),
+            b(&match &self.update_ver { Some(v) => format!("Atualizar o Duck: {} -> {v}", crate::update::current()), None => format!("Atualizar o Duck (esta: {}; procura versao nova)", crate::update::current()) }, "duck_update", vec![]),
             b("Reiniciar server (atualiza o Duck; os shells continuam)", "restart_server", vec![]),
             b("Encerrar server (fecha todos os shells)", "kill_server", vec![]),
             b("Inicio: projetos, sessoes e acoes", "home", vec![]),

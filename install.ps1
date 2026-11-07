@@ -68,6 +68,11 @@ if (($userPath -split ';') -notcontains $bin) {
 
 & $exe init
 
+# Tipo da instalacao para o `duck update`: so a do release se atualiza sozinha.
+$data = Join-Path $env:LOCALAPPDATA 'duck'
+New-Item -ItemType Directory -Force $data | Out-Null
+Set-Content (Join-Path $data 'install-kind') ($prebuilt ? 'release' : "source $root") -Encoding utf8NoBOM
+
 $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Duck.lnk'
 $sh = New-Object -ComObject WScript.Shell
 $s = $sh.CreateShortcut($lnk); $s.TargetPath = "$bin\duckw.exe"; $s.WorkingDirectory = $env:USERPROFILE

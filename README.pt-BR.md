@@ -78,6 +78,11 @@ irm https://raw.githubusercontent.com/herlondf/duck/main/get.ps1 | iex   # insta
 Opções do instalador vão depois de `sh -s --` (Linux) ou com
 `& ([scriptblock]::Create((irm .../get.ps1))) -Boot` (Windows).
 
+**Atualizações:** o Duck procura release novo uma vez por dia e avisa. Depois,
+**Ctrl+Shift+P > Atualizar o Duck** (ou `duck update`) baixa, confere, instala e
+reinicia o server; os shells continuam. Desliga com `update_check = false`.
+Instalação pelo código atualiza com `git pull` + instalador, como antes.
+
 ### Compilando do código
 
 Precisa do [Rust](https://rustup.rs) (stable); no Linux e no macOS o instalador
