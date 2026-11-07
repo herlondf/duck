@@ -593,23 +593,22 @@ servidor externo.
    - No Windows, libere a porta: item **Firewall do Windows** no painel (copia
      o comando; cole num terminal de administrador). Ele libera a TCP e a UDP 7878.
    - No Fedora a zona padrão do firewall já libera portas acima de 1024.
-3. Conecte de um dos dois jeitos:
-   - **Pelo código.** Num computador: **Copiar o código deste computador**. No
-     outro: **Colar o código do outro computador**. Pronto: os dois lados ficam
-     pareados, sem pergunta. O código leva o token: trate como senha.
-   - **Pela rede.** Num computador: **Procurar Ducks na rede local** e depois
-     **Conectar com ...**. No outro aparece **Pedido de conexão**. Em
-     **Conectar**, os dois lados ficam pareados.
-4. Cada computador pareado aparece no painel com o estado (online e o tempo de
+3. Num dos dois: **Procurar computadores na rede** e depois **Conectar com ...**.
+   Se a busca não achar (outra rede, VPN): **Conectar por IP** e digite o IP do outro.
+4. O painel de quem pediu mostra um **número de confirmação** (ex.: `482 913`).
+   No outro aparece o popup **Pedido de conexão** com um número. Se for o mesmo,
+   **Conectar**. Se for diferente, ou se você não pediu nada, **Negar**.
+   As chaves são trocadas sozinhas: não há nada para copiar entre os dois.
+5. Cada computador pareado aparece no painel com o estado (online e o tempo de
    resposta). Enter nele: testar, mandar uma mensagem de teste ou remover.
 
 Pelo terminal é o mesmo:
 
 ```sh
-duck peer code              # o código deste computador
-duck peer join <código>     # cola o código do outro
 duck peer find              # procura Ducks na rede local
-duck peer connect <ip>      # pede conexão; o outro aceita na janela
+duck peer connect <ip>      # pede conexão e mostra o número; o outro aceita na janela
+duck peer code              # avançado: código com o token, para colar com duck peer join
+duck peer join <código>     # avançado: pareia direto pelo código (trate como senha)
 duck peer list              # pareados e se respondem
 duck peer remove <nome>
 ```

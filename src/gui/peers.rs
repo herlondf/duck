@@ -1,6 +1,7 @@
-//! Painel Computadores (Ctrl+Shift+P > Computadores): liga a escuta, mostra o
-//! codigo deste computador, cola o do outro, procura Ducks na rede e lista os
-//! pareados com o estado de cada um. A rede roda em threads; o resultado volta
+//! Painel Computadores (Ctrl+Shift+P > Computadores): liga a escuta, procura
+//! Ducks na rede (ou conecta por IP), pede conexao e lista os pareados com o
+//! estado de cada um. O pedido mostra um numero de confirmacao nas duas telas;
+//! o outro lado aceita num popup e as chaves sao trocadas sozinhas. A rede roda em threads; o resultado volta
 //! pela fila de acoes (`peer_*_done`) e um Tick.
 
 use super::*;
@@ -20,17 +21,22 @@ impl Gui {
             }
             Some(a) => {
                 items.push(Item::new(format!("●  Este computador: {name} · escutando em {a}"), "Enter: trocar o nome", "peer_rename", vec![]));
-                items.push(Item::new("Copiar o código deste computador", format!("duck:{name}@{a}#… · cole no painel Computadores do outro"), "peer_copy_code", vec![]));
             }
         }
-        items.push(Item::new("Colar o código do outro computador", "duck:nome@ip:porta#… · conecta os dois de uma vez", "peer_join", vec![]));
+        // Pedido feito daqui esperando o outro aceitar (sai quando ele aparece na lista).
+        if let Some(w) = self.peer_status.get("\u{0}espera").cloned() {
+            if self.cfg.peers.iter().any(|(n, _)| *n == w) { self.peer_status.remove("\u{0}espera"); } else {
+                items.push(Item::new(format!("⏳  Esperando {w} aceitar · número de confirmação: {}", peer::confirm_code(&peer::self_token())),
+                    "aceite lá só se aparecer o mesmo número · Enter cancela", "peer_wait_cancel", vec![]));
+            }
+        }
         let searching = self.peer_status.contains_key("\u{0}busca");
         let hint = match (&self.peer_found, searching) {
             (_, true) => "procurando…".to_string(),
             (None, _) => "acha os Ducks escutando nesta rede".to_string(),
             (Some(f), _) => format!("{} encontrado(s) · Enter procura de novo", f.len()),
         };
-        items.push(Item::new("Procurar Ducks na rede local", hint, "peer_discover", vec![]));
+        items.push(Item::new("Procurar computadores na rede", hint, "peer_discover", vec![]));
         let known: Vec<&str> = self.cfg.peers.iter().map(|(_, a)| a.as_str()).collect();
         for f in self.peer_found.iter().flatten() {
             let (fname, faddr) = (f["name"].as_str().unwrap_or("duck"), f["addr"].as_str().unwrap_or(""));
@@ -38,6 +44,7 @@ impl Gui {
             items.push(Item::new(format!("+  Conectar com {fname} ({faddr})"), format!("{} · o outro aceita la", f["os"].as_str().unwrap_or("")),
                 "peer_connect", vec![json!(fname), json!(faddr)]));
         }
+        items.push(Item::new("Conectar por IP", "quando a busca não acha (outra rede, VPN) · o outro aceita lá", "peer_connect_ask", vec![]));
         if !self.cfg.peers.is_empty() {
             items.push(Item::new("── Computadores conectados ──", "", "", vec![]));
         }
@@ -145,39 +152,6 @@ impl Gui {
                     Err(e) => self.flash(&e),
                 }
             }
-            "peer_copy_code" => {
-                let Some(a) = peer::advertised(&self.cfg.peer_listen) else { return true };
-                let code = peer::code(&self.cfg.peer_name, &a, &peer::self_token());
-                match clip_set(&code) {
-                    Ok(_) => self.flash("Código copiado. No outro computador: Computadores > Colar o código. Trate como senha."),
-                    Err(e) => self.flash(&format!("clipboard: {e}")),
-                }
-                self.open_peers(false);
-            }
-            "peer_join" => {
-                let mut o = Overlay::prompt("Código do outro computador (duck:nome@ip:porta#…)", "", "peer_join_code", vec![]);
-                o.secret = true;
-                self.overlay = Some(o);
-            }
-            "peer_join_code" => {
-                let c = match peer::parse_code(&s(0)) { Ok(c) => c, Err(e) => { self.flash(&e); return true } };
-                if c.name == self.cfg.peer_name { self.flash("Esse é o código deste computador: cole o do outro"); return true; }
-                let Some(my_addr) = self.peers_ensure_on() else { return true };
-                if let Err(e) = peer::save(&c.name, &c.addr, &c.token) { self.flash(&e); return true; }
-                let me = self.cfg.peer_name.clone();
-                self.flash(&format!("Conectando com {} ({})…", c.name, c.addr));
-                let (a, t) = (c.addr.clone(), c.token.clone());
-                self.peers_bg("peer_join_done", vec![json!(c.name)], move || peer::pair_request(&me, &my_addr, &a, Some(&t)));
-                self.open_peers(false);
-            }
-            "peer_join_done" => {
-                let r = args.get(1).cloned().unwrap_or(Value::Null);
-                match r["error"].as_str() {
-                    None => { self.flash(&format!("Conectado com {} ✓  Teste: duck msg {} \"oi\"", s(0), s(0))); self.peer_status.remove(&s(0)); }
-                    Some(e) => self.flash(&format!("{} não aceitou: {}", s(0), Self::peers_hint(e))),
-                }
-                if self.overlay.as_ref().is_some_and(|o| o.peers) { self.open_peers(true); }
-            }
             "peer_discover" => {
                 self.peer_status.insert("\u{0}busca".into(), String::new());
                 let mut ports = vec![peer::DEFAULT_PORT];
@@ -194,21 +168,43 @@ impl Gui {
                 }
                 if self.overlay.as_ref().is_some_and(|o| o.peers) { self.open_peers(false); }
             }
+            "peer_connect_ask" => {
+                self.overlay = Some(Overlay::prompt("IP do outro computador (ex.: 192.168.0.20 ou 192.168.0.20:7878)", "", "peer_connect_ip", vec![]));
+            }
+            "peer_connect_ip" => {
+                let ip = s(0).trim().to_string();
+                if ip.is_empty() { return true; }
+                let addr = if ip.contains(':') { ip.clone() } else { format!("{ip}:{}", peer::DEFAULT_PORT) };
+                self.builtin("peer_connect", &[json!(""), json!(addr)]);
+            }
             "peer_connect" => {
                 let (pname, addr) = (s(0), s(1));
                 let Some(my_addr) = self.peers_ensure_on() else { return true };
                 let me = self.cfg.peer_name.clone();
-                self.flash(&format!("Pedindo conexão a {pname}…"));
+                let label = if pname.is_empty() { addr.clone() } else { pname.clone() };
+                self.flash(&format!("Pedindo conexão a {label}…"));
                 let a = addr.clone();
-                self.peers_bg("peer_connect_done", vec![json!(pname)], move || peer::pair_request(&me, &my_addr, &a, None));
+                self.peers_bg("peer_connect_done", vec![json!(label)], move || peer::pair_request(&me, &my_addr, &a, None));
                 self.open_peers(false);
             }
             "peer_connect_done" => {
                 let r = args.get(1).cloned().unwrap_or(Value::Null);
                 match r["error"].as_str() {
-                    None => self.flash(&format!("Pedido enviado. Aceite em {}: ele aparece aqui quando aceitar.", s(0))),
+                    None => {
+                        // O nome de verdade vem na resposta (por IP ainda nao sabiamos).
+                        let n = r["name"].as_str().map(String::from).unwrap_or_else(|| s(0));
+                        let code = peer::confirm_code(&peer::self_token());
+                        self.peer_status.insert("\u{0}espera".into(), n.clone());
+                        self.flash(&format!("Pedido enviado a {n}. Lá deve aparecer o número {code}: aceite só se for igual."));
+                    }
                     Some(e) => self.flash(&format!("{}: {}", s(0), Self::peers_hint(e))),
                 }
+                if self.overlay.as_ref().is_some_and(|o| o.peers) { self.open_peers(false); }
+            }
+            "peer_wait_cancel" => {
+                // So esquece a espera daqui; o pedido la expira quando alguem negar.
+                self.peer_status.remove("\u{0}espera");
+                self.open_peers(false);
             }
             "peer_accept" => {
                 let id = args.first().cloned().unwrap_or(json!(0));

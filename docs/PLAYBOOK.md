@@ -602,25 +602,24 @@ outside server.
    - On Windows, open the port: the **Firewall do Windows** item in the panel
      copies the command; paste it in an admin terminal. It opens TCP and UDP 7878.
    - On Fedora the default firewall zone already allows ports above 1024.
-3. Connect in one of two ways:
-   - **With the code.** On one computer: **Copiar o código deste computador**
-     (copy this computer's code). On the other: **Colar o código do outro
-     computador** (paste the other one's code). Done: both sides are paired, no
-     question asked. The code carries the token: treat it like a password.
-   - **Over the network.** On one computer: **Procurar Ducks na rede local**
-     (find Ducks on the local network), then **Conectar com ...** (connect to).
-     The other one shows **Pedido de conexão** (connection request). On
-     **Conectar**, both sides are paired.
-4. Each paired computer shows in the panel with its state (online and the
+3. On one of them: **Procurar computadores na rede** (find computers on the
+   network), then **Conectar com ...** (connect to). If the search finds nothing
+   (another network, VPN): **Conectar por IP** (connect by IP) and type the other's IP.
+4. The panel of the computer that asked shows a **confirmation number** (e.g.
+   `482 913`). The other one shows the **Pedido de conexão** (connection request)
+   popup with a number. If it is the same, **Conectar**. If it differs, or you
+   did not ask, **Negar** (deny). The keys are exchanged on their own: nothing
+   to copy between the two.
+5. Each paired computer shows in the panel with its state (online and the
    response time). Enter on it: test, send a test message or remove.
 
 The same from the terminal:
 
 ```sh
-duck peer code              # this computer's code
-duck peer join <code>       # paste the other one's code
 duck peer find              # find Ducks on the local network
-duck peer connect <ip>      # ask to connect; the other accepts in its window
+duck peer connect <ip>      # ask to connect, shows the number; the other accepts in its window
+duck peer code              # advanced: code with the token, for duck peer join
+duck peer join <code>       # advanced: pair straight from the code (treat as a password)
 duck peer list              # paired computers and whether they answer
 duck peer remove <name>
 ```

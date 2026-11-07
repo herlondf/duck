@@ -296,15 +296,14 @@ texto para o agente de outro, sem copiar e colar. Vai por TCP direto entre os
 dois Duck (use o Tailscale; na rede local o token passa sem criptografia).
 
 Para ligar e parear: **Ctrl+Shift+P > Computadores** nos dois. Enter em
-**Desligado** liga a escuta na rede local. Depois, **Copiar o código** num e
-**Colar o código** no outro, ou **Procurar Ducks na rede** e aceitar o pedido
-do outro lado. O mesmo pelo terminal:
+**Desligado** liga a escuta na rede local. Depois, num deles, **Procurar
+computadores na rede** (ou **Conectar por IP**) e **Conectar com ...**. O outro
+recebe um popup com um número de confirmação: aceite só se for o mesmo que
+aparece na tela de quem pediu. O mesmo pelo terminal:
 
 ```powershell
-duck peer code                   # o código deste computador (trate como senha)
-duck peer join <código>          # no outro: conecta os dois de uma vez
 duck peer find                   # Ducks escutando na rede local
-duck peer connect 192.168.0.7    # pede conexão; o outro aceita na janela
+duck peer connect 192.168.0.7    # pede conexão e mostra o número; o outro aceita na janela
 duck peer list                   # pareados e se respondem
 duck msg fedora "texto"          # ou: Get-Content x.txt | duck msg fedora
 duck msg fedora --to MinhasCompras "texto"   # para a sessão MinhasCompras de lá

@@ -126,6 +126,16 @@ pub fn ping(addr: &str) -> Result<u128, String> {
 
 /// Pede conexao. `their_token` (do codigo) faz o outro aceitar na hora; sem
 /// ele, o usuario de la aprova. Resposta: `accepted` ou `approval`.
+/// Numero de confirmacao do pedido de conexao (como no Bluetooth): sai da
+/// chave de quem pede, aparece nas duas telas e o usuario so aceita se for
+/// igual. FNV-1a: o mesmo valor em qualquer versao e sistema.
+pub fn confirm_code(key: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.trim().to_lowercase().bytes() { h ^= b as u64; h = h.wrapping_mul(0x0100_0000_01b3); }
+    let n = h % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
 pub fn pair_request(me: &str, my_addr: &str, addr: &str, their_token: Option<&str>) -> Result<Value, String> {
     let req = json!({"pair": 1, "from": me, "addr": my_addr, "key": self_token(), "token": their_token.unwrap_or("")});
     let v = send(addr, &req)?;
@@ -201,6 +211,15 @@ mod tests {
         assert!(parse_code("duck:x@10.0.0.1:7878").is_err());
         assert!(parse_code("duck:x@10.0.0.1:7878#naohex!").is_err());
         assert!(parse_code("duck:x#ab12cd34ef56ab12cd34").is_err());
+    }
+
+    #[test]
+    fn confirm_code_stable() {
+        let k = "ab".repeat(32);
+        assert_eq!(confirm_code(&k), confirm_code(&format!(" {} ", k.to_uppercase())));
+        assert_ne!(confirm_code(&k), confirm_code(&"cd".repeat(32)));
+        let c = confirm_code(&k);
+        assert!(c.len() == 7 && c.as_bytes()[3] == b' ' && c.replace(' ', "").chars().all(|d| d.is_ascii_digit()), "{c}");
     }
 
     #[test]

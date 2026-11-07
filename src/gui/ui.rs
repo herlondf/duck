@@ -3005,14 +3005,19 @@ fn draw_overlay(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, o: &Overla
         l.shapes.push(Shape::ring(x, y, ww, hh, lin(mix(theme.tab_bar, theme.fg, 0.12), 1.0), 14.0, 1.0));
     };
     let wrap = |r: &mut Renderer, text: &str, max: f32, size: f32, lines: usize| -> Vec<String> {
+        // \n no texto comeca linha nova.
         let mut out = Vec::new();
-        let mut cur = String::new();
-        for word in text.split(' ') {
-            let cand = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
-            if r.measure(&cand, true, size) > max && !cur.is_empty() { out.push(std::mem::replace(&mut cur, word.to_string())); } else { cur = cand; }
+        for para in text.split('\n') {
+            let mut cur = String::new();
+            for word in para.split(' ') {
+                let cand = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+                if r.measure(&cand, true, size) > max && !cur.is_empty() { out.push(std::mem::replace(&mut cur, word.to_string())); } else { cur = cand; }
+                if out.len() >= lines { break; }
+            }
             if out.len() >= lines { break; }
+            if !cur.is_empty() { out.push(cur); }
         }
-        if out.len() < lines && !cur.is_empty() { out.push(cur); }
+        out.truncate(lines);
         out
     };
     match &o.kind {

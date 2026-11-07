@@ -1048,7 +1048,8 @@ fn pair_in(srv: &Arc<Server>, v: &Value, ip: &str) -> Result<Value, String> {
     if pend.iter().any(|a| serde_json::from_str::<Value>(&a.payload).is_ok_and(|p| p["ip"] == ip)) { return Err("ja tem um pedido seu esperando a resposta".into()); }
     if pend.len() >= 3 { return Err("pedidos demais esperando resposta: tente daqui a pouco".into()); }
     let payload = json!({"name": name, "addr": addr, "key": key, "ip": ip}).to_string();
-    ask(&mut m, "pair", 0, format!("{name} ({addr}) quer se conectar com este computador"), payload);
+    let code = crate::peer::confirm_code(&key);
+    ask(&mut m, "pair", 0, format!("{name} ({addr}) quer se conectar com este computador.\nNúmero de confirmação: {code}\nSó aceite se for o mesmo número que aparece na tela de {name}."), payload);
     srv.notify();
     Ok(proto::ok(json!({"approval": true, "name": me})))
 }

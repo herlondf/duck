@@ -925,7 +925,12 @@ pub fn peer(args: &[String]) -> i32 {
             let Some(my_addr) = mine() else { eprintln!("duck peer connect: {off}"); return 1 };
             let addr = if addr.contains(':') { addr.clone() } else { format!("{addr}:{}", crate::peer::DEFAULT_PORT) };
             match crate::peer::pair_request(&me, &my_addr, &addr, None) {
-                Ok(v) => { println!("pedido enviado para {} ({addr}): aceite la. Quando aceitar, ele aparece em duck peer list.", v["name"].as_str().unwrap_or("?")); 0 }
+                Ok(v) => {
+                    let n = v["name"].as_str().unwrap_or("?");
+                    println!("pedido enviado para {n} ({addr}). Numero de confirmacao: {}", crate::peer::confirm_code(&crate::peer::self_token()));
+                    println!("Aceite em {n} so se aparecer o mesmo numero. Depois ele aparece em duck peer list.");
+                    0
+                }
                 Err(e) => { eprintln!("duck peer connect: {addr}: {e}"); 1 }
             }
         }
