@@ -20,7 +20,9 @@ impl Gui {
                     "reinicia o server; os shells continuam", "peer_enable", vec![]));
             }
             Some(a) => {
-                items.push(Item::new(format!("●  Este computador: {name} · escutando em {a}"), "Enter: trocar o nome", "peer_rename", vec![]));
+                items.push(Item::new(format!("●  Este computador: {name} · {a}"), "Enter: trocar o nome", "peer_rename", vec![]));
+                items.push(Item::new(format!("Rede: {}", Self::listen_label(&self.cfg.peer_listen)),
+                    "Enter: escolher em qual rede escutar (casa, VMs, VPN ou todas)", "peer_listen_menu", vec![]));
             }
         }
         // Pedido feito daqui esperando o outro aceitar (sai quando ele aparece na lista).
@@ -31,18 +33,31 @@ impl Gui {
             }
         }
         let searching = self.peer_status.contains_key("\u{0}busca");
+        // Separa o que a busca achou: este computador (respondeu a propria
+        // busca), os ja pareados e os novos, que viram item para conectar.
+        let mut found_new = vec![];
+        let mut found_known = vec![];
+        for f in self.peer_found.iter().flatten() {
+            let (fname, faddr) = (f["name"].as_str().unwrap_or("duck").to_string(), f["addr"].as_str().unwrap_or("").to_string());
+            if fname == name || Some(faddr.as_str()) == adv.as_deref() || self.is_own_addr(&faddr) { continue; }
+            match self.cfg.peers.iter().find(|(n, a)| *n == fname || *a == faddr) {
+                Some((n, _)) => found_known.push((n.clone(), faddr)),
+                None => found_new.push((fname, faddr, f["os"].as_str().unwrap_or("").to_string())),
+            }
+        }
         let hint = match (&self.peer_found, searching) {
             (_, true) => "procurando…".to_string(),
-            (None, _) => "acha os Ducks escutando nesta rede".to_string(),
-            (Some(f), _) => format!("{} encontrado(s) · Enter procura de novo", f.len()),
+            (None, _) => "acha os Ducks escutando nas redes deste computador".to_string(),
+            (Some(_), _) if found_new.is_empty() && found_known.is_empty() => "nenhum outro Duck respondeu · Enter procura de novo".to_string(),
+            (Some(_), _) => format!("{} novo(s), {} já conectado(s) · Enter procura de novo", found_new.len(), found_known.len()),
         };
         items.push(Item::new("Procurar computadores na rede", hint, "peer_discover", vec![]));
-        let known: Vec<&str> = self.cfg.peers.iter().map(|(_, a)| a.as_str()).collect();
-        for f in self.peer_found.iter().flatten() {
-            let (fname, faddr) = (f["name"].as_str().unwrap_or("duck"), f["addr"].as_str().unwrap_or(""));
-            if Some(faddr) == adv.as_deref() || known.contains(&faddr) { continue; }
-            items.push(Item::new(format!("+  Conectar com {fname} ({faddr})"), format!("{} · o outro aceita la", f["os"].as_str().unwrap_or("")),
+        for (fname, faddr, os) in found_new {
+            items.push(Item::new(format!("+  Conectar com {fname} ({faddr})"), format!("{os} · o outro aceita lá"),
                 "peer_connect", vec![json!(fname), json!(faddr)]));
+        }
+        for (pname, faddr) in found_known {
+            items.push(Item::new(format!("✓  {pname} ({faddr}) · já conectado"), "Enter: opções", "peer_menu", vec![json!(pname)]));
         }
         items.push(Item::new("Conectar por IP", "quando a busca não acha (outra rede, VPN) · o outro aceita lá", "peer_connect_ask", vec![]));
         if !self.cfg.peers.is_empty() {
@@ -107,6 +122,23 @@ impl Gui {
         Some(addr)
     }
 
+    /// Descricao da escuta: "todas as redes" ou a placa e o IP.
+    fn listen_label(listen: &str) -> String {
+        let port = peer::port_of(listen);
+        if peer::listens_all(listen) { return format!("todas as redes (porta {port})"); }
+        let host = listen.rsplit_once(':').map_or(listen, |(h, _)| h);
+        match peer::interfaces().into_iter().find(|i| i.ip == host) {
+            Some(i) => format!("só {} · {}:{port}", i.name, i.ip),
+            None => format!("só {host}:{port} (essa rede não existe mais aqui)"),
+        }
+    }
+
+    /// `addr` e um IP deste computador (a busca acha o proprio Duck por cada rede).
+    fn is_own_addr(&self, addr: &str) -> bool {
+        let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+        peer::port_of(addr) == peer::port_of(&self.cfg.peer_listen) && peer::interfaces().iter().any(|i| i.ip == host)
+    }
+
     fn peers_hint(err: &str) -> String {
         let fw = if err.contains("timed out") || err.contains("tempo") || err.contains("refused") || err.contains("recusad") {
             " · confira se o Duck de la esta escutando (painel Computadores) e, no Windows, a porta 7878 liberada no firewall"
@@ -141,6 +173,33 @@ impl Gui {
                 }
                 Err(e) => self.flash(&e),
             },
+            "peer_listen_menu" => {
+                let port = peer::port_of(&self.cfg.peer_listen);
+                let cur = self.cfg.peer_listen.trim().to_string();
+                let mark = |on: bool| if on { "●" } else { "○" };
+                let mut items = vec![Item::new(format!("{}  Todas as redes", mark(peer::listens_all(&cur))),
+                    "casa, VMs e VPN ao mesmo tempo · a conexão continua exigindo token ou aprovação", "peer_listen_set", vec![json!(format!("0.0.0.0:{port}"))])];
+                for i in peer::interfaces() {
+                    let addr = format!("{}:{port}", i.ip);
+                    items.push(Item::new(format!("{}  Só {} · {}", mark(cur == addr), i.name, i.ip),
+                        "só os computadores desta rede alcançam este", "peer_listen_set", vec![json!(addr)]));
+                }
+                items.push(Item::new("Voltar", "", "peers", vec![]));
+                self.overlay = Some(Overlay::list("Em qual rede este computador escuta? (reinicia o server; os shells continuam)", items));
+            }
+            "peer_listen_set" => {
+                let addr = s(0);
+                if addr.is_empty() || addr == self.cfg.peer_listen.trim() { self.open_peers(false); return true; }
+                match config::set_local_setting("peer.listen", &format!("'{addr}'")) {
+                    Ok(_) => {
+                        self.cfg.peer_listen = addr.clone();
+                        let _ = self.call(json!({"cmd": "restart-server"}));
+                        self.flash(&format!("Escutando em {}", Self::listen_label(&addr)));
+                        self.open_peers(false);
+                    }
+                    Err(e) => self.flash(&e),
+                }
+            }
             "peer_rename" => {
                 let cur = self.cfg.peer_name.clone();
                 self.overlay = Some(Overlay::prompt("Nome deste computador (o outro usa em duck msg <nome>)", &cur, "peer_rename_set", vec![]));

@@ -3619,7 +3619,10 @@ pub fn run() {
         let s = srv.clone();
         std::thread::spawn(move || crate::peer::answer_discovery(port, move || {
             let m = s.lock();
-            (m.cfg.peer_name.clone(), crate::peer::advertised(&m.cfg.peer_listen).unwrap_or_default())
+            // Em todas as redes: sem endereco, quem procura usa o IP de onde a
+            // resposta veio (o da rede dele; o da rota padrao pode nao alcancar).
+            let addr = if crate::peer::listens_all(&m.cfg.peer_listen) { String::new() } else { crate::peer::advertised(&m.cfg.peer_listen).unwrap_or_default() };
+            (m.cfg.peer_name.clone(), addr)
         }));
     }
     { let s = srv.clone(); std::thread::spawn(move || event_loop(s, rx)); }

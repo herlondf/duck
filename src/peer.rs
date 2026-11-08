@@ -42,6 +42,37 @@ pub fn local_ip() -> Option<String> {
     (!ip.is_unspecified() && !ip.is_loopback()).then(|| ip.to_string())
 }
 
+/// Uma rede IPv4 desta maquina (placa de rede, VM, VPN...).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Iface { pub name: String, pub ip: String, pub broadcast: String }
+
+/// Redes IPv4 desta maquina, sem loopback nem link-local (169.254).
+pub fn interfaces() -> Vec<Iface> {
+    let Ok(nets) = sysinfo::Networks::new_with_refreshed_list() else { return vec![] };
+    let mut out = vec![];
+    for (name, data) in nets.iter() {
+        for n in data.ip_networks() {
+            let std::net::IpAddr::V4(ip) = n.addr else { continue };
+            if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() { continue; }
+            out.push(Iface { name: name.to_string_lossy().into_owned(), ip: ip.to_string(), broadcast: broadcast_of(ip, n.prefix).to_string() });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.ip.cmp(&b.ip)));
+    out
+}
+
+fn broadcast_of(ip: std::net::Ipv4Addr, prefix: u8) -> std::net::Ipv4Addr {
+    let p = u32::from(prefix.min(32));
+    let mask = if p == 0 { 0 } else { u32::MAX << (32 - p) };
+    std::net::Ipv4Addr::from(u32::from(ip) | !mask)
+}
+
+/// `listen` escuta em todas as redes (0.0.0.0, :: ou sem host).
+pub fn listens_all(listen: &str) -> bool {
+    let host = listen.trim().rsplit_once(':').map_or(listen.trim(), |(h, _)| h).trim_matches(['[', ']']);
+    host.is_empty() || host == "0.0.0.0" || host == "::"
+}
+
 /// Porta de um "host:porta" (padrao 7878).
 pub fn port_of(addr: &str) -> u16 {
     addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(DEFAULT_PORT)
@@ -147,10 +178,14 @@ pub fn discover(ports: &[u16], wait: Duration) -> Vec<Value> {
     let Ok(s) = UdpSocket::bind("0.0.0.0:0") else { return vec![] };
     let _ = s.set_broadcast(true);
     let _ = s.set_read_timeout(Some(Duration::from_millis(150)));
-    // Broadcast geral e o da /24 (alguns roteadores Wi-Fi so passam o direcionado).
+    // Broadcast geral e o direcionado de cada rede desta maquina: o geral so
+    // sai pela rota padrao, e assim a busca tambem acha VMs, VPNs e a outra placa.
     let mut targets: Vec<String> = vec!["255.255.255.255".into()];
     if let Some(ip) = local_ip().filter(|ip| ip.contains('.')) {
         if let Some((net, _)) = ip.rsplit_once('.') { targets.push(format!("{net}.255")); }
+    }
+    for i in interfaces() {
+        if !targets.contains(&i.broadcast) { targets.push(i.broadcast); }
     }
     let send_all = || for p in ports { for t in &targets { let _ = s.send_to(PROBE, (t.as_str(), *p)); } };
     send_all();
@@ -166,8 +201,9 @@ pub fn discover(ports: &[u16], wait: Duration) -> Vec<Value> {
         if v["duck"].as_u64() != Some(1) { continue; }
         let addr = v["addr"].as_str().filter(|a| !a.is_empty()).map(String::from)
             .unwrap_or_else(|| format!("{}:{}", from.ip(), v["port"].as_u64().unwrap_or(DEFAULT_PORT as u64)));
+        let name = clean_name(v["name"].as_str().unwrap_or("duck"));
         if out.iter().any(|o| o["addr"] == addr.as_str()) { continue; }
-        out.push(json!({"name": clean_name(v["name"].as_str().unwrap_or("duck")), "addr": addr, "os": v["os"], "version": v["version"]}));
+        out.push(json!({"name": name, "addr": addr, "os": v["os"], "version": v["version"]}));
     }
     out
 }
@@ -202,6 +238,17 @@ pub fn windows_firewall_cmd(port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broadcast_e_todas_as_redes() {
+        let ip = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
+        assert_eq!(broadcast_of(ip("192.168.122.1"), 24), ip("192.168.122.255"));
+        assert_eq!(broadcast_of(ip("10.1.2.3"), 16), ip("10.1.255.255"));
+        assert_eq!(broadcast_of(ip("10.1.2.3"), 32), ip("10.1.2.3"));
+        assert_eq!(broadcast_of(ip("10.1.2.3"), 0), ip("255.255.255.255"));
+        assert!(listens_all("0.0.0.0:7878") && listens_all("[::]:7878") && listens_all(":7878"));
+        assert!(!listens_all("192.168.68.139:7878") && !listens_all("[fe80::1]:7878"));
+    }
 
     #[test]
     fn code_roundtrip() {
