@@ -3,8 +3,10 @@
 //! So atualiza instalacao feita pelo release (get.sh / get.ps1). Instalacao
 //! pelo codigo (clone + install) continua com git pull + install, para nao
 //! misturar as duas. Quem instalou grava o tipo em <data_dir>/install-kind.
-//! A troca dos binarios e o proprio get.sh / get.ps1 da versao nova: baixa,
-//! confere o SHA256 e roda o instalador.
+//! A troca dos binarios e o get.sh / get.ps1: baixa o pacote da versao nova,
+//! confere o SHA256 e roda o instalador. No Windows o get.ps1 vem embutido
+//! neste binario e roda de um arquivo (`pwsh -File`): baixar e executar um
+//! script na hora (`irm | iex`) o Defender acusa como trojan.
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -93,16 +95,25 @@ pub fn check_cached(max_age: Duration) -> Option<String> {
     newer(&latest, current()).then_some(latest)
 }
 
-/// Baixa e instala a versao `ver` pelo get.sh / get.ps1 dela. No Windows o
-/// instalador ja reinicia o server; no Linux/macOS quem chamou reinicia.
+/// get.ps1 desta versao: baixa o pacote da versao pedida em DUCK_VERSION.
+#[cfg(windows)]
+const GET_PS1: &str = include_str!("../get.ps1");
+
+/// Baixa e instala a versao `ver`. No Windows o instalador ja reinicia o
+/// server; no Linux/macOS quem chamou reinicia.
 pub fn install(ver: &str) -> Result<String, String> {
     let tag = format!("v{}", ver.trim_start_matches('v'));
-    let base = format!("https://raw.githubusercontent.com/{}/{tag}", repo());
-    let mut cmd = if cfg!(windows) {
+    #[cfg(windows)]
+    let (_script, mut cmd) = {
+        let p = std::env::temp_dir().join(format!("duck-update-{}.ps1", std::process::id()));
+        std::fs::write(&p, GET_PS1).map_err(|e| format!("{}: {e}", p.display()))?;
         let mut c = std::process::Command::new("pwsh");
-        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &format!("irm {base}/get.ps1 | iex")]);
-        c
-    } else {
+        c.arg("-NoProfile").arg("-File").arg(&p);
+        (TempFile(p), c)
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let base = format!("https://raw.githubusercontent.com/{}/{tag}", repo());
         let mut c = std::process::Command::new("sh");
         c.args(["-c", &format!("curl -fsSL {base}/get.sh | sh")]);
         c
@@ -111,6 +122,14 @@ pub fn install(ver: &str) -> Result<String, String> {
         .output().map_err(|e| format!("{}: {e}", if cfg!(windows) { "pwsh (PowerShell 7)" } else { "sh" }))?;
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if out.status.success() { Ok(text) } else { Err(text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("instalador falhou").trim().to_string()) }
+}
+
+/// Apaga o arquivo quando sai de escopo (deu certo ou nao).
+#[cfg(windows)]
+struct TempFile(PathBuf);
+#[cfg(windows)]
+impl Drop for TempFile {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
 }
 
 fn source_hint(root: &str) -> String {
