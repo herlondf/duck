@@ -18,9 +18,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use glyphon::cosmic_text::fontdb;
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    Attrs, Buffer, Cache, Color, ContentType, CustomGlyph, Family, FontSystem, Metrics, RasterizedCustomGlyph,
+    Resolution, Shaping, Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -253,6 +254,19 @@ impl TexPass {
     }
 }
 
+/// Emoji COLRv1 desenhados por crate::colr (o swash os deixa em branco).
+/// Cada glifo/tamanho ganha um id de glifo customizado do glyphon.
+#[derive(Default)]
+struct Emoji {
+    /// Fonte com COLRv1 (dados + indice da face); None = fonte comum.
+    fonts: HashMap<fontdb::ID, Option<(Arc<glyphon::cosmic_text::Font>, u32)>>,
+    /// (fonte, glifo, px) -> id na lista; None = o swash desenha.
+    ids: HashMap<(fontdb::ID, u16, u32), Option<u16>>,
+    list: Vec<EmojiGlyph>,
+}
+
+struct EmojiGlyph { font: Arc<glyphon::cosmic_text::Font>, index: u32, gid: u16, px: f32, left: i32, top: i32, w: u32, h: u32 }
+
 struct BgImage { pass: TexPass, bind: wgpu::BindGroup, w: f32, h: f32, alpha: f32 }
 
 struct Post { pass: TexPass, target: Option<(u32, u32, wgpu::Texture, wgpu::BindGroup)>, start: Instant }
@@ -272,7 +286,8 @@ pub struct Renderer {
     quads: Quads,
     bg: Option<BgImage>,
     post: Option<Post>,
-    cache: HashMap<u64, Buffer>,
+    cache: HashMap<u64, (Buffer, Vec<CustomGlyph>)>,
+    emoji: Emoji,
     widths: HashMap<u64, f32>,
     pub family: String,
     pub ui_family: String,
@@ -345,7 +360,7 @@ impl Renderer {
         let scale = window.scale_factor() as f32;
         let mut r = Renderer {
             window, surface, device, queue, config, swash: SwashCache::new(), viewport, atlas, glyph_cache: cache, text, quads,
-            bg: None, post: None, cache: HashMap::new(), widths: HashMap::new(), family: family.into(), ui_family: String::new(),
+            bg: None, post: None, cache: HashMap::new(), emoji: Emoji::default(), widths: HashMap::new(), family: family.into(), ui_family: String::new(),
             weight: 400, features: Vec::new(), font_px: 0.0, cell_w: 8.0, cell_h: 16.0,
             line_height, transparent, font_system, lost,
         };
@@ -408,6 +423,53 @@ impl Renderer {
         b.set_text(&text_glyphs(&t.text), &attrs, Shaping::Advanced, None);
         b.shape_until_scroll(&mut self.font_system, false);
         b
+    }
+
+    /// Glifos do texto moldado que vem de fonte COLRv1 (emoji coloridos):
+    /// viram glifos customizados na mesma posicao. `max_w` encolhe o emoji
+    /// que passaria da largura (2 celulas na grade).
+    fn emoji_glyphs(&mut self, b: &Buffer, max_w: Option<f32>) -> Vec<CustomGlyph> {
+        let mut out = Vec::new();
+        for run in b.layout_runs() {
+            for g in run.glyphs.iter() {
+                let Some(id) = self.emoji_id(g.font_id, g.font_weight, g.glyph_id, g.font_size, max_w) else { continue };
+                let e = &self.emoji.list[id as usize];
+                out.push(CustomGlyph {
+                    id,
+                    left: g.x + g.font_size * g.x_offset + e.left as f32,
+                    top: run.line_y + g.y - g.font_size * g.y_offset + e.top as f32,
+                    width: e.w as f32,
+                    height: e.h as f32,
+                    color: None,
+                    snap_to_physical_pixel: true,
+                    metadata: g.metadata,
+                });
+            }
+        }
+        out
+    }
+
+    fn emoji_id(&mut self, font_id: fontdb::ID, weight: fontdb::Weight, gid: u16, px: f32, max_w: Option<f32>) -> Option<u16> {
+        let key = (font_id, gid, px.to_bits() ^ max_w.map_or(0, |w| w.to_bits().rotate_left(16)));
+        if let Some(id) = self.emoji.ids.get(&key) { return *id; }
+        if !self.emoji.fonts.contains_key(&font_id) {
+            let index = self.font_system.db().face(font_id).map_or(0, |f| f.index);
+            let f = self.font_system.get_font(font_id, weight).filter(|f| crate::colr::has_v1(f.data(), index)).map(|f| (f, index));
+            self.emoji.fonts.insert(font_id, f);
+        }
+        let id = self.emoji.fonts[&font_id].clone().and_then(|(font, index)| {
+            if self.emoji.list.len() >= u16::MAX as usize || !crate::colr::is_v1_only(font.data(), index, gid) { return None; }
+            let mut px = px;
+            let (mut left, mut top, mut w, mut h) = crate::colr::bounds(font.data(), index, gid, px)?;
+            if let Some(m) = max_w.filter(|m| w as f32 > *m && *m > 0.0) {
+                px *= m / w as f32;
+                (left, top, w, h) = crate::colr::bounds(font.data(), index, gid, px)?;
+            }
+            self.emoji.list.push(EmojiGlyph { font, index, gid, px, left, top, w, h });
+            Some((self.emoji.list.len() - 1) as u16)
+        });
+        self.emoji.ids.insert(key, id);
+        id
     }
 
     /// Largura do texto em pixels (texto da interface tem largura variavel).
@@ -515,7 +577,10 @@ impl Renderer {
                 used.insert(k);
                 if !self.cache.contains_key(&k) {
                     let b = self.shape(t);
-                    self.cache.insert(k, b);
+                    // Na grade o emoji largo ocupa 2 celulas: nao passa disso.
+                    let max_w = (!t.ui).then(|| 2.0 * self.cell_w * if t.size > 0.0 { t.size } else { 1.0 });
+                    let g = self.emoji_glyphs(&b, max_w);
+                    self.cache.insert(k, (b, g));
                 }
             }
         }
@@ -525,18 +590,27 @@ impl Renderer {
         for (li, layer) in layers.iter().enumerate().take(LAYERS) {
             let areas: Vec<TextArea> = layer.texts.iter().map(|t| {
                 let c = t.color;
+                let (buffer, custom) = &self.cache[&Self::key(t)];
                 TextArea {
-                    buffer: &self.cache[&Self::key(t)],
+                    buffer,
                     left: t.x,
                     top: t.y,
                     scale: 1.0,
                     bounds: TextBounds { left: 0, top: 0, right: t.clip_right.map(|r| r as i32).unwrap_or(w as i32), bottom: h as i32 },
                     default_color: Color::rgba(c.0, c.1, c.2, (t.alpha * 255.0) as u8),
-                    custom_glyphs: &[],
+                    custom_glyphs: custom,
                 }
             }).collect();
-            let _ = self.text[li].prepare(&self.device, &self.queue, &mut self.font_system, &mut self.atlas,
-                &self.viewport, areas, &mut self.swash);
+            let emoji = &self.emoji.list;
+            let _ = self.text[li].prepare_with_custom(&self.device, &self.queue, &mut self.font_system, &mut self.atlas,
+                &self.viewport, areas, &mut self.swash, |req| {
+                    let e = emoji.get(req.id as usize)?;
+                    // Cor "do texto" pedida pela fonte (rara em emoji): cinza claro fixo,
+                    // ja que o atlas guarda o glifo sem a cor de quem o usa.
+                    let data = crate::colr::rasterize(e.font.data(), e.index, e.gid, e.px, e.left, e.top,
+                        req.width as u32, req.height as u32, [220, 220, 220, 255])?;
+                    Some(RasterizedCustomGlyph { data, content_type: ContentType::Color })
+                });
             // Formas primeiro (fundos de cartao, sombras), depois os quads da grade.
             let data: Vec<f32> = layer.shapes.iter().flat_map(|q| [q.x, q.y, q.w, q.h, q.color[0], q.color[1], q.color[2], q.color[3], q.radius, q.soft, q.border, 0.0])
                 .chain(layer.quads.iter().flat_map(|q| [q.x, q.y, q.w, q.h, q.color[0], q.color[1], q.color[2], q.color[3], 0.0, 0.0, 0.0, 0.0])).collect();
@@ -625,9 +699,10 @@ impl Renderer {
 }
 
 /// Simbolos que no Linux so existem em fonte de emoji colorido (Noto Color
-/// Emoji), que nao sai na tela: ficavam em branco, como o check das opcoes
-/// marcadas do Claude Code. Troca pelo equivalente da fonte embutida, de
-/// mesma largura.
+/// Emoji), como o check das opcoes marcadas do Claude Code. O emoji colorido
+/// ja sai (crate::colr), mas estes ocupam 1 celula na grade e o emoji tem
+/// largura de 2: vazaria na celula vizinha e ignoraria a cor do texto. Troca
+/// pelo equivalente monocromatico da fonte embutida, de mesma largura.
 fn text_glyphs(s: &str) -> std::borrow::Cow<'_, str> {
     const MAP: [(char, char); 3] = [('\u{2714}', '\u{2713}'), ('\u{2716}', '\u{2715}'), ('\u{2718}', '\u{2717}')];
     if !s.chars().any(|c| MAP.iter().any(|(f, _)| *f == c)) { return std::borrow::Cow::Borrowed(s); }
