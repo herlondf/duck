@@ -606,6 +606,11 @@ conexão cifrada. Fora da rede local, um relay opcional faz a ponte.
      (casa, VM, VPN).
    - Se o firewall bloquear a porta, o painel avisa (⚠ Firewall bloqueia) e
      Enter copia o comando que libera. No Windows: item **Firewall do Windows**.
+     O comando libera a faixa 7878–7882, que serve a todos os usuários do computador.
+   - Dois usuários logados no mesmo computador (Windows com troca de usuário),
+     cada um com o seu Duck: o segundo acha a 7878 ocupada, usa a próxima livre
+     (até 7882) e, sem `peer.name` na config, se chama `maquina-usuario`
+     (ex.: `legion-tp-herlon-filgueira`). A busca acha os dois.
 3. Num dos dois, uma destas:
    - **Procurar computadores**: acha os Ducks da rede local, das VMs e da
      Tailscale. Enter em **+ Conectar com ...**.

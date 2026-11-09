@@ -1093,6 +1093,10 @@ pub fn diagnose(name: Option<&str>) -> Vec<Check> {
         Some(_) if crate::peer::listens_all(&cfg.peer_listen) => out.push(check(Some(true), format!("Escutando em todas as redes, porta {port}."))),
         Some(a) => out.push(check(None, format!("Escutando só em {a}: computadores de outras redes (VMs, VPN) não chegam aqui. Painel Computadores > Rede > Todas as redes."))),
     }
+    if let Some(conf) = crate::peer::reserve_of().filter(|_| !cfg.peer_listen.is_empty()) {
+        out.push(check(None, format!("A porta {} está com outro Duck deste computador (outro usuário logado?): este usa a reserva {port}, com o nome {}. Os outros acham este pela busca (Procurar computadores), que também atualiza o endereço de quem já pareou.",
+            crate::peer::port_of(&conf), cfg.peer_name)));
+    }
     if !cfg.peer_listen.is_empty() {
         let blocked = crate::peer::firewalld_blocked(port);
         if blocked.is_empty() { if !cfg!(windows) { out.push(check(Some(true), "Firewall deste computador libera a porta (ou não há firewalld).")); } }

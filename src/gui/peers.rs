@@ -22,6 +22,8 @@ impl Gui {
     /// Abre (ou redesenha) o painel. `ping`: testa os pareados e le o estado
     /// do server em segundo plano.
     pub(super) fn open_peers(&mut self, ping: bool) {
+        // O server pode ter caido numa porta reserva depois que a janela leu a config.
+        peer::apply_bound(&mut self.cfg.peer_listen, &mut self.cfg.peer_name, self.cfg.peer_name_explicit);
         let name = self.cfg.peer_name.clone();
         let adv = peer::advertised(&self.cfg.peer_listen);
         let st = self.peer_state.clone();
@@ -35,6 +37,10 @@ impl Gui {
                 items.push(Item::new(format!("●  {name} · {} {} · chave {key}…", os_icon(std::env::consts::OS), std::env::consts::OS), "Enter: trocar o nome", "peer_rename", vec![]));
                 items.push(Item::new(format!("   Rede: {}", Self::listen_label(&self.cfg.peer_listen)),
                     "Enter: escolher em qual rede escutar (casa, VMs, VPN ou todas)", "peer_listen_menu", vec![]));
+                if let Some(conf) = peer::reserve_of() {
+                    items.push(Item::new(format!("   Porta {}: a {} está com outro Duck deste computador", peer::port_of(&self.cfg.peer_listen), peer::port_of(&conf)),
+                        "outro usuário logado com o Duck aberto · os outros acham este pela busca", "", vec![]));
+                }
             }
         }
         let relay = if self.cfg.peer_relay.is_empty() { "desligado · para falar com computadores fora da rede".to_string() }

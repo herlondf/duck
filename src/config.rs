@@ -265,6 +265,8 @@ pub struct Config {
     /// nome deste computador, entrega sem aprovacao e limite de idas e voltas.
     pub peer_listen: String,
     pub peer_name: String,
+    /// `peer.name` escrito na config (senao o nome sai da maquina).
+    pub peer_name_explicit: bool,
     pub peer_trust: bool,
     pub peer_max_hops: u32,
     /// Relay (`duck relay`) para alcancar computadores fora da rede: "host:porta".
@@ -496,6 +498,13 @@ pub fn parse(t: &Table) -> Config {
     if let Some(l) = std::env::var_os("LOCALAPPDATA") {
         font_dirs.push(PathBuf::from(l).join(r"Microsoft\Windows\Fonts").to_string_lossy().to_string());
     }
+    // Porta e nome deste computador. Se o server caiu numa porta reserva (outro
+    // usuario daqui com o Duck aberto), vale o que ele anotou (peer::apply_bound).
+    let mut peer_listen = t.get::<Table>("peer").ok().map(|p| s(&p, "listen", "")).unwrap_or_default();
+    let set_name = t.get::<Table>("peer").ok().map(|p| s(&p, "name", "")).filter(|n| !n.is_empty());
+    let peer_name_explicit = set_name.is_some();
+    let mut peer_name = set_name.unwrap_or_else(host_name);
+    crate::peer::apply_bound(&mut peer_listen, &mut peer_name, peer_name_explicit);
     Config {
         font_family,
         font_dirs,
@@ -547,9 +556,7 @@ pub fn parse(t: &Table) -> Config {
         shader: t.get::<Option<String>>("shader").ok().flatten(),
         visual_bell: t.get::<Option<bool>>("visual_bell").ok().flatten().unwrap_or(true),
         token_budget: n(t, "token_budget", 0.0) as u64,
-        peer_listen: t.get::<Table>("peer").ok().map(|p| s(&p, "listen", "")).unwrap_or_default(),
-        peer_name: t.get::<Table>("peer").ok().map(|p| s(&p, "name", "")).filter(|n| !n.is_empty())
-            .unwrap_or_else(|| std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "duck".into()).to_lowercase()),
+        peer_listen, peer_name, peer_name_explicit,
         peer_trust: t.get::<Table>("peer").ok().and_then(|p| p.get::<Option<bool>>("trust").ok().flatten()).unwrap_or(false),
         peer_max_hops: t.get::<Table>("peer").ok().map(|p| n(&p, "max_hops", 10.0) as u32).unwrap_or(10),
         peer_relay: t.get::<Table>("peer").ok().map(|p| s(&p, "relay", "")).unwrap_or_default(),
@@ -690,6 +697,11 @@ pub fn mix_rgb(a: Rgb, b: Rgb, f: f32) -> Rgb {
 }
 
 pub fn named_theme(name: &str) -> Theme { theme_file(name).unwrap_or_else(|| builtin_theme(name)) }
+
+/// Nome da maquina, minusculo (nome padrao deste computador para os outros).
+pub fn host_name() -> String {
+    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "duck".into()).to_lowercase()
+}
 
 pub fn load_config() -> (Config, Option<String>) {
     let (_lua, t, err) = load();

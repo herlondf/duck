@@ -104,6 +104,78 @@ pub fn advertised(listen: &str) -> Option<String> {
     }
 }
 
+// ------------------------------------------------- varios usuarios na maquina
+
+/// Portas reservas: com a porta da config ocupada (outro usuario do mesmo
+/// computador com o Duck aberto), o server tenta as seguintes. A busca e a
+/// regra de firewall cobrem a faixa toda.
+pub const PORT_SPAN: u16 = 5;
+
+/// Faixa de portas que a busca testa a partir de `port`.
+pub fn port_range(port: u16) -> std::ops::RangeInclusive<u16> {
+    port..=port.saturating_add(PORT_SPAN - 1)
+}
+
+/// Usuario do sistema (USERNAME no Windows, USER no resto).
+pub fn os_user() -> String {
+    std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default()
+}
+
+/// Nome quando outro Duck deste computador ja usa a porta: `maquina-usuario`
+/// ("tp.herlon.filgueira" vira "tp-herlon-filgueira").
+pub fn user_name(host: &str, user: &str) -> String {
+    let user = user.trim().replace(['.', ' ', '@', '\\'], "-");
+    if user.is_empty() { return clean_name(host); }
+    clean_name(&format!("{}-{}", clean_name(host), user))
+}
+
+/// Onde o server anota a porta e o nome que de fato usa, quando nao sao os da
+/// config. CLI, janela e convites leem daqui (ver `apply_bound`).
+fn bound_file() -> std::path::PathBuf { crate::proto::data_dir().join("peer-bound.json") }
+
+/// Escuta em `listen`; ocupada, tenta as portas seguintes da faixa. Devolve o
+/// socket e o endereco efetivo.
+pub fn bind_listen(listen: &str) -> Result<(std::net::TcpListener, String), String> {
+    let (host, port) = listen.trim().rsplit_once(':').map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(DEFAULT_PORT)))
+        .unwrap_or((listen.trim().to_string(), DEFAULT_PORT));
+    let mut first_err = None;
+    for p in port_range(port) {
+        let addr = format!("{host}:{p}");
+        match std::net::TcpListener::bind(&addr) {
+            Ok(l) => return Ok((l, addr)),
+            // Outro processo na porta (no Windows, de outro usuario, pode vir como acesso negado).
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied) => {
+                first_err.get_or_insert(format!("{addr}: {e}"));
+            }
+            Err(e) => return Err(format!("{addr}: {e}")),
+        }
+    }
+    Err(format!("{} (e as {} seguintes tambem ocupadas)", first_err.unwrap_or_default(), PORT_SPAN - 1))
+}
+
+/// Anota o que o server usa. Sem desvio (porta da config), apaga a nota.
+pub fn record_bound(configured: &str, effective: &str, name: Option<&str>) {
+    let f = bound_file();
+    if configured.trim() == effective.trim() && name.is_none() { let _ = std::fs::remove_file(f); return; }
+    let _ = std::fs::write(f, json!({"configured": configured.trim(), "listen": effective, "name": name}).to_string());
+}
+
+/// `listen` da config quando o server esta numa porta reserva (None: na da config).
+pub fn reserve_of() -> Option<String> {
+    let v: Value = serde_json::from_slice(&std::fs::read(bound_file()).ok()?).ok()?;
+    v["configured"].as_str().filter(|c| !c.is_empty()).map(String::from)
+}
+
+/// Aplica a nota do server na config lida: so vale para a mesma `listen` da
+/// config (mudou a config, a nota antiga e ignorada ate o server reiniciar).
+pub fn apply_bound(listen: &mut String, name: &mut String, name_explicit: bool) {
+    let Ok(b) = std::fs::read(bound_file()) else { return };
+    let Ok(v) = serde_json::from_slice::<Value>(&b) else { return };
+    if listen.is_empty() || v["configured"].as_str() != Some(listen.trim()) { return; }
+    if let Some(l) = v["listen"].as_str().filter(|l| !l.is_empty()) { *listen = l.to_string(); }
+    if !name_explicit { if let Some(n) = v["name"].as_str().filter(|n| !n.is_empty()) { *name = n.to_string(); } }
+}
+
 fn lua_str(s: &str) -> String { format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")) }
 
 /// Liga a escuta (`peer.listen`) e grava o nome. Vale ao reiniciar o server.
@@ -405,9 +477,14 @@ pub fn discover(ports: &[u16], wait: Duration) -> Vec<Value> {
     for i in interfaces() {
         if !targets.contains(&i.broadcast) { targets.push(i.broadcast); }
     }
+    // Cada porta pedida e as reservas dela: outro usuario do mesmo computador
+    // com o Duck aberto escuta numa das seguintes.
+    let mut all: Vec<u16> = vec![];
+    for p in ports { for q in port_range(*p) { if !all.contains(&q) { all.push(q); } } }
+    let ports = &all[..];
     // A Tailscale nao tem broadcast: testa os computadores da tailnet em paralelo.
-    let ts_port = ports.first().copied().unwrap_or(DEFAULT_PORT);
-    let ts = std::thread::spawn(move || discover_tailscale(ts_port));
+    let ts_ports: Vec<u16> = port_range(ports.first().copied().unwrap_or(DEFAULT_PORT)).collect();
+    let ts = std::thread::spawn(move || discover_tailscale(&ts_ports));
     let send_all = || for p in ports { for t in &targets { let _ = s.send_to(PROBE, (t.as_str(), *p)); } };
     send_all();
     let mut out: Vec<Value> = vec![];
@@ -480,9 +557,10 @@ fn parse_tailscale(json_text: &str) -> Vec<(String, String)> {
 }
 
 /// Pinga em paralelo os computadores da tailnet; os que tem Duck viram itens da busca.
-fn discover_tailscale(port: u16) -> Vec<Value> {
+fn discover_tailscale(ports: &[u16]) -> Vec<Value> {
     let peers = tailscale_peers();
-    let hs: Vec<_> = peers.into_iter().map(|(n, ip)| std::thread::spawn(move || {
+    let pairs: Vec<(String, String, u16)> = peers.into_iter().flat_map(|(n, ip)| ports.iter().map(move |p| (n.clone(), ip.clone(), *p))).collect();
+    let hs: Vec<_> = pairs.into_iter().map(|(n, ip, port)| std::thread::spawn(move || {
         let addr = format!("{ip}:{port}");
         let mut s = tcp(&addr, Duration::from_millis(900)).ok()?;
         use std::io::{BufRead, Write};
@@ -502,9 +580,19 @@ fn discover_tailscale(port: u16) -> Vec<Value> {
 // ---------------------------------------------------------------- firewall
 
 /// Comando que libera a porta no firewall do Windows (TCP e a descoberta UDP).
+/// Libera a faixa toda (a porta e as reservas), para servir a qualquer usuario
+/// deste computador.
 pub fn windows_firewall_cmd(port: u16) -> String {
-    format!("New-NetFirewallRule -DisplayName 'Duck peers ({port})' -Direction Inbound -Protocol TCP -LocalPort {port} -Profile Private,Domain -Action Allow; \
-             New-NetFirewallRule -DisplayName 'Duck peers descoberta ({port})' -Direction Inbound -Protocol UDP -LocalPort {port} -Profile Private,Domain -Action Allow")
+    let (a, b) = fw_range(port);
+    format!("New-NetFirewallRule -DisplayName 'Duck peers ({a}-{b})' -Direction Inbound -Protocol TCP -LocalPort {a}-{b} -Profile Private,Domain -Action Allow; \
+             New-NetFirewallRule -DisplayName 'Duck peers descoberta ({a}-{b})' -Direction Inbound -Protocol UDP -LocalPort {a}-{b} -Profile Private,Domain -Action Allow")
+}
+
+/// Faixa de firewall que contem `port`: a padrao (7878..7882) se ela esta
+/// dentro; senao a partir dela.
+fn fw_range(port: u16) -> (u16, u16) {
+    let base = if port_range(DEFAULT_PORT).contains(&port) { DEFAULT_PORT } else { port };
+    (base, base.saturating_add(PORT_SPAN - 1))
 }
 
 /// Zonas do firewalld (Linux) com placa de rede ativa que nao liberam a
@@ -544,7 +632,8 @@ fn port_in_range(r: &str, port: u16, proto: &str) -> bool {
 
 /// Comando que libera a porta numa zona do firewalld (TCP e a busca UDP).
 pub fn firewalld_cmd(zone: &str, port: u16) -> String {
-    format!("sudo firewall-cmd --zone={zone} --add-port={port}/tcp --add-port={port}/udp --permanent && sudo firewall-cmd --reload")
+    let (a, b) = fw_range(port);
+    format!("sudo firewall-cmd --zone={zone} --add-port={a}-{b}/tcp --add-port={a}-{b}/udp --permanent && sudo firewall-cmd --reload")
 }
 
 #[cfg(test)]
@@ -593,6 +682,26 @@ mod tests {
                             "b":{"HostName":"off","TailscaleIPs":["100.1.1.1"],"Online":false}}}"#;
         assert_eq!(parse_tailscale(j), vec![("legion".to_string(), "100.101.1.2".to_string())]);
         assert!(parse_tailscale("nao e json").is_empty());
+    }
+
+    #[test]
+    fn varios_usuarios() {
+        assert_eq!(user_name("LEGION", "tp.herlon.filgueira"), "legion-tp-herlon-filgueira");
+        assert_eq!(user_name("legion", ""), "legion");
+        assert_eq!(user_name("pc", "DOMINIO\\joao silva"), "pc-dominio-joao-silva");
+        assert_eq!(port_range(7878).collect::<Vec<_>>(), vec![7878, 7879, 7880, 7881, 7882]);
+        assert_eq!(fw_range(7880), (7878, 7882));
+        assert_eq!(fw_range(9000), (9000, 9004));
+        assert!(windows_firewall_cmd(7879).contains("-LocalPort 7878-7882"));
+        assert!(firewalld_cmd("home", 7878).contains("--add-port=7878-7882/tcp"));
+        // Porta ocupada: cai na seguinte da faixa.
+        let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = a.local_addr().unwrap().port();
+        if port < u16::MAX - 5 {
+            let (_b, addr) = bind_listen(&format!("127.0.0.1:{port}")).unwrap();
+            assert_ne!(port_of(&addr), port);
+            assert!(port_range(port).contains(&port_of(&addr)));
+        }
     }
 
     #[test]

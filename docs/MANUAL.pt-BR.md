@@ -331,6 +331,10 @@ Segredos conhecidos saem mascarados. Depois de `max_hops` mensagens na mesma
 conversa, o Duck recusa e pede o usuário; no painel dá para encerrar uma
 conversa. Um pareado pode ter vários endereços (casa, VPN, relay): o Duck tenta
 na ordem e aprende os novos sozinho.
+Dois usuários logados no mesmo computador, cada um com o seu Duck: quem chega
+depois acha a porta ocupada, escuta na próxima livre (até quatro acima, ex.:
+7879) e, sem `peer.name` na config, se apresenta como `maquina-usuario`. O
+`duck peer doctor` e o painel mostram a porta reserva; a busca testa a faixa toda.
 À mão, no `~/.duck-local.lua`: `config.peer = { listen = '0.0.0.0:7878', relay = 'host:7879' }` e
 `config.peers = { nome = 'ip:7878,relay:host:7879' }` (a chave de cada um fica no cofre).
 

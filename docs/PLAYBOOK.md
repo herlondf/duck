@@ -614,6 +614,11 @@ connection. Outside the local network, an optional relay bridges them.
      interface only (home, VM, VPN).
    - If the firewall blocks the port, the panel says so (⚠ Firewall) and Enter
      copies the command that opens it. On Windows: **Firewall do Windows** item.
+     The command opens the 7878–7882 range, which covers every user of the computer.
+   - Two users signed in on the same computer (Windows fast user switching),
+     each with their own Duck: the second finds 7878 taken, uses the next free
+     port (up to 7882) and, without `peer.name` in the config, is named
+     `machine-user` (e.g. `legion-tp-herlon-filgueira`). The search finds both.
 3. On one of them, either:
    - **Procurar computadores** (find computers): finds Ducks on the local
      network, VMs and Tailscale. Enter on **+ Conectar com ...**.

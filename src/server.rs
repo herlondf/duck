@@ -981,11 +981,7 @@ const PEER_MAX_FILE: usize = 64 << 20;
 /// Escuta outros computadores (`peer = { listen = 'ip:porta' }`). O que vem
 /// cifrado (Noise, ver secure.rs) passa por `secure_req`; texto puro so ping
 /// e pareados antigos (ate 0.1.8) com token.
-fn peer_listen(srv: Arc<Server>, addr: String) {
-    let l = match std::net::TcpListener::bind(&addr) {
-        Ok(l) => l,
-        Err(e) => { proto::log(&format!("peers: nao escutou em {addr}: {e}")); return; }
-    };
+fn peer_listen(srv: Arc<Server>, l: std::net::TcpListener, addr: String) {
     proto::log(&format!("peers: escutando em {addr}"));
     for s in l.incoming().flatten() {
         let srv = srv.clone();
@@ -3968,6 +3964,8 @@ pub fn run() {
     std::panic::set_hook(Box::new(|info| proto::log(&format!("PANIC: {info}"))));
     let token = proto::new_token();
     install_shell_scripts();
+    // A nota da porta reserva e deste server: a anterior nao vale mais.
+    crate::peer::record_bound("", "", None);
     let (cfg, err) = config::load_config();
     if let Some(e) = err { proto::log(&format!("config: {e}")); }
     let (tx, rx) = channel();
@@ -3987,9 +3985,25 @@ pub fn run() {
     proto::log(&format!("server {} iniciado (pid {})", env!("CARGO_PKG_VERSION"), std::process::id()));
     recover(&srv);
     let listen = srv.lock().cfg.peer_listen.clone();
-    if !listen.is_empty() {
-        let port = crate::peer::port_of(&listen);
-        { let s = srv.clone(); std::thread::spawn(move || peer_listen(s, listen)); }
+    let bound = if listen.is_empty() { None } else {
+        match crate::peer::bind_listen(&listen) {
+            Ok(b) => Some(b),
+            Err(e) => { proto::log(&format!("peers: nao escutou: {e}")); None }
+        }
+    };
+    if let Some((l, addr)) = bound {
+        let port = crate::peer::port_of(&addr);
+        if addr != listen {
+            // Outro Duck deste computador (outro usuario) ja usa a porta da
+            // config: fica na reserva e, sem nome na config, usa maquina-usuario.
+            let mut m = srv.lock();
+            let name = (!m.cfg.peer_name_explicit).then(|| crate::peer::user_name(&config::host_name(), &crate::peer::os_user()));
+            proto::log(&format!("peers: {listen} ocupada (outro Duck neste computador?): escutando em {addr}{}", name.as_ref().map(|n| format!(" como {n}")).unwrap_or_default()));
+            crate::peer::record_bound(&listen, &addr, name.as_deref());
+            m.cfg.peer_listen = addr.clone();
+            if let Some(n) = name { m.cfg.peer_name = n; }
+        }
+        { let s = srv.clone(); std::thread::spawn(move || peer_listen(s, l, addr)); }
         // Descoberta (painel Computadores > Procurar): responde nome e endereco, nunca o token.
         let s = srv.clone();
         std::thread::spawn(move || crate::peer::answer_discovery(port, move || {
