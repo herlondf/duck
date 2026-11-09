@@ -28,20 +28,33 @@ impl Gui {
                 self.update_ver = Some(v.clone());
                 if self.shown_notices.insert(format!("update {v}")) { self.flash(&update::how_to(&v)); }
             }
+            // Arg "release": trocar a instalacao pelo codigo pela do release.
             "duck_update" => {
                 if self.updating { self.flash("Atualizando o Duck…"); return true; }
-                if let update::Kind::Source(_) = update::kind() {
+                let mode = if s(0) == "release" { update::Mode::Release } else { update::Mode::Auto };
+                let kind = update::kind();
+                if let (update::Mode::Auto, update::Kind::Source(_)) = (mode, &kind) {
                     let v = self.update_ver.clone().unwrap_or_else(|| "nova".into());
                     self.flash(&update::how_to(&v));
                     return true;
                 }
                 self.updating = true;
-                self.flash("Procurando versão nova do Duck…");
-                self.peers_bg("duck_update_done", vec![], || {
+                self.flash(if mode == update::Mode::Release { "Trocando pela instalação do release…" } else { "Procurando versão nova do Duck…" });
+                self.peers_bg("duck_update_done", vec![], move || {
                     let latest = update::latest()?;
-                    if !update::newer(&latest, update::current()) { return Ok(json!({"uptodate": update::current()})); }
-                    update::install(&latest)?;
-                    Ok(json!({"installed": latest}))
+                    match update::plan(mode, &kind, Some(&latest), update::current(), update::CAN_SWITCH) {
+                        update::Plan::UpToDate => Ok(json!({"uptodate": update::current()})),
+                        update::Plan::Install { switch } => {
+                            update::install(&latest)?;
+                            #[cfg(not(windows))]
+                            let warn = update::shadow_warning();
+                            #[cfg(windows)]
+                            let warn: Option<String> = None;
+                            Ok(json!({"installed": latest, "switch": switch, "warn": warn}))
+                        }
+                        update::Plan::Refuse(m) => Err(m),
+                        update::Plan::Pull(_) => Err("use duck update --source num terminal".into()),
+                    }
                 });
             }
             "duck_update_done" => {
@@ -53,7 +66,9 @@ impl Gui {
                 self.update_ver = None;
                 // No Windows o instalador ja reiniciou o server; aqui, reinicia.
                 if !cfg!(windows) { let _ = self.call(json!({"cmd": "restart-server"})); }
-                self.flash(&format!("Duck {v} instalado e server reiniciado (os shells continuam). Feche e abra a janela para usar a versão nova."));
+                let switch = if r["switch"].as_bool() == Some(true) { " Agora é instalação do release: as próximas atualizações são por aqui." } else { "" };
+                let warn = r["warn"].as_str().map(|w| format!(" {w}")).unwrap_or_default();
+                self.flash(&format!("Duck {v} instalado e server reiniciado (os shells continuam). Feche e abra a janela para usar a versão nova.{switch}{warn}"));
             }
             _ => return false,
         }
