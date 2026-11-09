@@ -1527,6 +1527,10 @@ impl Gui {
             defs.push((format!("Novo pane: {}  (a direita)", d.name), "split".into(), vec![json!("right"), json!(d.name)]));
             defs.push((format!("Nova aba: {}", d.name), "new_tab".into(), vec![json!(d.name)]));
         }
+        // Instalacao pelo codigo: a troca pelo release (que se atualiza sozinha).
+        if crate::update::CAN_SWITCH && matches!(crate::update::kind(), crate::update::Kind::Source(_)) {
+            defs.push(b("Atualizar o Duck: trocar pelo release (instalação pelo código; atualiza sozinho depois)", "duck_update", vec![json!("release")]));
+        }
         let mut items: Vec<Item> = defs.into_iter().map(|(label, action, args)| {
             let hint = self.hint_for(&action, args.first().and_then(|v| v.as_str()));
             Item::new(label, hint, &action, args)

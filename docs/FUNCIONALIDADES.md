@@ -60,7 +60,9 @@ Legenda: `[x]` pronto e testado · `[~]` pronto, teste parcial · `[ ]` a fazer.
       `NO_COLOR` injetado pela sessão do Claude)
 - [x] Atualizador: aviso de versão nova (1x por dia) e `duck update` /
       Ctrl+Shift+P > Atualizar o Duck (baixa o release, confere o SHA256, instala
-      e reinicia o server sem fechar os shells). Só na instalação pelo release.
+      e reinicia o server sem fechar os shells). Só na instalação pelo release;
+      a pelo código troca para a do release com `duck update --release` (Linux)
+      ou atualiza pelo clone com `duck update --source`.
 - [x] Windows: pane novo relê PATH e variáveis do registro (`refresh_env`).
       Um programa instalado com o Duck aberto já aparece na aba nova, sem
       reiniciar o server, como no Windows Terminal.

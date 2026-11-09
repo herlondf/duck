@@ -81,7 +81,15 @@ Opções do instalador vão depois de `sh -s --` (Linux) ou com
 **Atualizações:** o Duck procura release novo uma vez por dia e avisa. Depois,
 **Ctrl+Shift+P > Atualizar o Duck** (ou `duck update`) baixa, confere, instala e
 reinicia o server; os shells continuam. Desliga com `update_check = false`.
-Instalação pelo código atualiza com `git pull` + instalador, como antes.
+
+A instalação pelo código (clone + `./install.sh`) não muda com o `duck update`
+puro. No Linux, `duck update --release` (ou **Ctrl+Shift+P > Atualizar o
+Duck: trocar pelo release**) passa para a instalação do release: os mesmos
+`~/.local/bin/duck` e `duckw`, e daí em diante o `duck update` atualiza
+sozinho; o clone fica onde está. `duck update --source` faz `git pull
+--ff-only` + `./install.sh` no clone (compila, então precisa do `cargo`).
+Versões antes da 0.1.9 não têm o `--release`: rode uma vez a linha do `get.sh`
+acima. No Windows, pelo código: `git pull` + `install.ps1`, como antes.
 
 ### Compilando do código
 
