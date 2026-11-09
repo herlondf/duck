@@ -482,7 +482,9 @@ mod tests {
         assert_eq!(plan(Mode::Auto, &rel, Some("0.1.8"), "0.1.8", true), Plan::UpToDate);
         assert_eq!(plan(Mode::Release, &rel, Some("0.1.8"), "0.1.2", true), Plan::Install { switch: false });
         // Pelo codigo, sem flag: nao troca nada, explica.
-        assert!(matches!(plan(Mode::Auto, &nowhere, Some("0.1.8"), "0.1.2", true), Plan::Refuse(m) if m.contains("--release")));
+        // A dica muda por sistema: no Windows a troca e pelo get.ps1.
+        let hint = if CAN_SWITCH { "--release" } else { "get.ps1" };
+        assert!(matches!(plan(Mode::Auto, &nowhere, Some("0.1.8"), "0.1.2", true), Plan::Refuse(m) if m.contains(hint)));
         assert_eq!(plan(Mode::Auto, &src, Some("0.1.8"), "0.1.8", true), Plan::UpToDate);
         // --release: troca, mesmo na mesma versao; nao volta versao; nao no Windows.
         assert_eq!(plan(Mode::Release, &nowhere, Some("0.1.8"), "0.1.2", true), Plan::Install { switch: true });
