@@ -84,8 +84,9 @@ if ($Boot) { & $exe install }
 Copy-Item "$root\extensions\claude-usage\statusline.ps1" "$bin\duck-statusline.ps1" -Force
 
 if ($ClaudeHooks) {
+  # Todo perfil ~/.claude*, mesmo sem settings.json ainda (perfil novo):
+  # o duck install --hooks cria o arquivo.
   Get-ChildItem $env:USERPROFILE -Directory -Force -Filter '.claude*' |
-    Where-Object { Test-Path (Join-Path $_.FullName 'settings.json') } |
     ForEach-Object {
       $settings = Join-Path $_.FullName 'settings.json'
       & $exe install --hooks $settings

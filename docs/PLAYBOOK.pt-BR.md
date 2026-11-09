@@ -730,6 +730,8 @@ No outro computador:
 | Avisos de agente não aparecem | Confira `notify = true` no `~/.duck.lua` (é o padrão). O aviso só sai se você não estiver olhando para aquele pane. Em tela cheia, ele vai para a central do Windows. |
 | Agente sem estado nas abas | `install.ps1 -SkipBuild -ClaudeHooks`, depois reabra o Claude. |
 | Atualizei e nada mudou | Feche e abra a janela do Duck (o server já foi reiniciado). |
+| Windows sem Git: o Claude bloqueia todas as ferramentas ("Git Bash wasn't found") | Os hooks do Duck estão no formato antigo. `duck install --hooks "<perfil>\settings.json"` migra para o formato sem shell; `duck doctor` mostra o comando de cada perfil. |
+| Restaurar não retoma a sessão do agente | O pane mostra o motivo e o comando. Em geral faltam os hooks do Duck no perfil do Claude daquele pane: `duck install --hooks "<perfil>/settings.json"`. |
 | `duck msg`: "nao respondeu" | `duck peer doctor <nome>` (ou Computadores > nome > Diagnosticar): diz se o outro não escuta, se o firewall bloqueia, se a versão é antiga ou se só uma direção funciona, e o que fazer. |
 | `duck msg`: "nao esta pareado la" ou "chave ... nao e a esperada" | O outro esqueceu este computador ou foi reinstalado. Pareie de novo (convite é o mais rápido). |
 | Pareado com "⚠ sem criptografia" | Foi pareado numa versão até 0.1.8. Atualize os dois e use **Parear de novo**. |

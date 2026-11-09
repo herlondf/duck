@@ -740,6 +740,8 @@ On the other computer:
 | Agent notices don't show | Check `notify = true` in `~/.duck.lua` (the default). A notice only goes out when you aren't looking at that pane. In full screen it goes to the Windows notification center. |
 | Agents show no state in tabs | `install.ps1 -SkipBuild -ClaudeHooks`, then reopen Claude. |
 | I updated and nothing changed | Close and reopen the Duck window (the server was already restarted). |
+| Windows without Git: Claude blocks every tool ("Git Bash wasn't found") | The Duck hooks are in the old format. `duck install --hooks "<profile>\settings.json"` migrates them to the shell-free format; `duck doctor` shows the command for each profile. |
+| Restore does not resume the agent session | The pane shows why and the command to fix it. Usually the Claude profile of that pane lacks the Duck hooks: `duck install --hooks "<profile>/settings.json"`. |
 | `duck msg`: "nao respondeu" (did not answer) | `duck peer doctor <name>` (or Computadores > name > Diagnosticar): tells whether the other side is not listening, the firewall blocks it, the version is old or only one direction works, and what to do. |
 | `duck msg`: "nao esta pareado la" (not paired there) or "chave ... nao e a esperada" (unexpected key) | The other side forgot this computer or was reinstalled. Pair again (an invite is quickest). |
 | Peer marked "⚠ sem criptografia" (no encryption) | Paired with version 0.1.8 or older. Update both and use **Parear de novo**. |

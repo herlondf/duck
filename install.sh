@@ -209,7 +209,8 @@ fi
 
 if [ "$hooks" = 1 ]; then
   for d in "$HOME"/.claude*; do
-    [ -f "$d/settings.json" ] && "$bin/duck" install --hooks "$d/settings.json"
+    # Todo perfil ~/.claude*, mesmo sem settings.json (o duck cria o arquivo).
+    [ -d "$d" ] && "$bin/duck" install --hooks "$d/settings.json"
   done
 fi
 

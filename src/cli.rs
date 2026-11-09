@@ -213,28 +213,180 @@ X-GNOME-Autostart-enabled=true
     }
 }
 
-fn install_hooks(path: &str, exe: &str) -> i32 {
-    let raw = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
-    let mut v: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(e) => { eprintln!("{path}: {e}"); return 1 } };
-    let _ = std::fs::write(format!("{path}.bak-duck"), &raw);
-    let cmd = format!("\"{}\" hook", exe.replace('\\', "/"));
-    let hooks = v.as_object_mut().unwrap().entry("hooks").or_insert(json!({}));
-    for ev in ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd"] {
-        let list = hooks.as_object_mut().unwrap().entry(ev).or_insert(json!([]));
-        let present = list.to_string().contains(" hook\"") && list.to_string().contains("duck");
-        if !present {
-            list.as_array_mut().unwrap().push(json!({"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}));
-        }
+/// Eventos do Claude Code em que o Duck registra `duck hook`.
+const HOOK_EVENTS: [&str; 7] = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd"];
+
+/// Entrada do hook do Duck. No Windows o Claude Code roda `command` pelo Git
+/// Bash; sem ele cai no PowerShell, onde `"C:/.../duck.exe" hook` e erro de
+/// sintaxe e o hook que falha trava as ferramentas (PreToolUse). Por isso
+/// la vai programa em `command` e argumentos em `args` (sem shell). Sem
+/// `onFailure`: o hook do Duck e informativo, falhar nao pode travar o Claude.
+fn hook_entry(exe: &str, windows: bool) -> Value {
+    let exe = exe.replace('\\', "/");
+    if windows { json!({"type": "command", "command": exe, "args": ["hook"], "timeout": 5}) }
+    else { json!({"type": "command", "command": format!("\"{exe}\" hook"), "timeout": 5}) }
+}
+
+/// Nome do programa (sem pasta, aspas nem .exe), minusculo.
+fn prog_base(p: &str) -> String {
+    let p = p.trim().trim_matches('"').trim_matches('\'');
+    let base = p.rsplit(['/', '\\']).next().unwrap_or(p).to_lowercase();
+    base.strip_suffix(".exe").unwrap_or(&base).to_string()
+}
+
+/// O hook e do Duck? (`duck hook` numa string, antigo, ou duck + args ["hook"]).
+/// Hooks de terceiros nunca casam.
+fn is_duck_hook(h: &Value) -> bool {
+    let cmd = h["command"].as_str().unwrap_or("");
+    if let Some(args) = h["args"].as_array() {
+        return prog_base(cmd) == "duck" && args.len() == 1 && args[0] == "hook";
     }
-    match std::fs::write(path, serde_json::to_string_pretty(&v).unwrap()) {
-        Ok(_) => { println!("hooks do Duck em {path} (backup .bak-duck)"); 0 }
-        Err(e) => { eprintln!("{e}"); 1 }
+    let Some(prog) = cmd.trim().strip_suffix(" hook") else { return false };
+    prog_base(prog) == "duck"
+}
+
+/// Hook do Duck no formato que quebra no Windows sem Git Bash (string unica).
+fn is_legacy_duck_hook(h: &Value) -> bool { is_duck_hook(h) && h.get("args").is_none() }
+
+/// Poe o hook do Duck em cada evento: troca a entrada antiga (migra), tira
+/// duplicadas e nao mexe nas de terceiros. Devolve se mudou algo.
+fn apply_hooks(v: &mut Value, exe: &str, windows: bool) -> Result<bool, String> {
+    if !v.is_object() { return Err("settings.json nao e um objeto JSON".into()); }
+    let want = hook_entry(exe, windows);
+    let before = v.clone();
+    let hooks = v.as_object_mut().unwrap().entry("hooks").or_insert(json!({}));
+    let Some(hooks) = hooks.as_object_mut() else { return Err("\"hooks\" nao e um objeto".into()) };
+    for ev in HOOK_EVENTS {
+        let list = hooks.entry(ev).or_insert(json!([]));
+        let Some(groups) = list.as_array_mut() else { return Err(format!("hooks.{ev} nao e uma lista")) };
+        let mut placed = false;
+        for g in groups.iter_mut() {
+            let Some(hs) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) else { continue };
+            let mut out = Vec::with_capacity(hs.len());
+            for h in hs.drain(..) {
+                if !is_duck_hook(&h) { out.push(h); }
+                else if !placed { out.push(want.clone()); placed = true; }
+            }
+            *hs = out;
+        }
+        // Grupo que so tinha o Duck (duplicado) e ficou vazio sai.
+        groups.retain(|g| g.get("hooks").and_then(|h| h.as_array()).is_none_or(|h| !h.is_empty()));
+        if !placed { groups.push(json!({"hooks": [want.clone()]})); }
+    }
+    Ok(*v != before)
+}
+
+/// Estado dos hooks do Duck num settings.json.
+#[derive(Debug, PartialEq)]
+pub enum HookState {
+    Ok,
+    /// Arquivo nao existe ou nao tem o hook do Duck.
+    Missing,
+    /// Formato antigo (string unica) no Windows: trava o Claude sem Git Bash.
+    Legacy,
+    /// JSON invalido.
+    Invalid(String),
+}
+
+fn hook_state_of(v: &Value, windows: bool) -> HookState {
+    let entries: Vec<&Value> = v["hooks"].as_object().into_iter().flat_map(|o| o.values())
+        .filter_map(|l| l.as_array()).flatten()
+        .filter_map(|g| g["hooks"].as_array()).flatten().filter(|h| is_duck_hook(h)).collect();
+    if entries.is_empty() { HookState::Missing }
+    else if windows && entries.iter().any(|h| is_legacy_duck_hook(h)) { HookState::Legacy }
+    else { HookState::Ok }
+}
+
+pub fn hook_state(settings: &std::path::Path) -> HookState {
+    let Ok(raw) = std::fs::read_to_string(settings) else { return HookState::Missing };
+    if raw.trim().is_empty() { return HookState::Missing; }
+    match serde_json::from_str::<Value>(&raw) { Ok(v) => hook_state_of(&v, cfg!(windows)), Err(e) => HookState::Invalid(e.to_string()) }
+}
+
+/// Perfis do Claude Code: pastas ~/.claude* (o settings.json pode nao existir ainda).
+pub fn claude_profiles() -> Vec<std::path::PathBuf> {
+    let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(crate::config::home()).into_iter().flatten().flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".claude") && e.path().is_dir())
+        .map(|e| e.path()).collect();
+    v.sort();
+    v
+}
+
+/// Comando que instala (ou migra) os hooks num perfil.
+pub fn hooks_fix_cmd(settings: &std::path::Path) -> String { format!("duck install --hooks \"{}\"", settings.display()) }
+
+fn install_hooks(path: &str, exe: &str) -> i32 {
+    let p = std::path::Path::new(path);
+    // Perfil sem settings.json (perfil novo do Claude): cria.
+    if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Err(e) = std::fs::create_dir_all(dir) { eprintln!("{}: {e}", dir.display()); return 1; }
+    }
+    let raw = std::fs::read_to_string(p).unwrap_or_default();
+    let raw = if raw.trim().is_empty() { "{}".to_string() } else { raw };
+    let mut v: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(e) => { eprintln!("{path}: {e}"); return 1 } };
+    let legacy = hook_state_of(&v, cfg!(windows)) == HookState::Legacy;
+    match apply_hooks(&mut v, exe, cfg!(windows)) {
+        Ok(false) => { println!("hooks do Duck ja estavam em {path}"); 0 }
+        Ok(true) => {
+            let _ = std::fs::write(format!("{path}.bak-duck"), &raw);
+            match std::fs::write(p, serde_json::to_string_pretty(&v).unwrap()) {
+                Ok(_) => { println!("hooks do Duck {} em {path} (backup .bak-duck)", if legacy { "migrados para o formato sem shell" } else { "instalados" }); 0 }
+                Err(e) => { eprintln!("{e}"); 1 }
+            }
+        }
+        Err(e) => { eprintln!("{path}: {e}"); 1 }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hooks_windows_e_linux() {
+        let exe = r"C:\Users\herlo\AppData\Local\Duck\bin\duck.exe";
+        let ev = |v: &Value, e: &str| v["hooks"][e].as_array().unwrap().clone();
+        // Novo, Windows: programa + args, sem shell.
+        let mut v = json!({});
+        assert!(apply_hooks(&mut v, exe, true).unwrap());
+        let h = &ev(&v, "PreToolUse")[0]["hooks"][0];
+        assert_eq!(h["command"], "C:/Users/herlo/AppData/Local/Duck/bin/duck.exe");
+        assert_eq!(h["args"], json!(["hook"]));
+        assert!(h.get("onFailure").is_none());
+        assert_eq!(hook_state_of(&v, true), HookState::Ok);
+        // Rodar de novo nao muda nada.
+        assert!(!apply_hooks(&mut v, exe, true).unwrap());
+        // Antigo (string unica) + duplicado + hook de terceiro: migra, tira o
+        // duplicado e mantem o de terceiro no lugar.
+        let old = json!({"type": "command", "command": "\"C:/Users/herlo/AppData/Local/Duck/bin/duck.exe\" hook", "timeout": 5});
+        let other = json!({"type": "command", "command": "node C:/x/meu-hook.js hook"});
+        let mut v = json!({"model": "opus", "hooks": {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [other.clone(), old.clone()]}, {"hooks": [old.clone()]}],
+            "Stop": [{"hooks": [old.clone()]}]}});
+        assert_eq!(hook_state_of(&v, true), HookState::Legacy);
+        assert_eq!(hook_state_of(&v, false), HookState::Ok);
+        assert!(apply_hooks(&mut v, exe, true).unwrap());
+        let pre = ev(&v, "PreToolUse");
+        assert_eq!(pre.len(), 1, "grupo so com duplicado sai: {pre:?}");
+        assert_eq!(pre[0]["matcher"], "Bash");
+        assert_eq!(pre[0]["hooks"][0], other);
+        assert_eq!(pre[0]["hooks"][1]["args"], json!(["hook"]));
+        assert_eq!(ev(&v, "Stop").len(), 1);
+        assert_eq!(v["model"], "opus");
+        assert_eq!(hook_state_of(&v, true), HookState::Ok);
+        // Linux: string unica (o shell e POSIX), sem regressao.
+        let mut v = json!({});
+        assert!(apply_hooks(&mut v, "/home/u/.local/bin/duck", false).unwrap());
+        assert_eq!(ev(&v, "Stop")[0]["hooks"][0]["command"], "\"/home/u/.local/bin/duck\" hook");
+        assert!(!apply_hooks(&mut v, "/home/u/.local/bin/duck", false).unwrap());
+        // Nao confunde com outros programas chamados "...hook".
+        assert!(!is_duck_hook(&json!({"command": "\"/x/duckdns\" hook"})));
+        assert!(!is_duck_hook(&json!({"command": "/x/ruff", "args": ["hook"]})));
+        assert!(is_duck_hook(&json!({"command": "duck hook"})));
+        assert_eq!(hook_state_of(&json!({"hooks": {}}), true), HookState::Missing);
+        assert!(apply_hooks(&mut json!([]), exe, true).is_err());
+    }
+
     #[test]
     fn args() {
         let v = parse_args("send", &["--pane".into(), "3".into(), "--text".into(), "oi".into(), "--enter".into()]);
@@ -276,13 +428,16 @@ pub fn doctor() -> i32 {
         }
         Err(e) => println!("-- server nao esta rodando ({e}); sobe sozinho ao abrir o Duck"),
     }
-    // Hooks do Claude em cada perfil.
-    for e in std::fs::read_dir(crate::config::home()).into_iter().flatten().flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        let settings = e.path().join("settings.json");
-        if name.starts_with(".claude") && settings.is_file() {
-            let has = std::fs::read_to_string(&settings).unwrap_or_default().contains("duck");
-            println!("{}hooks do Duck em ~/{name}/settings.json{}", ok(has), if has { "" } else { "  (duck install --hooks <arquivo>)" });
+    // Hooks do Claude em cada perfil (~/.claude*), com o comando que corrige.
+    for dir in claude_profiles() {
+        let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let settings = dir.join("settings.json");
+        match hook_state(&settings) {
+            HookState::Ok => println!("ok hooks do Duck em ~/{name}/settings.json"),
+            HookState::Missing => println!("!! hooks do Duck faltando em ~/{name}{}: {}",
+                if settings.is_file() { "/settings.json" } else { " (sem settings.json)" }, hooks_fix_cmd(&settings)),
+            HookState::Legacy => println!("!! hooks do Duck em ~/{name}/settings.json no formato antigo (trava o Claude sem Git Bash): {}", hooks_fix_cmd(&settings)),
+            HookState::Invalid(e) => println!("!! ~/{name}/settings.json invalido: {e}"),
         }
     }
     let script = crate::proto::data_dir().join("shell").join("duck.sh");

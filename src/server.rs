@@ -3410,7 +3410,9 @@ fn save_node(m: &Mux, n: &Node) -> Saved {
                 cwd: p.cwd.clone(), domain: p.domain.clone(), cmd: p.cmd.clone(),
                 // Privado nao vai para o disco; o resto passa pelo filtro de segredos.
                 text: if p.private { String::new() } else { scrub(m, pane_text(&p.term, Some(200))) },
-                agent: p.agent.clone().filter(|a| a.session.is_some()),
+                // Sem sessao tambem: na restauracao o pane explica por que
+                // nao retomou (hooks do Duck faltando no perfil do Claude).
+                agent: p.agent.clone(),
             }
         }
         Node::Split { vertical, ratio, a, b } => Saved::Split {
@@ -3466,6 +3468,49 @@ fn resume_line(domain_cmd: &[String], a: &Agent, extra: &str) -> Option<String> 
     })
 }
 
+/// Perfis ja avisados na restauracao em andamento (um aviso por perfil,
+/// nao um por pane; vale um minuto, o tempo de restaurar tudo).
+static RESTORE_WARNED: Mutex<Option<(Instant, HashSet<String>)>> = Mutex::new(None);
+
+/// Aviso escrito no pane quando o agente salvo nao tem sessao para retomar:
+/// em geral os hooks do Duck nao estao no perfil do Claude (sem eles o Duck
+/// nao fica sabendo o id da sessao), ou estao no formato antigo do Windows.
+fn restore_warning(a: &Agent, domain_cmd: &[String]) -> String {
+    let wsl = domain_cmd.first().is_some_and(|c| c.to_lowercase().contains("wsl"));
+    // Perfil do pane: o que o hook informou; sem hook nao se sabe, entao
+    // olha todos os ~/.claude* (no WSL o perfil e de la: so o comando).
+    let profiles: Vec<std::path::PathBuf> = match &a.config_dir {
+        Some(d) => vec![std::path::PathBuf::from(d)],
+        None if wsl => vec![],
+        None => crate::cli::claude_profiles(),
+    };
+    let bad: Vec<(std::path::PathBuf, crate::cli::HookState)> = profiles.iter().map(|d| d.join("settings.json"))
+        .map(|f| { let st = crate::cli::hook_state(&f); (f, st) })
+        .filter(|(_, st)| *st != crate::cli::HookState::Ok).collect();
+    let mut warned = RESTORE_WARNED.lock().unwrap();
+    if warned.as_ref().is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(60)) { *warned = Some((Instant::now(), HashSet::new())); }
+    let seen = &mut warned.as_mut().unwrap().1;
+    let y = |t: &str| format!("\x1b[33m{t}\x1b[0m\n");
+    if bad.is_empty() {
+        return y(&format!("Duck: a sessao do {} deste pane nao foi restaurada: ela nao chegou a ser registrada (o hook do Duck nao informou o id). Abra o agente e use /resume.",
+            if a.name.is_empty() { "Claude" } else { &a.name }));
+    }
+    let mut out = String::new();
+    for (f, st) in &bad {
+        let key = f.to_string_lossy().to_string();
+        if !seen.insert(key) { continue; }
+        let why = match st {
+            crate::cli::HookState::Legacy => format!("os hooks do Duck em {} estao no formato antigo, que o Claude no Windows nao roda sem o Git Bash.", f.display()),
+            crate::cli::HookState::Invalid(e) => format!("o {} esta invalido ({e}).", f.display()),
+            _ => format!("os hooks do Duck nao estao instalados em {}.", f.display()),
+        };
+        out.push_str(&y(&format!("Duck: nao foi possivel restaurar a sessao do Claude: {why}")));
+        out.push_str(&y(&format!("Para instalar: {}", crate::cli::hooks_fix_cmd(f))));
+    }
+    if out.is_empty() { out = y("Duck: a sessao do Claude deste pane nao foi restaurada (hooks do Duck faltando no perfil: veja o aviso no primeiro pane ou rode duck doctor)."); }
+    out
+}
+
 fn restore_node(srv: &Arc<Server>, m: &mut Mux, s: &Saved, pending: &mut Vec<(Id, String)>) -> Result<Node, String> {
     match s {
         Saved::Leaf { cwd, domain, cmd, text, agent } => {
@@ -3478,7 +3523,14 @@ fn restore_node(srv: &Arc<Server>, m: &mut Mux, s: &Saved, pending: &mut Vec<(Id
             })?;
             if let Some(a) = agent {
                 let dcmd = m.cfg.domains.iter().find(|d| &d.name == domain).map(|d| d.cmd.clone()).unwrap_or_default();
-                if let Some(line) = resume_line(&dcmd, a, &m.cfg.resume_args) { pending.push((id, line)); }
+                match resume_line(&dcmd, a, &m.cfg.resume_args) {
+                    Some(line) => pending.push((id, line)),
+                    // Tinha agente, mas sem sessao para retomar: diz por que no pane.
+                    None => if let Some(p) = m.panes.get_mut(&id) {
+                        let msg = restore_warning(a, &dcmd);
+                        p.parser.advance(&mut p.term, msg.replace('\n', "\r\n").as_bytes());
+                    }
+                }
             }
             Ok(Node::Leaf(id))
         }
