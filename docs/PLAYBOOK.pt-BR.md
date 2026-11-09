@@ -573,59 +573,113 @@ As Rotinas mandam a resposta a uma automação do Home Assistant por webhook.
 ## 6. Mensagens entre computadores
 
 O `duck msg` deixa o agente de um computador mandar mensagem para o agente de
-outro. Serve para quando você trabalha em duas máquinas e fica copiando texto
-de uma sessão para a outra. Os dois Duck conversam direto por TCP. Não tem
-servidor externo.
+outro. Serve para quando você trabalha em duas máquinas (ou numa VM) e fica
+copiando texto de uma sessão para a outra. Os Ducks conversam direto, com
+conexão cifrada. Fora da rede local, um relay opcional faz a ponte.
 
 ### Antes de começar
 
-- Os dois computadores rodam o Duck, na mesma versão.
-- Um enxerga o outro: mesma rede local, ou os dois no
-  [Tailscale](https://tailscale.com) (recomendado).
-- Na rede local sem Tailscale, o token passa sem criptografia. Use só numa rede
-  em que você confia.
+- Os dois computadores rodam o Duck 0.2.0 ou mais novo. Um Duck mais antigo
+  continua recebendo mensagens de quem já estava pareado, mas sem criptografia:
+  atualize e pareie de novo.
+- Um alcança o outro: mesma rede local, VM no mesmo computador, os dois no
+  [Tailscale](https://tailscale.com), ou um relay (abaixo).
 
-### Ligar e parear pelo painel
+### Segurança
+
+- **Tudo cifrado.** A conexão usa o protocolo Noise (X25519, ChaCha20-Poly1305).
+  Cada Duck tem um par de chaves e reconhece o outro pela chave pública. Nenhum
+  token passa pela rede.
+- **Número de confirmação.** Ao parear, as duas telas mostram um número de
+  9 dígitos tirado da própria conexão. Se alguém estiver no meio, os números
+  saem diferentes: aceite só se forem iguais.
+- **Você aprova.** Mensagens, arquivos e pedidos de conexão esperam você
+  aceitar. `trust = true` pula a pergunta das mensagens e arquivos. Use só
+  entre computadores seus.
+
+### Parear pelo painel
 
 1. Nos dois computadores: **Ctrl+Shift+P > Computadores**.
-2. Se a primeira linha diz **Desligado**, Enter. O Duck passa a escutar no IP
-   da rede local (porta 7878) e reinicia o server. Os shells continuam.
-   - No Windows, libere a porta: item **Firewall do Windows** no painel (copia
-     o comando; cole num terminal de administrador). Ele libera a TCP e a UDP 7878.
-   - No Fedora a zona padrão do firewall já libera portas acima de 1024.
-3. Num dos dois: **Procurar computadores na rede** e depois **Conectar com ...**.
-   Se a busca não achar (outra rede, VPN): **Conectar por IP** e digite o IP do outro.
-4. O painel de quem pediu mostra um **número de confirmação** (ex.: `482 913`).
-   No outro aparece o popup **Pedido de conexão** com um número. Se for o mesmo,
-   **Conectar**. Se for diferente, ou se você não pediu nada, **Negar**.
-   As chaves são trocadas sozinhas: não há nada para copiar entre os dois.
-5. Cada computador pareado aparece no painel com o estado (online e o tempo de
-   resposta). Enter nele: testar, mandar uma mensagem de teste ou remover.
+2. Se a primeira linha diz **desligado**, Enter. O Duck passa a escutar em
+   todas as redes (porta 7878) e reinicia o server. Os shells continuam.
+   - **Rede** escolhe onde escutar: todas as redes (padrão), ou só uma placa
+     (casa, VM, VPN).
+   - Se o firewall bloquear a porta, o painel avisa (⚠ Firewall bloqueia) e
+     Enter copia o comando que libera. No Windows: item **Firewall do Windows**.
+3. Num dos dois, uma destas:
+   - **Procurar computadores**: acha os Ducks da rede local, das VMs e da
+     Tailscale. Enter em **+ Conectar com ...**.
+   - **Conectar por IP**: quando a busca não acha.
+   - **Gerar convite** de um lado e **Usar convite** do outro: conecta sem
+     aprovação. O convite vale 10 minutos, uma vez só. Cole por mensagem,
+     e-mail ou Slack.
+4. Sem convite, as duas telas mostram o **número de confirmação**. No outro
+   aparece **Pedido de conexão** (a barra de tarefas pisca se a janela estiver
+   em segundo plano). Se o número for igual, **Conectar**. Se for diferente, ou
+   se você não pediu nada, **Negar**.
+   - O pedido fica em **Pedidos** no painel até alguém responder.
+   - Se o aceite não conseguir voltar (firewall, rede só de ida), quem pediu
+     consulta sozinho e fecha o pareamento. O lado que aceitou recebe um aviso
+     de que não alcança o outro.
+5. Cada pareado aparece em **Conectados** com o sistema, o tempo de resposta,
+   a versão do Duck (⚠ se estiver desatualizado) e se a conexão é cifrada.
+   Enter nele:
+   - **Agentes de lá**: as sessões abertas no outro computador. Enter numa
+     delas manda mensagem para ela.
+   - **Mandar mensagem**, **Enviar arquivo** (até 64 MB; lá vai para
+     Downloads/Duck depois de aceito).
+   - **Diagnosticar**: testa cada endereço, a criptografia, a versão e se o
+     outro alcança este de volta, e diz o que fazer.
+   - **Endereços**: o mesmo computador pode ter vários (casa, VPN, relay). O
+     Duck tenta na ordem e põe na frente o que funcionou. Endereços novos
+     entram sozinhos quando o outro fala daqui ou aparece na busca.
+   - **Parear de novo**, **Remover**.
+6. **Conversas** lista as trocas entre agentes e quantas idas e voltas cada
+   uma já teve. Enter encerra: mensagens novas dela são recusadas.
 
 Pelo terminal é o mesmo:
 
 ```sh
-duck peer find              # procura Ducks na rede local
-duck peer connect <ip>      # pede conexão e mostra o número; o outro aceita na janela
-duck peer code              # avançado: código com o token, para colar com duck peer join
-duck peer join <código>     # avançado: pareia direto pelo código (trate como senha)
-duck peer list              # pareados e se respondem
+duck peer find                     # rede local, VMs e Tailscale
+duck peer connect <ip>             # pede conexão, mostra o número e espera o aceite
+duck peer invite                   # gera um convite (vale 10 min, uma vez)
+duck peer join '<convite>'         # usa o convite do outro
+duck peer list                     # pareados: online, versão, cifrado ou não
+duck peer doctor [nome]            # diagnóstico (sem nome: só deste computador)
+duck peer sessions <nome>          # agentes abertos lá
+duck peer addr <nome> add|remove|list [endereço]
+duck peer convs                    # conversas; duck peer close <id> encerra
 duck peer remove <nome>
+duck send-file <nome> <arquivo>
 ```
 
-### Ligar à mão (Tailscale, outra porta)
+### Fora da rede local
+
+- **Tailscale (mais simples).** Instale nos dois. A busca acha os Ducks da
+  tailnet sozinha, e o endereço da Tailscale entra na lista do pareado.
+- **Relay.** Num computador que os dois alcançam (um VPS, por exemplo):
+
+  ```sh
+  duck relay --listen 0.0.0.0:7879 --secret <senha>
+  ```
+
+  Nos Ducks: **Computadores > Relay > Usar um relay** (`host:7879`) e a senha.
+  Depois, pareie pelo convite: ele já leva o caminho pelo relay. O relay só
+  emenda as conexões. A criptografia vai de ponta a ponta, então ele não lê
+  nem altera nada.
+
+### À mão
 
 No `~/.duck-local.lua` (o painel grava no mesmo arquivo):
 
 ```lua
-config.peer = { listen = '100.64.0.1:7878', trust = false, max_hops = 10 }
-config.peers = { fedora = '100.64.0.2:7878' }   -- nome = endereço do OUTRO
+config.peer = { listen = '0.0.0.0:7878', name = 'notebook', trust = false, max_hops = 10,
+                relay = 'meu-vps.com:7879', relay_secret = '...' }
+config.peers = { fedora = '192.168.0.7:7878,100.64.0.2:7878,relay:meu-vps.com:7879' }
 ```
 
-`listen = '0.0.0.0:7878'` escuta em todas as redes; prefira o IP do Tailscale.
-Depois, **Ctrl+Shift+P > Reiniciar server** (recarregar a config não basta). O
-log (`server.log`) mostra `peers: escutando em ...`. O token do outro vai para
-o cofre com `duck peer add <nome> <token>` (o token sai de `duck peer token` lá).
+A chave de cada pareado fica no cofre do sistema, não na config. Depois de
+mudar `listen` ou `relay`: **Ctrl+Shift+P > Reiniciar server**.
 
 ### Usar
 
@@ -644,21 +698,19 @@ No outro computador:
 2. Ela vai para o agente da conversa. Se for a primeira, vai para o agente do
    pane aberto na janela. Pane sem agente não recebe: quem mandou recebe erro.
    Com `--to <nome>`, vai para o agente cujo nome da aba, título, pasta ou
-   número do pane bate. Se não achar ou achar mais de um, o erro lista os
-   agentes abertos lá.
+   número do pane bate (`duck peer sessions <nome>` lista os de lá).
 3. Se o agente estiver trabalhando, a mensagem espera ele parar.
 4. O texto entregue explica ao agente como responder
    (`duck msg <nome> --conv <id> "..."`). A resposta volta para o pane que mandou
    a primeira mensagem.
 
-### Limites e segurança
+### Limites
 
-- **Você aprova.** Um agente não aprova pela API. `trust = true` pula a
-  pergunta. Use só entre computadores seus.
 - **Sem conversa sem fim.** Depois de `max_hops` mensagens (10) na mesma
   conversa, o Duck recusa e pede você. Para começar outra, mande sem `--conv`.
+  Você também pode encerrar a conversa no painel.
 - **Segredos mascarados.** Tokens conhecidos saem mascarados.
-- **Até 16 mil caracteres por mensagem.**
+- **Até 16 mil caracteres por mensagem** e 64 MB por arquivo.
 
 ---
 
@@ -678,8 +730,9 @@ No outro computador:
 | Avisos de agente não aparecem | Confira `notify = true` no `~/.duck.lua` (é o padrão). O aviso só sai se você não estiver olhando para aquele pane. Em tela cheia, ele vai para a central do Windows. |
 | Agente sem estado nas abas | `install.ps1 -SkipBuild -ClaudeHooks`, depois reabra o Claude. |
 | Atualizei e nada mudou | Feche e abra a janela do Duck (o server já foi reiniciado). |
-| `duck msg`: "nao respondeu" | O server do outro lado não está escutando ou o firewall bloqueia. Lá: `peer = { listen = ... }`, `duck cli restart-server` (fora do Duck) e a porta liberada. Teste: `Test-NetConnection <ip> -Port 7878` (Windows) ou `nc -zv <ip> 7878`. |
-| `duck msg`: "token errado" | Pareie de novo: `duck peer token` do outro lado e `duck peer add <nome> <token>` aqui. |
+| `duck msg`: "nao respondeu" | `duck peer doctor <nome>` (ou Computadores > nome > Diagnosticar): diz se o outro não escuta, se o firewall bloqueia, se a versão é antiga ou se só uma direção funciona, e o que fazer. |
+| `duck msg`: "nao esta pareado la" ou "chave ... nao e a esperada" | O outro esqueceu este computador ou foi reinstalado. Pareie de novo (convite é o mais rápido). |
+| Pareado com "⚠ sem criptografia" | Foi pareado numa versão até 0.1.8. Atualize os dois e use **Parear de novo**. |
 | `duck msg`: "nenhum agente para receber" | No outro computador, abra a aba de um agente (Claude rodando) e mande de novo. |
 
 Ainda com problema? O log do server fica em

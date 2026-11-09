@@ -292,22 +292,33 @@ duck mcp                                            # servidor MCP (stdio): duck
 ```
 
 **Mensagens entre computadores (`duck msg`):** o agente de um computador manda
-texto para o agente de outro, sem copiar e colar. Vai por TCP direto entre os
-dois Duck (use o Tailscale; na rede local o token passa sem criptografia).
+texto para o agente de outro, sem copiar e colar. A conexão entre os dois Duck
+é cifrada (Noise: X25519 + ChaCha20-Poly1305) e cada um reconhece o outro pela
+chave pública. Funciona na rede local, entre o computador e as VMs, pela
+Tailscale e, fora da rede, por um relay (`duck relay`), que só emenda as
+conexões sem conseguir ler nada.
 
-Para ligar e parear: **Ctrl+Shift+P > Computadores** nos dois. Enter em
-**Desligado** liga a escuta na rede local. Depois, num deles, **Procurar
-computadores na rede** (ou **Conectar por IP**) e **Conectar com ...**. O outro
-recebe um popup com um número de confirmação: aceite só se for o mesmo que
-aparece na tela de quem pediu. O mesmo pelo terminal:
+Para parear: **Ctrl+Shift+P > Computadores** nos dois. Enter em **desligado**
+liga a escuta em todas as redes. Depois, num deles, **Procurar computadores**
+(rede local, VMs e Tailscale) ou **Conectar por IP**, e **Conectar com ...**. As
+duas telas mostram um número de 9 dígitos: aceite só se for o mesmo. Ou gere um
+**convite** de um lado (vale 10 min, uma vez) e use do outro: conecta sem
+aprovação. O painel também mostra pedidos pendentes, firewall bloqueando a
+porta, versão de cada pareado, conversas abertas, e tem **Diagnosticar**. O
+mesmo pelo terminal:
 
 ```powershell
-duck peer find                   # Ducks escutando na rede local
-duck peer connect 192.168.0.7    # pede conexão e mostra o número; o outro aceita na janela
-duck peer list                   # pareados e se respondem
+duck peer find                   # rede local, VMs e Tailscale
+duck peer connect 192.168.0.7    # pede conexão, mostra o número e espera o aceite
+duck peer invite                 # convite (lá: duck peer join '<convite>')
+duck peer list                   # pareados: online, versão, cifrado
+duck peer doctor fedora          # o que falta para falar com o fedora (e ele com este)
+duck peer sessions fedora        # agentes abertos lá
 duck msg fedora "texto"          # ou: Get-Content x.txt | duck msg fedora
 duck msg fedora --to MinhasCompras "texto"   # para a sessão MinhasCompras de lá
 duck msg fedora --conv 4929def2 "resposta"   # continua a conversa
+duck send-file fedora build.zip  # até 64 MB; lá vai para Downloads/Duck
+duck relay --listen 0.0.0.0:7879 --secret S  # relay num servidor que os dois alcançam
 ```
 
 A mensagem vai para o agente da conversa. Se for a primeira, vai para o
@@ -317,8 +328,11 @@ achar mais de um, o erro lista os agentes abertos lá. O usuário de lá aprova 
 entrega (`trust = true` entrega direto). Um agente não aprova pela API. A
 entrega espera o agente parar. A resposta volta para o pane que mandou.
 Segredos conhecidos saem mascarados. Depois de `max_hops` mensagens na mesma
-conversa, o Duck recusa e pede o usuário. No Windows, libere a porta (TCP e UDP 7878): item **Firewall do Windows** no painel.
-À mão: `config.peer = { listen = 'ip:7878' }` e `config.peers = { nome = 'ip:7878' }` no `~/.duck-local.lua`.
+conversa, o Duck recusa e pede o usuário; no painel dá para encerrar uma
+conversa. Um pareado pode ter vários endereços (casa, VPN, relay): o Duck tenta
+na ordem e aprende os novos sozinho.
+À mão, no `~/.duck-local.lua`: `config.peer = { listen = '0.0.0.0:7878', relay = 'host:7879' }` e
+`config.peers = { nome = 'ip:7878,relay:host:7879' }` (a chave de cada um fica no cofre).
 
 **Fila com dependências (`duck fleet`):** cada linha do arquivo pode ter um
 id, dependências e uma verificação:

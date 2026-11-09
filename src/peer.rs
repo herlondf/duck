@@ -245,6 +245,14 @@ pub fn send_legacy(addr: &str, req: &Value) -> Result<Value, String> {
     serde_json::from_str(&line).map_err(|e| format!("resposta invalida: {e}"))
 }
 
+/// Erro de rede em palavras: o que provavelmente aconteceu.
+pub fn human_err(e: &str) -> String {
+    if e.contains("refused") || e.contains("recusad") { "não responde (Duck fechado, ou escuta em outra rede/porta)".into() }
+    else if e.contains("timed out") || e.contains("tempo") || e.contains("WouldBlock") { "sem resposta (desligado, firewall ou outra rede)".into() }
+    else if e.contains("unreachable") || e.contains("inacess") || e.contains("No route") { "rede inalcançável daqui".into() }
+    else { e.to_string() }
+}
+
 /// Resposta do ping: quem esta do outro lado.
 #[derive(Clone, Debug, Default)]
 pub struct Info { pub ms: u128, pub name: String, pub version: String, pub os: String, pub key: String }

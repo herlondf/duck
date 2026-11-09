@@ -34,8 +34,10 @@ doing.
 - **Agents talk across computers.** `duck msg fedora "run X and tell me Y"`
   sends a message from the agent on one computer to the agent on another, with
   no copy and paste between them. You approve it before it reaches the agent;
-  the reply comes back to the pane that asked. Direct between the two Duck
-  servers (over Tailscale or the local network), no outside server.
+  the reply comes back to the pane that asked. Encrypted connection directly
+  between the Ducks (local network, VMs, Tailscale) or through your own relay
+  outside the network; it also lists the agents on the other side, sends files
+  and has a diagnosis.
 - **Tabs you don't lose.** Pinned tabs, reopen the last closed one
   (`Ctrl+Alt+T`, with the agent session), jump back to the previous one
   (`Alt+Q`), picture-in-picture of a pane over other tabs, and a preview with

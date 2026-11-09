@@ -34,8 +34,9 @@ fazendo.
 - **Agentes conversam entre computadores.** `duck msg fedora "rode X e me
   diga Y"` manda uma mensagem do agente de um computador para o agente de
   outro, sem copiar e colar entre eles. Você aprova antes de ela chegar ao
-  agente; a resposta volta para o pane que pediu. Direto entre os dois Duck
-  (pelo Tailscale ou pela rede local), sem servidor externo.
+  agente; a resposta volta para o pane que pediu. Conexão cifrada direto
+  entre os Duck (rede local, VMs, Tailscale) ou por um relay próprio fora da
+  rede; também lista os agentes do outro lado, manda arquivos e tem diagnóstico.
 - **Blocos de comando.** Com a shell integration (OSC 133), cada comando vira
   um cartão com exit code e duração, botões de copiar, re-executar, recolher e
   fixar, e um minimapa que marca as falhas.

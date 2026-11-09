@@ -134,8 +134,10 @@ impl Gui {
         }
         let mut o = Overlay::list("Computadores · agentes de computadores diferentes conversando (duck msg)", items);
         o.peers = true;
-        // Redesenho (resultado de ping/busca): fica no item onde estava.
+        // Redesenho (resultado de ping/busca): fica no item onde estava. Na
+        // primeira vez, comeca no primeiro item que faz algo (nao no titulo).
         if let Some(old) = self.overlay.as_ref().filter(|o| o.peers && o.input.is_empty()) { o.sel = old.sel.min(o.shown.len().saturating_sub(1)); }
+        else { o.sel = o.shown.iter().position(|&i| !matches!(&o.items[i].action, Action::Builtin(a, _) if a.is_empty())).unwrap_or(0); }
         self.overlay = Some(o);
         if ping { self.peers_refresh(); }
     }
@@ -153,7 +155,10 @@ impl Gui {
             self.peers_bg("peer_info_done", vec![json!(name)], move || Ok(match peer::ping_any(&list) {
                 Ok((i, a)) => json!({"online": true, "state": format!("{} ms", i.ms), "version": i.version, "os": i.os, "addr": a}),
                 Err(e) if e == "so pelo relay" => json!({"online": true, "state": "pelo relay"}),
-                Err(e) => json!({"online": false, "state": format!("sem resposta: {}", e.split(" · ").next().unwrap_or(&e))}),
+                Err(e) => {
+                    let first = e.split(" · ").next().unwrap_or(&e);
+                    json!({"online": false, "state": peer::human_err(first.split_once(": ").map_or(first, |(_, x)| x))})
+                }
             }));
         }
     }
