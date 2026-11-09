@@ -693,7 +693,7 @@ De um agente (ou de você, em qualquer pane):
 ```sh
 duck msg fedora "Instale o pacote do X no Fedora e me diga a versão"
 cat config.toml | duck msg fedora          # texto pelo stdin
-duck msg fedora --to MinhasCompras "..."   # para uma sessão específica de lá
+duck msg fedora/MinhasCompras "..."        # para a aba MinhasCompras de lá
 ```
 
 No outro computador:
@@ -702,8 +702,11 @@ No outro computador:
    A mensagem também vai para a caixa de entrada.
 2. Ela vai para o agente da conversa. Se for a primeira, vai para o agente do
    pane aberto na janela. Pane sem agente não recebe: quem mandou recebe erro.
-   Com `--to <nome>`, vai para o agente cujo nome da aba, título, pasta ou
-   número do pane bate (`duck peer sessions <nome>` lista os de lá).
+   Com `<computador>/<aba>` (ou `--to <aba>`), vai para o agente cujo nome da
+   aba, título, pasta ou número do pane bate. Parte do nome basta; acentos e os
+   símbolos do título não contam. `duck peer sessions <nome>` lista os de lá, e
+   na janela **Ctrl+Shift+P > Mandar mensagem para um agente de outro
+   computador** mostra as abas de todos os computadores numa lista só.
 3. Se o agente estiver trabalhando, a mensagem espera ele parar.
 4. O texto entregue explica ao agente como responder
    (`duck msg <nome> --conv <id> "..."`). A resposta volta para o pane que mandou

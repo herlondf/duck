@@ -1400,21 +1400,38 @@ fn agent_names(m: &Mux) -> Vec<(Id, Vec<String>)> {
 
 /// Acha o agente pelo nome: id do pane, nome igual ou, se so um bater, parte do nome.
 fn pick_agent(cands: &[(Id, Vec<String>)], want: &str) -> Result<Id, String> {
-    if let Ok(id) = want.parse::<Id>() { if cands.iter().any(|c| c.0 == id) { return Ok(id); } }
-    let w = want.to_lowercase();
+    if let Ok(id) = want.trim().trim_start_matches('#').parse::<Id>() { if cands.iter().any(|c| c.0 == id) { return Ok(id); } }
+    let w = fold(want);
+    if w.is_empty() { return Err("nome vazio".into()); }
     for exact in [true, false] {
         let hit: Vec<Id> = cands.iter().filter(|(_, ns)| ns.iter().any(|n| {
-            let n = n.to_lowercase();
+            let n = fold(n);
             if exact { n == w } else { n.contains(&w) }
         })).map(|c| c.0).collect();
         match hit.len() {
             0 => continue,
             1 => return Ok(hit[0]),
-            _ => return Err(format!("mais de um agente com '{want}': {}. Use um nome mais exato ou o numero do pane.", list_agents(cands, &hit))),
+            _ => return Err(format!("mais de um agente com '{want}': {}. Use um nome mais exato ou o numero do pane. Dica: renomeie a aba (duplo clique) para um nome fixo, como \"monde\".", list_agents(cands, &hit))),
         }
     }
     let all: Vec<Id> = cands.iter().map(|c| c.0).collect();
     Err(format!("nenhum agente com '{want}'. Abertos: {}", if all.is_empty() { "nenhum".into() } else { list_agents(cands, &all) }))
+}
+
+/// Nome para comparar: minusculo, sem acento e sem os simbolos que o agente
+/// poe no titulo (◐ ✳ ⠂...); espacos repetidos viram um.
+fn fold(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.to_lowercase().chars() {
+        let c = match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a', 'é' | 'è' | 'ê' | 'ë' => 'e', 'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o', 'ú' | 'ù' | 'û' | 'ü' => 'u', 'ç' => 'c', 'ñ' => 'n',
+            c => c,
+        };
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '|' | '/') { out.push(c); }
+        else if !out.is_empty() && !out.ends_with(' ') && (c.is_whitespace() || c.is_ascii_punctuation()) { out.push(' '); }
+    }
+    out.trim().to_string()
 }
 
 fn list_agents(cands: &[(Id, Vec<String>)], ids: &[Id]) -> String {
@@ -4130,6 +4147,15 @@ mod tests {
         assert_eq!(pick_agent(&c, "3"), Ok(3));
         assert!(pick_agent(&c, "comp").unwrap_err().contains("mais de um"));
         assert!(pick_agent(&c, "xyz").unwrap_err().contains("Abertos: 3"));
+        // Sem acento, sem os simbolos do titulo, numero com #.
+        let c = vec![(2, vec!["◐ Isolamento de ambientes".into()]), (4, vec!["Notificações".into(), "Ferrum|Git".into()])];
+        assert_eq!(pick_agent(&c, "isolamento"), Ok(2));
+        assert_eq!(pick_agent(&c, "Isolamento de Ambientes"), Ok(2));
+        assert_eq!(pick_agent(&c, "notificacoes"), Ok(4));
+        assert_eq!(pick_agent(&c, "ferrum"), Ok(4));
+        assert_eq!(pick_agent(&c, "#2"), Ok(2));
+        assert!(pick_agent(&c, "o").unwrap_err().contains("renomeie a aba"));
+        assert_eq!(fold("  ✳  Instalação   do Slack "), "instalacao do slack");
         assert_eq!(percent_decode("/C:/My%20Dir"), "/C:/My Dir");
     }
 

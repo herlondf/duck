@@ -1483,6 +1483,7 @@ impl Gui {
             b("Recarregar config", "reload_config", vec![]),
             b("Desanexar (fecha a janela, shells continuam)", "detach", vec![]),
             b("Computadores: conectar outro computador (mensagens entre agentes)", "peers", vec![]),
+            b("Mandar mensagem para um agente de outro computador (escolhe pela aba)", "peer_msg_pick", vec![]),
             b(&match &self.update_ver { Some(v) => format!("Atualizar o Duck: {} -> {v}", crate::update::current()), None => format!("Atualizar o Duck (esta: {}; procura versao nova)", crate::update::current()) }, "duck_update", vec![]),
             b("Reiniciar server (atualiza o Duck; os shells continuam)", "restart_server", vec![]),
             b("Encerrar server (fecha todos os shells)", "kill_server", vec![]),

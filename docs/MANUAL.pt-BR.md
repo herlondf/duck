@@ -315,16 +315,20 @@ duck peer list                   # pareados: online, versão, cifrado
 duck peer doctor fedora          # o que falta para falar com o fedora (e ele com este)
 duck peer sessions fedora        # agentes abertos lá
 duck msg fedora "texto"          # ou: Get-Content x.txt | duck msg fedora
-duck msg fedora --to MinhasCompras "texto"   # para a sessão MinhasCompras de lá
+duck msg fedora/MinhasCompras "texto"        # para a aba MinhasCompras de lá (= --to MinhasCompras)
 duck msg fedora --conv 4929def2 "resposta"   # continua a conversa
 duck send-file fedora build.zip  # até 64 MB; lá vai para Downloads/Duck
 duck relay --listen 0.0.0.0:7879 --secret S  # relay num servidor que os dois alcançam
 ```
 
 A mensagem vai para o agente da conversa. Se for a primeira, vai para o
-agente do pane aberto na janela de lá. Com `--to`, vai para o agente cujo nome
-da aba, título, pasta ou número do pane bate com o texto. Se não achar ou
-achar mais de um, o erro lista os agentes abertos lá. O usuário de lá aprova antes da
+agente do pane aberto na janela de lá. Com `fedora/<aba>` (ou `--to`), vai
+para o agente cujo nome da aba, título, pasta ou número do pane bate com o
+texto: parte do nome basta, e acentos e os símbolos do título (◐, ✳) não
+contam. Se não achar ou achar mais de um, o erro lista os agentes abertos lá.
+Pela janela: **Ctrl+Shift+P > Mandar mensagem para um agente de outro
+computador** lista as abas com agente de todos os computadores; Enter escreve a
+mensagem. Para um alvo que não muda, dê um nome fixo à aba (duplo clique). O usuário de lá aprova antes da
 entrega (`trust = true` entrega direto). Um agente não aprova pela API. A
 entrega espera o agente parar. A resposta volta para o pane que mandou.
 Segredos conhecidos saem mascarados. Depois de `max_hops` mensagens na mesma

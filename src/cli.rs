@@ -1028,7 +1028,7 @@ mod stats_tests {
     }
 }
 
-/// `duck msg <peer> [--to SESSAO] [--conv ID] "texto"` (ou texto no stdin): manda para o
+/// `duck msg <peer>[/aba] [--to SESSAO] [--conv ID] "texto"` (ou texto no stdin): manda para o
 /// agente de outro computador. O server prepara; a rede sai daqui.
 pub fn msg(args: &[String]) -> i32 {
     let (mut conv, mut to) = (None, None);
@@ -1037,7 +1037,12 @@ pub fn msg(args: &[String]) -> i32 {
     while let Some(a) = it.next() {
         if a == "--conv" { conv = it.next().cloned(); } else if a == "--to" { to = it.next().cloned(); } else { rest.push(a.clone()); }
     }
-    let Some(peer) = rest.first().cloned() else { eprintln!("uso: duck msg <peer> [--to SESSAO] [--conv ID] \"texto\"   (sem texto: le do stdin)"); return 2 };
+    let Some(mut peer) = rest.first().cloned() else { eprintln!("uso: duck msg <peer>[/aba] [--to SESSAO] [--conv ID] \"texto\"   (sem texto: le do stdin)"); return 2 };
+    // Forma curta: computador/aba ("legion/Ferrum"); nome de computador nao tem "/".
+    if let Some((p, t)) = peer.split_once('/').map(|(p, t)| (p.to_string(), t.to_string())) {
+        peer = p;
+        if to.is_none() && !t.trim().is_empty() { to = Some(t); }
+    }
     let mut text = rest[1..].join(" ");
     if text.trim().is_empty() { let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text); }
     let mut c = match Conn::connect_or_spawn() { Ok(c) => c, Err(e) => { eprintln!("duck: {e}"); return 1 } };
@@ -1315,7 +1320,7 @@ pub fn peer(args: &[String]) -> i32 {
                     println!("  {:>3}  {:<8}  {}  {}  ({})", s["id"], s["state"].as_str().unwrap_or(""), s["tab"].as_str().filter(|t| !t.is_empty()).unwrap_or(s["title"].as_str().unwrap_or("")),
                         s["dir"].as_str().unwrap_or(""), s["agent"].as_str().unwrap_or(""));
                 }
-                println!("Mandar para um: duck msg {name} --to <nome da aba, pasta ou id> \"texto\"");
+                println!("Mandar para um: duck msg {name}/<aba> \"texto\"   (aba, pasta, titulo ou numero; parte do nome basta)");
                 0
             }
             Ok((v, _)) => { eprintln!("duck peer sessions: {}", v["error"].as_str().unwrap_or("?")); 1 }

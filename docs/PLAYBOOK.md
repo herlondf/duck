@@ -702,7 +702,7 @@ From an agent (or from you, in any pane):
 ```sh
 duck msg fedora "Install package X on Fedora and tell me the version"
 cat config.toml | duck msg fedora          # text from stdin
-duck msg fedora --to MyShopping "..."      # to a specific session there
+duck msg fedora/MyShopping "..."           # to the MyShopping tab there
 ```
 
 On the other computer:
@@ -711,9 +711,12 @@ On the other computer:
    **Entregar ao agente** (deliver) or **Negar** (deny). It also goes to the inbox.
 2. It goes to the conversation's agent. For a first message, it goes to the
    agent of the pane open in the window. A pane without an agent does not
-   receive: the sender gets an error. With `--to <name>`, it goes to the agent
-   whose tab name, title, folder or pane number matches (`duck peer sessions
-   <name>` lists them).
+   receive: the sender gets an error. With `<computer>/<tab>` (or `--to <tab>`),
+   it goes to the agent whose tab name, title, folder or pane number matches.
+   Part of the name is enough; accents and the title symbols do not count.
+   `duck peer sessions <name>` lists them, and in the window **Ctrl+Shift+P >
+   Mandar mensagem para um agente de outro computador** shows the tabs of every
+   computer in one list.
 3. If the agent is working, the message waits until it stops.
 4. The delivered text tells the agent how to reply
    (`duck msg <name> --conv <id> "..."`). The reply goes back to the pane that

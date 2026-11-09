@@ -567,19 +567,50 @@ impl Gui {
                 let n = s(0);
                 let r = args.get(1).cloned().unwrap_or(Value::Null);
                 if let Some(e) = r["error"].as_str() { self.flash(&format!("{n}: {}", Self::peers_hint(e))); return true; }
-                let mut items: Vec<Item> = r["sessions"].as_array().into_iter().flatten().map(|x| {
-                    let label = x["tab"].as_str().filter(|t| !t.is_empty()).or(x["title"].as_str()).unwrap_or("?");
-                    Item::new(format!("{}  {label}", match x["state"].as_str() { Some("working") => "◐", Some("blocked") => "✋", _ => "●" }),
-                        format!("{} · {} · pane {} · Enter: mandar mensagem", x["dir"].as_str().unwrap_or(""), x["state"].as_str().unwrap_or(""), x["id"]),
-                        "peer_msg", vec![json!(n), x["id"].clone()])
-                }).collect();
+                let mut items: Vec<Item> = r["sessions"].as_array().into_iter().flatten().map(|x| session_item(&n, x, false)).collect();
                 if items.is_empty() { items.push(Item::new("Nenhum agente aberto lá", "", "", vec![])); }
                 items.push(Item::new("Voltar", "", "peer_menu", vec![json!(n)]));
                 self.overlay = Some(Overlay::list(&format!("Agentes de {n}"), items));
             }
+            "peer_msg_pick" => {
+                let peers: Vec<String> = self.cfg.peers.iter().map(|(n, _)| n.clone()).collect();
+                if peers.is_empty() { self.flash("Nenhum computador pareado: Ctrl+Shift+P > Computadores"); return true; }
+                self.flash("Procurando agentes nos outros computadores…");
+                self.peers_bg("peer_msg_pick_done", vec![], move || {
+                    // Em paralelo: um computador desligado nao segura os outros.
+                    let hs: Vec<_> = peers.into_iter().map(|n| std::thread::spawn(move || {
+                        let r = peer::request(&n, &json!({"sessions": 1}));
+                        match r {
+                            Ok((v, _)) if v["ok"].as_bool() == Some(true) => json!({"peer": n, "sessions": v["sessions"]}),
+                            Ok((v, _)) => json!({"peer": n, "error": v["error"]}),
+                            Err(e) => json!({"peer": n, "error": e}),
+                        }
+                    })).collect();
+                    Ok(json!(hs.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>()))
+                });
+            }
+            "peer_msg_pick_done" => {
+                let r = args.first().cloned().unwrap_or(Value::Null);
+                if let Some(e) = r["error"].as_str() { self.flash(e); return true; }
+                let mut items: Vec<Item> = vec![];
+                let mut off: Vec<String> = vec![];
+                for p in r.as_array().into_iter().flatten() {
+                    let n = p["peer"].as_str().unwrap_or("").to_string();
+                    match p["sessions"].as_array() {
+                        Some(ss) => items.extend(ss.iter().map(|x| session_item(&n, x, true))),
+                        None => off.push(n),
+                    }
+                }
+                if items.is_empty() { items.push(Item::new("Nenhum agente aberto nos outros computadores", "", "", vec![])); }
+                if !off.is_empty() { items.push(Item::new(format!("Sem resposta: {}", off.join(", ")), "desligado, firewall ou versão antiga · Computadores > nome > Diagnosticar", "peers", vec![])); }
+                self.overlay = Some(Overlay::list("Mandar mensagem para… (aba de cada computador)", items));
+            }
             "peer_msg" => {
                 let to = args.get(1).cloned().unwrap_or(Value::Null);
-                let title = if to.is_null() { format!("Mensagem para o agente de {}", s(0)) } else { format!("Mensagem para o pane {} de {}", to, s(0)) };
+                let label = s(2);
+                let title = if to.is_null() { format!("Mensagem para o agente de {}", s(0)) }
+                    else if label.is_empty() { format!("Mensagem para o pane {} de {}", to, s(0)) }
+                    else { format!("Mensagem para {} › {label}", s(0)) };
                 self.overlay = Some(Overlay::prompt(&title, "Teste do Duck: responda só \"ok, recebi\".", "peer_msg_send", vec![json!(s(0)), to]));
             }
             "peer_msg_send" => {
@@ -666,4 +697,22 @@ impl Gui {
         }
         true
     }
+}
+
+/// Uma sessao de agente de outro computador na lista (Enter: escrever a
+/// mensagem). `with_peer`: mostra tambem de qual computador e.
+fn session_item(peer: &str, x: &Value, with_peer: bool) -> Item {
+    let label = x["tab"].as_str().filter(|t| !t.is_empty()).or(x["title"].as_str()).unwrap_or("?").to_string();
+    let (mark, st) = match x["state"].as_str() { Some("working") => ("◐", "trabalhando"), Some("blocked") => ("✋", "esperando você"), Some("done") => ("●", "terminou"), _ => ("○", "parado") };
+    let who = if with_peer { format!("{peer} › ") } else { String::new() };
+    Item::new(format!("{mark}  {who}{label}"),
+        format!("{} · {st} · Enter: escrever a mensagem · no terminal: duck msg {peer}/{} \"...\"", x["dir"].as_str().unwrap_or(""), short_tab(&label)),
+        "peer_msg", vec![json!(peer), x["id"].clone(), json!(label)])
+}
+
+/// Primeiro pedaco do nome da aba, para o exemplo do terminal ("Ferrum|Git" -> "Ferrum").
+fn short_tab(label: &str) -> String {
+    let t: String = label.chars().filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_' || *c == '|').collect();
+    let t = t.trim().split(['|', ' ']).find(|w| !w.is_empty()).unwrap_or("").to_string();
+    if t.is_empty() { "aba".into() } else { t }
 }
