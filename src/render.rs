@@ -405,7 +405,7 @@ impl Renderer {
         }
         let mut b = Buffer::new(&mut self.font_system, Metrics::new(self.font_px * size, self.cell_h * size));
         b.set_size(None, None);
-        b.set_text(&t.text, &attrs, Shaping::Advanced, None);
+        b.set_text(&text_glyphs(&t.text), &attrs, Shaping::Advanced, None);
         b.shape_until_scroll(&mut self.font_system, false);
         b
     }
@@ -624,9 +624,30 @@ impl Renderer {
     }
 }
 
+/// Simbolos que no Linux so existem em fonte de emoji colorido (Noto Color
+/// Emoji), que nao sai na tela: ficavam em branco, como o check das opcoes
+/// marcadas do Claude Code. Troca pelo equivalente da fonte embutida, de
+/// mesma largura.
+fn text_glyphs(s: &str) -> std::borrow::Cow<'_, str> {
+    const MAP: [(char, char); 3] = [('\u{2714}', '\u{2713}'), ('\u{2716}', '\u{2715}'), ('\u{2718}', '\u{2717}')];
+    if !s.chars().any(|c| MAP.iter().any(|(f, _)| *f == c)) { return std::borrow::Cow::Borrowed(s); }
+    s.chars().map(|c| MAP.iter().find(|(f, _)| *f == c).map_or(c, |(_, t)| *t)).collect::<String>().into()
+}
+
 const NERD_FONT: &[u8] = include_bytes!("../fonts/JetBrainsMonoNerdFontMono-Regular.ttf");
 
 fn bytemuck_f32(v: &[f32]) -> &[u8] {
     // f32 -> bytes sem crate extra: layout de f32 e fixo e alinhado.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simbolos_de_emoji_viram_os_da_fonte() {
+        assert_eq!(text_glyphs("[✔] ok ✖ ✘"), "[✓] ok ✕ ✗");
+        assert!(matches!(text_glyphs("[ ] sem troca ✓"), std::borrow::Cow::Borrowed(_)));
+    }
 }
