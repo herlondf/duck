@@ -12,7 +12,6 @@
 param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $Rest)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $repo = if ($env:DUCK_REPO) { $env:DUCK_REPO } else { 'herlondf/duck' }
 $base = if ($env:DUCK_VERSION) { "https://github.com/$repo/releases/download/$($env:DUCK_VERSION)" } else { "https://github.com/$repo/releases/latest/download" }
@@ -36,7 +35,7 @@ try {
   # Extensoes antigas saem (arquivos apagados numa versao nova nao ficam para tras).
   if (Test-Path "$dest\extensions") { Remove-Item "$dest\extensions" -Recurse -Force -ErrorAction SilentlyContinue }
   Expand-Archive "$tmp\$name" -DestinationPath $dest -Force
-  & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File "$dest\install.ps1" @Rest
+  & $pwsh.Source -NoProfile -File "$dest\install.ps1" @Rest
   if ($LASTEXITCODE) { throw "install.ps1 falhou / failed ($LASTEXITCODE)" }
 } finally {
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
