@@ -4027,6 +4027,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restore_warning_perfil_sem_hooks() {
+        let dir = std::env::temp_dir().join(format!("duck-restore-{}", std::process::id())).join(".claude-totvs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = Agent { name: "claude".into(), config_dir: Some(dir.to_string_lossy().to_string()), ..Default::default() };
+        let settings = dir.join("settings.json");
+        let msg = restore_warning(&a, &[]);
+        assert!(msg.contains(&format!("nao estao instalados em {}", settings.display())), "{msg}");
+        assert!(msg.contains(&crate::cli::hooks_fix_cmd(&settings)), "{msg}");
+        // Segundo pane do mesmo perfil: nao repete o aviso longo.
+        let again = restore_warning(&a, &[]);
+        assert!(!again.contains("Para instalar"), "{again}");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
     fn loop_label_and_check() {
         let mut l = LoopRun { pane: 1, check: "x".into(), max: 5, iter: 0, phase: "agent".into(), sent_at: 0, started: 0, last_exit: None, last_out: String::new() };
         assert_eq!(l.label(), "⟳ 1/5");

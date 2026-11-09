@@ -388,6 +388,29 @@ mod tests {
     }
 
     #[test]
+    fn install_hooks_perfil_sem_settings() {
+        // Perfil novo do Claude (pasta sem settings.json, ou nem a pasta): cria e instala.
+        let dir = std::env::temp_dir().join(format!("duck-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let f = dir.join(".claude-totvs").join("settings.json");
+        let path = f.to_string_lossy().to_string();
+        assert_eq!(hook_state(&f), HookState::Missing);
+        assert_eq!(install_hooks(&path, "/opt/duck/bin/duck"), 0);
+        assert_eq!(hook_state(&f), HookState::Ok);
+        let first = std::fs::read_to_string(&f).unwrap();
+        // De novo: nada muda.
+        assert_eq!(install_hooks(&path, "/opt/duck/bin/duck"), 0);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), first);
+        // JSON invalido: nao sobrescreve, acusa.
+        std::fs::write(&f, "{ quebrado").unwrap();
+        assert!(matches!(hook_state(&f), HookState::Invalid(_)));
+        assert_eq!(install_hooks(&path, "/opt/duck/bin/duck"), 1);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{ quebrado");
+        assert_eq!(hooks_fix_cmd(&f), format!("duck install --hooks \"{}\"", f.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn args() {
         let v = parse_args("send", &["--pane".into(), "3".into(), "--text".into(), "oi".into(), "--enter".into()]);
         assert_eq!(v["pane"], 3);
