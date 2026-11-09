@@ -24,6 +24,7 @@ pub mod relay;
 pub mod plugins;
 pub mod proto;
 pub mod ptyhost;
+pub mod colr;
 pub mod render;
 pub mod secret;
 pub mod server;

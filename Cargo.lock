@@ -695,12 +695,14 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "skrifa 0.44.0",
  "snow",
  "sysinfo",
  "wasmi",
  "wgpu",
  "windows-sys 0.61.2",
  "winit",
+ "zeno",
 ]
 
 [[package]]
