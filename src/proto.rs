@@ -45,9 +45,38 @@ pub fn state_dir() -> PathBuf {
     d
 }
 
+/// Nome do pipe do server deste perfil. No Windows os pipes sao da maquina
+/// toda (todas as sessoes): duas contas com o mesmo nome de usuario (uma local
+/// e uma de dominio, por exemplo) caiam no mesmo pipe, e o aviso de uma
+/// aparecia na tela da outra. Por isso leva uma marca do perfil (LOCALAPPDATA).
 pub fn pipe_name() -> String {
-    let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default();
-    format!("duck-{}.sock", user.to_lowercase())
+    if cfg!(windows) {
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        format!("duck-{}-{}.sock", user_name(), profile_tag(&local))
+    } else {
+        format!("duck-{}.sock", user_name())
+    }
+}
+
+/// Nome de antes da marca do perfil (Duck ate 0.2.1 no Windows): o server
+/// novo tambem atende por ele e os clientes tentam por ele (janela antiga
+/// aberta durante a atualizacao). None fora do Windows.
+pub fn legacy_pipe_name() -> Option<String> {
+    cfg!(windows).then(|| format!("duck-{}.sock", user_name()))
+}
+
+fn user_name() -> String {
+    std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default().to_lowercase()
+}
+
+/// 8 hex do caminho do perfil (FNV-1a; maiusculas e barras nao importam).
+pub fn profile_tag(path: &str) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for b in path.trim().trim_end_matches(['\\', '/']).to_lowercase().replace('/', "\\").bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("{h:08x}")
 }
 
 pub fn token_path() -> PathBuf { data_dir().join("token") }
@@ -69,8 +98,22 @@ pub struct Conn {
 
 impl Conn {
     pub fn connect() -> std::io::Result<Conn> {
-        let name = pipe_name().to_ns_name::<GenericNamespaced>()?;
-        let mut s = Stream::connect(name)?;
+        match Conn::connect_to(&pipe_name()) {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                // Server antigo deste perfil (sem a marca no nome). So vale se
+                // ele aceitar o nosso token: o pipe antigo pode ser de outra
+                // conta com o mesmo nome de usuario.
+                let Some(old) = legacy_pipe_name() else { return Err(e) };
+                let mut c = Conn::connect_to(&old).map_err(|_| e)?;
+                c.call(serde_json::json!({"cmd": "ping"})).map_err(std::io::Error::other)?;
+                Ok(c)
+            }
+        }
+    }
+
+    fn connect_to(name: &str) -> std::io::Result<Conn> {
+        let mut s = Stream::connect(name.to_ns_name::<GenericNamespaced>()?)?;
         // Dentro de um pane vale o token do pane (escopo restrito); fora, o do dono.
         let token = env("TOKEN").unwrap_or_else(read_token);
         s.write_all(format!("{token}\n").as_bytes())?;
@@ -347,6 +390,17 @@ pub fn ok(extra: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipe_por_perfil() {
+        // Mesmo perfil escrito de jeitos diferentes: mesma marca; outro perfil: outra.
+        let a = profile_tag(r"C:\Users\herlon.filgueira\AppData\Local");
+        assert_eq!(a, profile_tag(r"c:/users/HERLON.FILGUEIRA/AppData/Local/"));
+        assert_ne!(a, profile_tag(r"C:\Users\herlon.filgueira.TP\AppData\Local"));
+        assert_eq!(a.len(), 8);
+        if cfg!(windows) { assert!(pipe_name().ends_with(".sock") && legacy_pipe_name().is_some()); }
+        else { assert_eq!(legacy_pipe_name(), None); }
+    }
 
     #[test]
     fn exe_path_after_reinstall() {

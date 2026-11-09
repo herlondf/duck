@@ -613,6 +613,8 @@ pub(super) fn draw_view(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, v:
         for (key, title) in siblings {
             let short = title.rsplit(" · ").next().unwrap_or(title);
             let tw = r.measure(short, true, 0.78) + 16.0;
+            // Sem espaco na linha (painel estreito): a aba desce para a proxima.
+            if x > lx && x + tw > x0 + pw - 10.0 { x = lx; top += ch * 1.4; }
             let tr = [x, top - 4.0, tw, ch * 1.2];
             let cur = *key == v.key();
             let hv = inside(tr, mouse);
@@ -625,16 +627,22 @@ pub(super) fn draw_view(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, v:
     }
     let mut y = top - scroll;
     let bottom = y0 + ph;
-    if v.loading && v.sections.is_empty() { l.texts.push(uit(lx, y, "carregando…", theme.muted, 0.85)); }
-    if !v.error.is_empty() { l.texts.push(TextItem { clip_right: Some(x0 + pw - 10.0), ..uit(lx, y, &v.error, theme.blocked, 0.8) }); y += ch * 1.2; }
     let visible = |y: f32, h: f32| y + h > top && y < bottom;
+    // Texto so inteiro dentro da lista: rolando, nada sobe por cima do
+    // cabecalho e das abas nem desce sobre o rodape (o texto nao tem recorte).
+    let shown = |y: f32| y >= top - 2.0 && y + ch <= bottom + 2.0;
+    if v.loading && v.sections.is_empty() && shown(y) { l.texts.push(uit(lx, y, "carregando…", theme.muted, 0.85)); }
+    if !v.error.is_empty() {
+        if shown(y) { l.texts.push(TextItem { clip_right: Some(x0 + pw - 10.0), ..uit(lx, y, &v.error, theme.blocked, 0.8) }); }
+        y += ch * 1.2;
+    }
     for sec in &v.sections {
         if !sec.title.is_empty() {
-            if visible(y, ch) { l.texts.push(TextItem { bold: true, ..uit(lx, y + 4.0, &sec.title, theme.muted, 0.78) }); }
+            if shown(y + 4.0) { l.texts.push(TextItem { bold: true, ..uit(lx, y + 4.0, &sec.title, theme.muted, 0.78) }); }
             y += ch * 1.35;
         }
         if sec.items.is_empty() {
-            if visible(y, ch) { l.texts.push(uit(lx + 8.0, y, "nada aqui", theme.muted, 0.78)); }
+            if shown(y) { l.texts.push(uit(lx + 8.0, y, "nada aqui", theme.muted, 0.78)); }
             y += ch * 1.2;
         }
         for it in &sec.items {
@@ -642,9 +650,10 @@ pub(super) fn draw_view(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, v:
             if visible(y, rh) {
                 let rr = [x0 + 6.0, y, pw - 12.0, rh];
                 let hv = inside(rr, mouse) && mouse.1 >= top;
-                if hv { l.shapes.push(Shape::rect(rr[0], rr[1].max(top), rr[2], rr[3] - (top - rr[1]).max(0.0), lin(mix(theme.tab_bar, theme.fg, 0.07), 1.0), 6.0)); }
+                let full = y >= top - 2.0 && y + rh <= bottom + 2.0;
+                if hv && full { l.shapes.push(Shape::rect(rr[0], rr[1], rr[2], rr[3], lin(mix(theme.tab_bar, theme.fg, 0.07), 1.0), 6.0)); }
                 let c = if it.color.is_empty() { theme.muted } else { theme.named(&it.color) };
-                if y >= top - 2.0 {
+                if full {
                     l.texts.push(TextItem { size: 0.9, ..mt(lx, y + 4.0, &icon(&it.icon), c) });
                     if it.unread { l.shapes.push(Shape::rect(x0 + 4.0, y + rh / 2.0 - 3.0, 6.0, 6.0, lin(theme.accent, 1.0), 3.0)); }
                     let mut right = x0 + pw - 14.0;
@@ -675,7 +684,7 @@ pub(super) fn draw_view(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, v:
                     }
                 }
                 if let Some(a) = it.actions.iter().find(|a| a.primary).or(it.actions.first()) {
-                    let clip = [rr[0], rr[1].max(top), rr[2], (rr[1] + rr[3] - rr[1].max(top)).max(0.0)];
+                    let clip = [rr[0], rr[1].max(top), rr[2], (rr[1] + rr[3]).min(bottom) - rr[1].max(top)];
                     hits.insert(0, Hit { r: clip, action: Action::Builtin("ext_action".into(), vec![json!(v.ext), json!(a.id), json!(it.id)]) });
                 }
             }

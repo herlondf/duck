@@ -3955,12 +3955,24 @@ fn diff_frame(f: &mut Value, sent: &mut HashMap<u64, (u16, u16, Vec<u64>)>) {
 }
 
 pub fn run() {
+    // Um server antigo deste perfil (pipe sem a marca do perfil) ainda vivo:
+    // nao sobe outro em paralelo (os dois adotariam os mesmos shells).
+    if proto::legacy_pipe_name().is_some() && proto::Conn::connect().is_ok() {
+        eprintln!("duck server: ja tem um rodando");
+        std::process::exit(1);
+    }
     let name = proto::pipe_name();
     let ns = name.clone().to_ns_name::<GenericNamespaced>().expect("nome do pipe");
     let listener = match ListenerOptions::new().name(ns).create_sync() {
         Ok(l) => l,
         Err(e) => { eprintln!("duck server: {e} (ja tem um rodando?)"); std::process::exit(1); }
     };
+    // Tambem pelo nome antigo, para a janela de antes da atualizacao. Se outra
+    // conta deste computador ja usa esse nome, fica so no novo.
+    let legacy = proto::legacy_pipe_name().and_then(|n| {
+        let ns = n.clone().to_ns_name::<GenericNamespaced>().ok()?;
+        ListenerOptions::new().name(ns).create_sync().map_err(|e| proto::log(&format!("pipe antigo {n}: {e} (outra conta com o mesmo usuario?)"))).ok()
+    });
     std::panic::set_hook(Box::new(|info| proto::log(&format!("PANIC: {info}"))));
     let token = proto::new_token();
     install_shell_scripts();
@@ -4030,6 +4042,13 @@ pub fn run() {
     { let s = srv.clone(); std::thread::spawn(move || changes_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || sync_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || { let sink = ext_sink(&s); s.lock().ext.start_all(&sink); s.notify(); }); }
+    if let Some(l) = legacy {
+        let (srv, token) = (srv.clone(), token.clone());
+        std::thread::spawn(move || for conn in l.incoming().flatten() {
+            let (s, t) = (srv.clone(), token.clone());
+            std::thread::spawn(move || serve_conn(s, conn, t));
+        });
+    }
     for conn in listener.incoming().flatten() {
         let (s, t) = (srv.clone(), token.clone());
         std::thread::spawn(move || serve_conn(s, conn, t));
