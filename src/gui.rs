@@ -406,6 +406,11 @@ pub struct Gui {
     /// Painel Computadores: estado de cada peer ("online 4 ms"...) e o que a descoberta achou.
     peer_status: HashMap<String, String>,
     peer_found: Option<Vec<Value>>,
+    /// Painel Computadores: ping de cada pareado (online, versao, sistema),
+    /// firewall, conversas e numeros de confirmacao dos pedidos feitos daqui.
+    peer_info: HashMap<String, Value>,
+    /// `peers-state` do server: pedidos pendentes, relay, versoes vistas.
+    peer_state: Value,
     /// Versao nova publicada (aviso e item "Atualizar o Duck").
     update_ver: Option<String>,
     updating: bool,
@@ -602,7 +607,7 @@ impl Gui {
             collapsed: HashMap::new(), pinned: HashMap::new(), search_hits: None, composer: None, ac: None, ac_dismissed: String::new(),
             usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), last_loop_check: String::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
             tab_cur: 0, tab_prev: 0, palette_rank: load_palette_rank(), scroll_base: HashMap::new(), pane_drag: None,
-            peer_status: HashMap::new(), peer_found: None, update_ver: None, updating: false,
+            peer_status: HashMap::new(), peer_found: None, peer_info: HashMap::new(), peer_state: Value::Null, update_ver: None, updating: false,
         };
         g.load_config();
         g.update_watch();
@@ -2266,23 +2271,20 @@ impl Gui {
             }
             // Pedido de aprovacao (OSC 52, acao de agente): pergunta uma vez.
             // O painel Computadores fica aberto esperando o outro lado: o pedido abre por cima.
-            if self.overlay.as_ref().is_none_or(|o| o.peers) {
-                if let Some(a) = f.approvals.iter().find(|a| !self.asked.contains(&a.id)).cloned() {
+            if let Some(a) = f.approvals.iter().find(|a| !self.asked.contains(&a.id)).cloned() {
+                let peerish = a.kind == "pair" || a.kind == "file";
+                if self.overlay.as_ref().is_none_or(|o| o.peers) {
                     self.asked.insert(a.id);
-                    let (yes, title) = match a.kind.as_str() {
-                        "clipboard" => ("Permitir copiar", "Clipboard"),
-                        "peer" => ("Entregar ao agente", "Mensagem de outro computador"),
-                        "pair" => ("Conectar", "Pedido de conexao"),
-                        _ => ("Permitir", "Agente pede confirmacao"),
-                    };
-                    // Negar primeiro: Enter distraido nao libera nada.
-                    let items = vec![
-                        Item::new("Negar", "Esc", "approve", vec![json!(a.id), json!(false)]),
-                        if a.kind == "pair" { Item::new(yes, "guarda o outro computador dos dois lados", "peer_accept", vec![json!(a.id)]) }
-                        else { Item::new(yes, "", "approve", vec![json!(a.id), json!(true)]) },
-                    ];
-                    self.overlay = Some(Overlay::dialog(&format!("{title}: {}", a.text), items));
+                    self.approval_dialog(json!(a.id), &a.kind, &a.text);
                     if !self.focused { toast("Duck pede confirmacao", &a.text); }
+                } else if peerish && self.shown_notices.insert(format!("ask{}", a.id)) {
+                    // Outra janela aberta por cima: avisa e espera fechar (fica tambem em Computadores > Pedidos).
+                    self.flash("Pedido de outro computador: feche esta tela para responder (ou Computadores > Pedidos)");
+                }
+                // Pedido de outro computador: chama atencao na barra de tarefas.
+                if peerish && !self.focused {
+                    if let Some(r) = &self.r { r.window.request_user_attention(Some(winit::window::UserAttentionType::Critical)); }
+                    if !self.asked.contains(&a.id) { toast("Duck: pedido de outro computador", &a.text); }
                 }
             }
             if f.resurrect && self.overlay.is_none() && self.shown_notices.insert("resurrect".into()) {

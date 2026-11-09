@@ -267,6 +267,10 @@ pub struct Config {
     pub peer_name: String,
     pub peer_trust: bool,
     pub peer_max_hops: u32,
+    /// Relay (`duck relay`) para alcancar computadores fora da rede: "host:porta".
+    pub peer_relay: String,
+    /// Senha do relay (a mesma do `duck relay --secret`), se ele pedir.
+    pub peer_relay_secret: String,
     /// Outros computadores: nome -> "ip:porta" (o token fica em `duck secret`).
     pub peers: Vec<(String, String)>,
     pub agent_profiles: Vec<AgentProfile>,
@@ -548,6 +552,8 @@ pub fn parse(t: &Table) -> Config {
             .unwrap_or_else(|| std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "duck".into()).to_lowercase()),
         peer_trust: t.get::<Table>("peer").ok().and_then(|p| p.get::<Option<bool>>("trust").ok().flatten()).unwrap_or(false),
         peer_max_hops: t.get::<Table>("peer").ok().map(|p| n(&p, "max_hops", 10.0) as u32).unwrap_or(10),
+        peer_relay: t.get::<Table>("peer").ok().map(|p| s(&p, "relay", "")).unwrap_or_default(),
+        peer_relay_secret: t.get::<Table>("peer").ok().map(|p| s(&p, "relay_secret", "")).unwrap_or_default(),
         peers: t.get::<Table>("peers").map(|p| p.pairs::<String, String>().flatten().collect()).unwrap_or_default(),
         agent_profiles: t.get::<Table>("agent_profiles").map(|p| p.sequence_values::<Table>().flatten()
             .map(|x| AgentProfile { name: s(&x, "name", "agente"), cmd: s(&x, "cmd", "claude") }).collect())

@@ -19,6 +19,8 @@ pub mod ext;
 pub mod gui;
 pub mod guard;
 pub mod peer;
+pub mod secure;
+pub mod relay;
 pub mod plugins;
 pub mod proto;
 pub mod ptyhost;
@@ -67,12 +69,14 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("secret") => cli::secret(&args[1..]),
         Some("msg") => cli::msg(&args[1..]),
         Some("peer") => cli::peer(&args[1..]),
+        Some("send-file") => cli::send_file(&args[1..]),
+        Some("relay") => relay::main(&args[1..]),
         Some("update") => update::main(&args[1..]),
         Some("guard") => guard::main(&args[1..]),
         Some("toast") => toast::run(args.get(1).map(String::as_str).unwrap_or("")),
         Some("--version" | "-V") => { println!("duck {}", env!("CARGO_PKG_VERSION")); 0 }
         Some("--help" | "-h") => {
-            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan | msg <peer> [--to sessao] texto | peer token|add | update [--check]");
+            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan | msg <peer> [--to sessao] texto | send-file <peer> <arq> | peer list|find|connect|invite|join|doctor|sessions | relay | update [--check]");
             0
         }
         _ => {

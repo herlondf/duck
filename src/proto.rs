@@ -212,7 +212,9 @@ pub fn log(msg: &str) {
     }
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-        let _ = writeln!(f, "{ts} {msg}");
+        // Uma escrita so: com varias (o writeln! quebra em pedacos) duas
+        // threads logando juntas misturavam as linhas.
+        let _ = f.write_all(format!("{ts} {msg}\n").as_bytes());
     }
 }
 

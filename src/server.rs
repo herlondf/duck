@@ -12,7 +12,7 @@
 //! Clientes com `subscribe` recebem frames: a 1a vez a tela inteira, depois
 //! so as linhas que mudaram.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{channel, Sender};
@@ -358,6 +358,8 @@ pub struct Mux {
     inbox: Inbox,
     /// Conversas com outros computadores (`duck msg`), pelo id.
     convs: HashMap<String, Conv>,
+    /// Pedidos de conexao, convites, versoes vistas, relay.
+    peers: PeerState,
     /// Loops "ate passar": pane do agente -> verificacao e voltas.
     loops: HashMap<Id, LoopRun>,
     approvals: Vec<Approval>,
@@ -957,10 +959,28 @@ fn front_pane(m: &Mux) -> Option<Id> {
     cs.iter().find_map(|c| m.workspaces.iter().find(|w| w.name == c.workspace).and_then(|w| w.tabs.get(w.active)).map(|t| t.active))
 }
 
-/// Escuta mensagens de outros computadores (`peer = { listen = 'ip:porta' }`).
-/// Uma linha JSON por conexao, com o token deste computador (`duck peer token`).
-/// ponytail: TCP sem TLS; o Tailscale criptografa. Na rede local aberta o token
-/// passa em claro: HMAC por mensagem se for usar fora do Tailscale.
+/// Estado dos computadores pareados que so existe em memoria.
+#[derive(Default)]
+struct PeerState {
+    /// Pedidos de conexao feitos daqui esperando o outro aceitar: chave do
+    /// outro -> (endereco usado, desde quando).
+    pending_out: HashMap<String, (String, Instant)>,
+    /// Convites validos (`duck peer invite`): codigo -> vale ate.
+    invites: HashMap<String, Instant>,
+    /// O que cada pareado disse por ultimo (versao, quando).
+    seen: HashMap<String, Value>,
+    /// Conversas encerradas pelo usuario daqui: nao aceitam mais mensagens.
+    closed: HashSet<String>,
+    /// Estado da conexao com o relay, para o painel.
+    relay: Arc<Mutex<String>>,
+}
+
+/// Maior arquivo aceito de outro computador.
+const PEER_MAX_FILE: usize = 64 << 20;
+
+/// Escuta outros computadores (`peer = { listen = 'ip:porta' }`). O que vem
+/// cifrado (Noise, ver secure.rs) passa por `secure_req`; texto puro so ping
+/// e pareados antigos (ate 0.1.8) com token.
 fn peer_listen(srv: Arc<Server>, addr: String) {
     let l = match std::net::TcpListener::bind(&addr) {
         Ok(l) => l,
@@ -969,34 +989,88 @@ fn peer_listen(srv: Arc<Server>, addr: String) {
     proto::log(&format!("peers: escutando em {addr}"));
     for s in l.incoming().flatten() {
         let srv = srv.clone();
-        std::thread::spawn(move || peer_conn(&srv, s));
+        std::thread::spawn(move || peer_conn(&srv, s, false));
     }
 }
 
-fn peer_conn(srv: &Arc<Server>, s: std::net::TcpStream) {
-    use std::io::{BufRead, Read, Write};
+/// Uma conexao de outro Duck (direta ou entregue pelo relay).
+fn peer_conn(srv: &Arc<Server>, mut s: std::net::TcpStream, via_relay: bool) {
+    use std::io::Read;
     let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-    let ip = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let ip = if via_relay { String::new() } else { s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default() };
+    let mut first = [0u8; 1];
+    let secure = matches!(s.peek(&mut first), Ok(1) if first[0] == crate::secure::MAGIC[0]);
+    if !secure { return peer_conn_legacy(srv, s, &ip); }
+    let mut magic = vec![0u8; crate::secure::MAGIC.len()];
+    if s.read_exact(&mut magic).is_err() || magic != crate::secure::MAGIC { return; }
+    let mut c = match crate::secure::Chan::accept(s) {
+        Ok(c) => c,
+        Err(e) => { proto::log(&format!("peers: handshake com {}: {e}", if ip.is_empty() { "relay" } else { &ip })); return; }
+    };
+    c.set_timeout(Duration::from_secs(120));
+    let req = match c.recv_json() { Ok(v) => v, Err(e) => { proto::log(&format!("peers: {e}")); return; } };
+    let key = c.remote().to_string();
+    let confirm = c.confirm();
+    let out = secure_req(srv, &req, &ip, &key, &confirm, via_relay).unwrap_or_else(|e| json!({"ok": false, "error": e}));
+    let _ = c.send_json(&out);
+}
+
+/// Pedido cifrado. `key`: chave publica de quem mandou (do handshake).
+fn secure_req(srv: &Arc<Server>, v: &Value, ip: &str, key: &str, confirm: &str, via_relay: bool) -> Result<Value, String> {
+    if v["ping"].as_u64() == Some(1) { return Ok(ping_info(srv)); }
+    let who = { let m = srv.lock(); crate::peer::name_by_key(&m.cfg.peers, key) };
+    if v["pair"].as_u64() == Some(1) { return pair_in(srv, v, ip, key, confirm, who, via_relay); }
+    if v["pair_status"].as_u64() == Some(1) { return Ok(pair_status_in(srv, key, who.is_some())); }
+    if v["pair_done"].as_u64() == Some(1) { return pair_done_in(srv, v, ip, key, via_relay); }
+    let Some(who) = who else {
+        proto::log(&format!("peers: chave desconhecida de {}", if ip.is_empty() { "relay" } else { ip }));
+        std::thread::sleep(Duration::from_millis(500));
+        return Err("este computador nao esta pareado la: conecte de novo (painel Computadores)".into());
+    };
+    learn(srv, &who, v, ip, via_relay);
+    if v["msg"].as_u64() == Some(1) { return peer_in(srv, v, &who); }
+    if v["sessions"].as_u64() == Some(1) { return Ok(sessions_out(&srv.lock())); }
+    if v["file"].as_u64() == Some(1) { return file_in(srv, v, &who); }
+    if v["callback"].as_u64() == Some(1) { return Ok(callback_in(v, ip)); }
+    if v["hello"].as_u64() == Some(1) { return Ok(ping_info(srv)); }
+    Err("pedido desconhecido (versao diferente do Duck?)".into())
+}
+
+/// Conexao em texto puro: ping e pareados antigos (sem chave) com token.
+fn peer_conn_legacy(srv: &Arc<Server>, s: std::net::TcpStream, ip: &str) {
+    use std::io::{BufRead, Read, Write};
     let mut line = String::new();
     let _ = std::io::BufReader::new((&s).take(64 * 1024)).read_line(&mut line);
     let res = match serde_json::from_str::<Value>(&line) {
         Err(e) => Err(format!("json: {e}")),
-        // Sem token: o painel testa se o Duck de la responde.
-        Ok(v) if v["ping"].as_u64() == Some(1) => Ok(proto::ok(json!({"name": srv.lock().cfg.peer_name}))),
-        // Pedido de conexao: com o token certo aceita, sem ele o usuario aprova.
-        Ok(v) if v["pair"].as_u64() == Some(1) => pair_in(srv, &v, &ip),
+        Ok(v) if v["ping"].as_u64() == Some(1) => Ok(ping_info(srv)),
+        Ok(v) if v["pair"].as_u64() == Some(1) || v["pair_done"].as_u64() == Some(1) =>
+            Err(format!("este Duck ({}) so conecta com criptografia: atualize o Duck dai (duck update)", crate::peer::VERSION)),
         Ok(v) => {
-            let mine = crate::secret::get("peer/self").unwrap_or_default();
-            let mine = mine.trim();
+            let mine = crate::peer::legacy_token().unwrap_or_default();
             if mine.is_empty() || !same(mine.as_bytes(), v["token"].as_str().unwrap_or("").as_bytes()) {
                 proto::log(&format!("peers: token errado de {ip}"));
                 std::thread::sleep(Duration::from_millis(500));
-                Err("token errado".into())
-            } else if v["pair_done"].as_u64() == Some(1) { pair_done_in(srv, &v, &ip) } else { peer_in(srv, &v, &ip) }
+                Err("token errado ou conexao sem criptografia recusada: pareie de novo".into())
+            } else {
+                // Quem mandou: pareado antigo (sem chave) com esse IP.
+                let from = {
+                    let m = srv.lock();
+                    m.cfg.peers.iter().filter(|(n, _)| crate::peer::key_of(n).is_none())
+                        .find(|(_, a)| crate::peer::split_addrs(a).iter().any(|x| x.rsplit_once(':').map(|h| h.0) == Some(ip)))
+                        .map(|(n, _)| n.clone())
+                };
+                match from { Some(f) => peer_in(srv, &v, &f), None => Err("token sem pareado antigo neste IP: pareie de novo".into()) }
+            }
         }
     };
     let out = res.unwrap_or_else(|e| json!({"ok": false, "error": e}));
     let _ = (&s).write_all(format!("{out}\n").as_bytes());
+}
+
+fn ping_info(srv: &Arc<Server>) -> Value {
+    let name = srv.lock().cfg.peer_name.clone();
+    proto::ok(json!({"name": name, "version": crate::peer::VERSION, "os": std::env::consts::OS, "key": crate::secure::my_key()}))
 }
 
 /// Comparacao em tempo constante (o token nao vaza pelo tempo de resposta).
@@ -1010,95 +1084,279 @@ fn reload_cfg(m: &mut Mux) {
     m.secrets = m.cfg.secret_patterns.iter().filter_map(|r| regex::Regex::new(r).ok()).collect();
 }
 
-/// Endereco do outro: o IP de onde a conexao veio (nao o que ele diz) e a
-/// porta que ele informou.
-fn peer_addr_from(ip: &str, claimed: &str) -> String {
-    let port = crate::peer::port_of(claimed);
+/// "ip:porta" com IPv6 entre colchetes.
+fn join_ip(ip: &str, port: u64) -> String {
     if ip.contains(':') { format!("[{ip}]:{port}") } else { format!("{ip}:{port}") }
 }
 
-/// Pedido de conexao de outro computador (painel Computadores ou `duck peer join`).
-fn pair_in(srv: &Arc<Server>, v: &Value, ip: &str) -> Result<Value, String> {
-    let name = crate::peer::clean_name(v["from"].as_str().unwrap_or(""));
-    let addr = peer_addr_from(ip, v["addr"].as_str().unwrap_or(""));
-    let key = v["key"].as_str().unwrap_or("").trim().to_string();
-    if key.len() < 16 || key.len() > 128 || !key.chars().all(|c| c.is_ascii_hexdigit()) { return Err("pedido sem chave valida".into()); }
-    let mine = crate::secret::get("peer/self").unwrap_or_default();
-    let mine = mine.trim();
+/// Enderecos de volta de quem pediu: o IP de onde veio (nao o que ele diz)
+/// com a porta que ele informou, e o relay dele.
+fn return_addrs(v: &Value, ip: &str, via_relay: bool) -> Vec<String> {
+    let direct = (!via_relay && !ip.is_empty()).then(|| join_ip(ip, v["port"].as_u64().unwrap_or(crate::peer::DEFAULT_PORT as u64)));
+    let mut out: Vec<String> = direct.into_iter().collect();
+    if let Some(r) = v["relay"].as_str().map(str::trim).filter(|r| !r.is_empty()) { out.push(format!("relay:{r}")); }
+    out
+}
+
+/// Pareado falou: guarda a versao e aprende o endereco de onde veio, se for
+/// novo (DHCP mudou, outra rede). Vai para o fim: os que ja funcionam vem antes.
+fn learn(srv: &Arc<Server>, who: &str, v: &Value, ip: &str, via_relay: bool) {
     let mut m = srv.lock();
-    if name == m.cfg.peer_name { return Err(format!("os dois computadores se chamam {name}: troque o nome de um no painel Computadores")); }
-    let me = m.cfg.peer_name.clone();
-    // Veio com o codigo deste computador: quem colou ja provou que viu a tela daqui.
-    if !mine.is_empty() && same(mine.as_bytes(), v["token"].as_str().unwrap_or("").trim().as_bytes()) {
-        crate::peer::save(&name, &addr, &key)?;
+    m.peers.seen.insert(who.to_string(), json!({"version": v["version"], "at": now_secs()}));
+    if via_relay || ip.is_empty() { return; }
+    let Some(port) = v["port"].as_u64() else { return };
+    let addr = join_ip(ip, port);
+    let mut list = m.cfg.peers.iter().find(|(n, _)| n == who).map(|(_, a)| crate::peer::split_addrs(a)).unwrap_or_default();
+    if list.contains(&addr) { return; }
+    let at = list.iter().position(|a| a.starts_with("relay:")).unwrap_or(list.len());
+    list.insert(at, addr.clone());
+    // Lista curta: tentativa em endereco morto custa segundos.
+    while list.len() > 6 { if let Some(i) = list.iter().rposition(|a| !a.starts_with("relay:")) { list.remove(i); } else { break; } }
+    if crate::peer::save_addrs(who, &list).is_ok() {
         reload_cfg(&mut m);
-        proto::log(&format!("peers: {name} ({addr}) conectado pelo codigo"));
-        m.inbox.push(json!({"kind": "peer", "pane": 0, "title": format!("{name} conectado"), "body": format!("{addr} usou o codigo deste computador. duck msg {name} \"...\" ja funciona."), "color": "done"}));
+        proto::log(&format!("peers: {who} tambem em {addr}"));
+    }
+}
+
+/// Pedido de conexao. Convite valido: aceita na hora. Senao o usuario daqui
+/// decide vendo o numero de confirmacao (o mesmo da tela de quem pediu).
+fn pair_in(srv: &Arc<Server>, v: &Value, ip: &str, key: &str, confirm: &str, who: Option<String>, via_relay: bool) -> Result<Value, String> {
+    let name = crate::peer::clean_name(v["from"].as_str().unwrap_or(""));
+    let mut m = srv.lock();
+    let me = m.cfg.peer_name.clone();
+    if key == crate::secure::my_key() { return Err("e este mesmo computador".into()); }
+    // Ja pareados (pedido repetido, ou o outro perdeu o aceite): confirma.
+    if who.is_some() { return Ok(proto::ok(json!({"accepted": true, "name": me}))); }
+    let addrs = return_addrs(v, ip, via_relay);
+    if addrs.is_empty() { return Err("sem caminho de volta: ligue a escuta ou um relay no painel Computadores".into()); }
+    let invite = v["invite"].as_str().unwrap_or("").trim().to_lowercase();
+    if !invite.is_empty() {
+        let ok = m.peers.invites.remove(&invite).is_some_and(|until| Instant::now() < until);
+        if !ok {
+            proto::log(&format!("peers: convite invalido de {name}"));
+            std::thread::sleep(Duration::from_millis(500));
+            return Err("convite invalido, ja usado ou vencido: peca outro".into());
+        }
+        let n = crate::peer::free_name(&m.cfg.peers, &name, key);
+        crate::peer::save(&n, &addrs, key)?;
+        reload_cfg(&mut m);
+        proto::log(&format!("peers: {n} ({}) conectado pelo convite", addrs.join(",")));
+        m.inbox.push(json!({"kind": "peer", "pane": 0, "title": format!("{n} conectado"), "body": format!("Usou um convite deste computador. duck msg {n} \"...\" ja funciona."), "color": "done"}));
         srv.notify();
         return Ok(proto::ok(json!({"accepted": true, "name": me})));
     }
-    if !v["token"].as_str().unwrap_or("").is_empty() {
-        proto::log(&format!("peers: codigo errado de {ip}"));
-        std::thread::sleep(Duration::from_millis(500));
-        return Err("codigo errado ou antigo: copie de novo no painel Computadores de la".into());
-    }
-    // Sem codigo (achou pela descoberta): o usuario daqui decide. Um pedido por
-    // IP e no maximo 3 esperando, para a rede nao encher a tela de perguntas.
+    // Um pedido por chave e no maximo 3 esperando: a rede nao enche a tela.
     let pend: Vec<&Approval> = m.approvals.iter().filter(|a| a.kind == "pair" && a.decided.is_none()).collect();
-    if pend.iter().any(|a| serde_json::from_str::<Value>(&a.payload).is_ok_and(|p| p["ip"] == ip)) { return Err("ja tem um pedido seu esperando a resposta".into()); }
+    if pend.iter().any(|a| serde_json::from_str::<Value>(&a.payload).is_ok_and(|p| p["key"] == key)) {
+        return Ok(proto::ok(json!({"approval": true, "name": me})));
+    }
     if pend.len() >= 3 { return Err("pedidos demais esperando resposta: tente daqui a pouco".into()); }
-    let payload = json!({"name": name, "addr": addr, "key": key, "ip": ip}).to_string();
-    let code = crate::peer::confirm_code(&key);
-    ask(&mut m, "pair", 0, format!("{name} ({addr}) quer se conectar com este computador.\nNúmero de confirmação: {code}\nSó aceite se for o mesmo número que aparece na tela de {name}."), payload);
+    let shown = if via_relay { "pelo relay".to_string() } else { addrs[0].clone() };
+    let payload = json!({"name": name, "addrs": addrs, "key": key}).to_string();
+    ask(&mut m, "pair", 0, format!("{name} ({shown}) quer se conectar com este computador.\nNúmero de confirmação: {confirm}\nSó aceite se for o mesmo número que aparece na tela de {name}."), payload);
+    m.inbox.push(json!({"kind": "peer", "pane": 0, "title": format!("{name} quer se conectar"), "body": format!("Número de confirmação: {confirm}. Aceite no aviso ou no painel Computadores."), "color": "working"}));
     srv.notify();
     Ok(proto::ok(json!({"approval": true, "name": me})))
 }
 
-/// O usuario aceitou o pedido de conexao: guarda o outro e avisa ele, que
-/// guarda este (`pair_done`) sem precisar de codigo.
-fn pair_accept(m: &mut Mux, payload: &str) -> Result<(), String> {
-    let p: Value = serde_json::from_str(payload).map_err(|e| e.to_string())?;
-    let (name, addr, key) = (p["name"].as_str().unwrap_or(""), p["addr"].as_str().unwrap_or(""), p["key"].as_str().unwrap_or(""));
-    crate::peer::save(name, addr, key)?;
-    reload_cfg(m);
+fn pair_status_in(srv: &Arc<Server>, key: &str, paired: bool) -> Value {
+    let m = srv.lock();
     let me = m.cfg.peer_name.clone();
-    let my_addr = crate::peer::advertised(&m.cfg.peer_listen).unwrap_or_default();
-    let req = json!({"pair_done": 1, "token": key, "from": me, "addr": my_addr, "key": crate::peer::self_token()});
-    let (name, addr) = (name.to_string(), addr.to_string());
-    std::thread::spawn(move || match crate::peer::send(&addr, &req) {
-        Ok(v) if v["ok"].as_bool() == Some(true) => proto::log(&format!("peers: {name} ({addr}) conectado")),
-        Ok(v) => proto::log(&format!("peers: {name} recusou o aceite: {}", v["error"].as_str().unwrap_or("?"))),
-        Err(e) => proto::log(&format!("peers: {name} ({addr}) nao recebeu o aceite: {e}")),
-    });
-    Ok(())
+    let mut v = json!({"accepted": paired, "name": me});
+    if paired && !m.cfg.peer_relay.is_empty() { v["relay"] = json!(m.cfg.peer_relay); }
+    let waiting = !paired && m.approvals.iter().any(|a| a.kind == "pair" && a.decided.is_none()
+        && serde_json::from_str::<Value>(&a.payload).is_ok_and(|p| p["key"] == key));
+    v["waiting"] = json!(waiting);
+    proto::ok(v)
 }
 
-/// O outro aceitou o nosso pedido (veio com o nosso token): guarda ele.
-fn pair_done_in(srv: &Arc<Server>, v: &Value, ip: &str) -> Result<Value, String> {
-    let name = crate::peer::clean_name(v["from"].as_str().unwrap_or(""));
-    let addr = peer_addr_from(ip, v["addr"].as_str().unwrap_or(""));
-    let key = v["key"].as_str().unwrap_or("").trim().to_string();
-    if key.len() < 16 || !key.chars().all(|c| c.is_ascii_hexdigit()) { return Err("aceite sem chave valida".into()); }
+/// O usuario aceitou: guarda o outro e avisa ele (`pair_done`). Se o aviso
+/// nao chega (firewall, NAT), o outro descobre ao consultar (`pair_status`),
+/// e o usuario daqui fica sabendo.
+fn pair_accept(srv: &Arc<Server>, m: &mut Mux, payload: &str) -> Result<String, String> {
+    let p: Value = serde_json::from_str(payload).map_err(|e| e.to_string())?;
+    let key = p["key"].as_str().unwrap_or("").to_string();
+    let addrs: Vec<String> = p["addrs"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(String::from)).collect();
+    let name = crate::peer::free_name(&m.cfg.peers, p["name"].as_str().unwrap_or("duck"), &key);
+    crate::peer::save(&name, &addrs, &key)?;
+    reload_cfg(m);
+    let mut req = json!({"pair_done": 1, "from": m.cfg.peer_name, "version": crate::peer::VERSION});
+    if !m.cfg.peer_listen.is_empty() { req["port"] = json!(crate::peer::port_of(&m.cfg.peer_listen)); }
+    if !m.cfg.peer_relay.is_empty() { req["relay"] = json!(m.cfg.peer_relay); }
+    let (srv, n) = (srv.clone(), name.clone());
+    std::thread::spawn(move || {
+        let mut errs = vec![];
+        for a in &addrs {
+            match crate::peer::open(a, Some(&key)).and_then(|mut c| c.call(&req)) {
+                Ok(v) if v["ok"].as_bool() == Some(true) => { proto::log(&format!("peers: {n} ({a}) avisado do aceite")); return; }
+                Ok(v) => errs.push(format!("{a}: {}", v["error"].as_str().unwrap_or("recusou"))),
+                Err(e) => errs.push(format!("{a}: {e}")),
+            }
+        }
+        let e = errs.join(" · ");
+        proto::log(&format!("peers: {n} nao recebeu o aceite: {e}"));
+        let mut m = srv.lock();
+        m.inbox.push(json!({"kind": "peer", "pane": 0, "title": format!("{n} conectado, mas sem caminho de volta"),
+            "body": format!("Não consegui abrir conexão até {n} ({e}). Ele termina a conexão sozinho ao consultar, mas mensagens daqui para lá vão falhar: veja Computadores > {n} > Diagnosticar."),
+            "color": "blocked"}));
+        srv.notify();
+    });
+    Ok(name)
+}
+
+/// Quem aceitou o nosso pedido avisa. So vale se o pedido saiu daqui.
+fn pair_done_in(srv: &Arc<Server>, v: &Value, ip: &str, key: &str, via_relay: bool) -> Result<Value, String> {
     let mut m = srv.lock();
-    crate::peer::save(&name, &addr, &key)?;
+    let Some((addr, _)) = m.peers.pending_out.remove(key) else { return Err("nenhum pedido daqui para esse computador".into()) };
+    let name = crate::peer::free_name(&m.cfg.peers, &crate::peer::clean_name(v["from"].as_str().unwrap_or("")), key);
+    let mut addrs = vec![addr];
+    for a in return_addrs(v, ip, via_relay) { if !addrs.contains(&a) { addrs.push(a); } }
+    crate::peer::save(&name, &addrs, key)?;
     reload_cfg(&mut m);
-    proto::log(&format!("peers: {name} ({addr}) aceitou a conexao"));
-    m.inbox.push(json!({"kind": "peer", "pane": 0, "title": format!("{name} aceitou a conexao"), "body": format!("duck msg {name} \"...\" ja funciona."), "color": "done"}));
+    proto::log(&format!("peers: {name} aceitou a conexao"));
+    m.inbox.push(json!({"kind": "peer", "pane": 0, "title": format!("{name} aceitou a conexão"), "body": format!("duck msg {name} \"...\" já funciona."), "color": "done"}));
     srv.notify();
     Ok(proto::ok(json!({})))
 }
 
-/// Mensagem que chegou: vai para o agente da conversa (ou o do pane que o
-/// usuario esta olhando), com aprovacao, a menos que `peer.trust`.
-fn peer_in(srv: &Arc<Server>, v: &Value, ip: &str) -> Result<Value, String> {
+/// Consulta os pedidos feitos daqui (a cada 3 s, ate 15 min): fecha o
+/// pareamento mesmo quando o outro nao consegue abrir conexao ate aqui.
+fn pair_poll_loop(srv: Arc<Server>) {
+    loop {
+        std::thread::sleep(Duration::from_secs(3));
+        let pend: Vec<(String, String)> = {
+            let mut m = srv.lock();
+            m.peers.pending_out.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(15 * 60));
+            m.peers.pending_out.iter().map(|(k, (a, _))| (k.clone(), a.clone())).collect()
+        };
+        for (key, addr) in pend {
+            let st = crate::peer::pair_status(&addr, &key);
+            let mut m = srv.lock();
+            if !m.peers.pending_out.contains_key(&key) { continue; }
+            match st {
+                Ok(crate::peer::PairState::Accepted(name, v)) => {
+                    m.peers.pending_out.remove(&key);
+                    let name = crate::peer::free_name(&m.cfg.peers, &name, &key);
+                    let addrs = crate::peer::addrs_for(&addr, v["relay"].as_str());
+                    if let Err(e) = crate::peer::save(&name, &addrs, &key) { proto::log(&format!("peers: guardar {name}: {e}")); continue; }
+                    reload_cfg(&mut m);
+                    proto::log(&format!("peers: {name} aceitou (consulta)"));
+                    m.inbox.push(json!({"kind": "peer", "pane": 0, "title": format!("{name} aceitou a conexão"), "body": format!("duck msg {name} \"...\" já funciona."), "color": "done"}));
+                    srv.notify();
+                }
+                Ok(crate::peer::PairState::Denied) => {
+                    m.peers.pending_out.remove(&key);
+                    m.inbox.push(json!({"kind": "peer", "pane": 0, "title": "Pedido de conexão negado", "body": format!("{addr} negou o pedido (ou ele expirou)."), "color": "blocked"}));
+                    srv.notify();
+                }
+                Ok(crate::peer::PairState::Waiting) | Err(_) => {}
+            }
+        }
+    }
+}
+
+/// Agentes deste computador, para o outro escolher com quem falar.
+fn sessions_out(m: &Mux) -> Value {
+    let mut list: Vec<Value> = m.panes.iter().filter_map(|(&id, p)| {
+        let a = p.agent.as_ref()?;
+        let tab = locate(m, id).map(|(w, t)| m.workspaces[w].tabs[t].title.clone()).unwrap_or_default();
+        let dir = p.cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("").to_string();
+        Some(json!({"id": id, "tab": tab, "title": p.title, "dir": dir, "state": a.state, "agent": a.name}))
+    }).collect();
+    list.sort_by_key(|v| v["id"].as_u64());
+    proto::ok(json!({"name": m.cfg.peer_name, "sessions": list}))
+}
+
+/// Pasta de downloads do usuario + Duck (Linux: xdg-user-dir).
+fn downloads_dir() -> std::path::PathBuf {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(std::path::PathBuf::from).unwrap_or_default();
+    let xdg = (!cfg!(windows)).then(|| std::process::Command::new("xdg-user-dir").arg("DOWNLOAD").output().ok()).flatten()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|d| !d.is_empty() && d != home.to_string_lossy().as_ref());
+    xdg.map(std::path::PathBuf::from).unwrap_or_else(|| home.join("Downloads")).join("Duck")
+}
+
+/// Nome de arquivo seguro (sem pasta, sem caracteres de controle).
+fn safe_file_name(n: &str) -> String {
+    let base = n.rsplit(['/', '\\']).next().unwrap_or("");
+    let s: String = base.chars().filter(|c| !c.is_control() && !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|')).take(120).collect();
+    let s = s.trim().trim_start_matches('.').to_string();
+    if s.is_empty() { "arquivo".into() } else { s }
+}
+
+/// Caminho livre: nome.ext, nome (2).ext...
+fn free_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let p = dir.join(name);
+    if !p.exists() { return p; }
+    let (stem, ext) = match name.rsplit_once('.') { Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")), _ => (name.to_string(), String::new()) };
+    (2..).map(|i| dir.join(format!("{stem} ({i}){ext}"))).find(|p| !p.exists()).unwrap_or(p)
+}
+
+/// Arquivo de outro computador: fica guardado ate o usuario aprovar (ou vai
+/// direto para Downloads/Duck com `peer.trust`).
+fn file_in(srv: &Arc<Server>, v: &Value, who: &str) -> Result<Value, String> {
+    use base64::Engine;
+    let name = safe_file_name(v["name"].as_str().unwrap_or(""));
+    let data = base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or("")).map_err(|e| format!("arquivo: {e}"))?;
+    if data.len() > PEER_MAX_FILE { return Err(format!("arquivo grande demais (maximo {} MB)", PEER_MAX_FILE >> 20)); }
+    let inbox_dir = proto::data_dir().join("incoming");
+    std::fs::create_dir_all(&inbox_dir).map_err(|e| e.to_string())?;
+    let tmp = inbox_dir.join(format!("{}-{name}", crate::secure::random_hex(4)));
+    std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
+    let size = human_size(data.len());
+    let mut m = srv.lock();
+    if m.cfg.peer_trust {
+        let dst = accept_file(&tmp, &name)?;
+        m.inbox.push(json!({"kind": "peer", "pane": 0, "title": format!("Arquivo de {who}"), "body": format!("{name} ({size}) salvo em {}", dst.display()), "color": "done"}));
+        srv.notify();
+        return Ok(proto::ok(json!({"saved": true, "approval": false})));
+    }
+    let payload = json!({"tmp": tmp, "name": name, "from": who}).to_string();
+    ask(&mut m, "file", 0, format!("{who} quer mandar o arquivo {name} ({size}). Aceitar salva em {}", downloads_dir().display()), payload);
+    srv.notify();
+    Ok(proto::ok(json!({"approval": true})))
+}
+
+fn accept_file(tmp: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+    let dir = downloads_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let dst = free_path(&dir, name);
+    if std::fs::rename(tmp, &dst).is_err() {
+        std::fs::copy(tmp, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+        let _ = std::fs::remove_file(tmp);
+    }
+    Ok(dst)
+}
+
+fn human_size(n: usize) -> String {
+    if n >= 1 << 20 { format!("{:.1} MB", n as f64 / (1u64 << 20) as f64) } else if n >= 1 << 10 { format!("{} KB", n >> 10) } else { format!("{n} B") }
+}
+
+/// Diagnostico: o outro pede para testarmos se ELE alcanca a gente de volta
+/// e devolvemos o resultado de cada endereco (o IP de onde veio primeiro).
+fn callback_in(v: &Value, ip: &str) -> Value {
+    let mut addrs: Vec<String> = vec![];
+    if !ip.is_empty() { addrs.push(join_ip(ip, v["port"].as_u64().unwrap_or(crate::peer::DEFAULT_PORT as u64))); }
+    for a in v["addrs"].as_array().into_iter().flatten().filter_map(|a| a.as_str()) {
+        if !addrs.iter().any(|x| x == a) && !a.starts_with("relay:") { addrs.push(a.to_string()); }
+    }
+    addrs.truncate(6);
+    let hs: Vec<_> = addrs.into_iter().map(|a| std::thread::spawn(move || match crate::peer::ping(&a) {
+        Ok(i) => json!({"addr": a, "ok": true, "ms": i.ms as u64}),
+        Err(e) => json!({"addr": a, "ok": false, "error": e}),
+    })).collect();
+    proto::ok(json!({"results": hs.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>()}))
+}
+
+/// Mensagem que chegou de `from` (pareado): vai para o agente da conversa
+/// (ou o do pane que o usuario esta olhando), com aprovacao, a menos que `peer.trust`.
+fn peer_in(srv: &Arc<Server>, v: &Value, from: &str) -> Result<Value, String> {
     let mut m = srv.lock();
     let hops = v["hops"].as_u64().unwrap_or(1) as u32;
     if hops > m.cfg.peer_max_hops { return Err(format!("limite de {} idas e voltas", m.cfg.peer_max_hops)); }
-    // Quem mandou: pelo IP na lista de peers; senao, o nome que ele diz.
-    let from = m.cfg.peers.iter().find(|(_, a)| a.rsplit_once(':').map(|x| x.0) == Some(ip)).map(|(n, _)| n.clone())
-        .unwrap_or_else(|| clean(v["from"].as_str().unwrap_or("?"), 40));
+    let from = from.to_string();
     let conv = clean(v["conv"].as_str().unwrap_or(""), 16);
     if conv.is_empty() { return Err("falta conv".into()); }
+    if m.peers.closed.contains(&conv) { return Err(format!("a conversa {conv} foi encerrada pelo usuario de la")); }
     let text: String = v["text"].as_str().unwrap_or("").chars().take(PEER_MAX_TEXT).collect();
     if text.trim().is_empty() { return Err("falta text".into()); }
     let has_agent = |m: &Mux, id: Id| m.panes.get(&id).is_some_and(|p| p.agent.is_some());
@@ -2148,18 +2406,27 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let ok = a.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             let Some(ap) = m.approvals.iter_mut().find(|x| x.id == id) else { return Err("pedido nao existe".into()) };
             ap.decided = Some(ok);
-            if ok && ap.kind == "clipboard" {
-                let text = ap.payload.clone();
+            let (kind, pane, payload) = (ap.kind.clone(), ap.pane, ap.payload.clone());
+            if ok && kind == "clipboard" {
                 m.clipboard.0 += 1;
-                m.clipboard.1 = text;
+                m.clipboard.1 = payload.clone();
             }
-            if ok && ap.kind == "peer" {
-                let (pane, text) = (ap.pane, ap.payload.clone());
-                if let Some(p) = m.panes.get_mut(&pane) { queue_or_deliver(p, text); }
+            if ok && kind == "peer" {
+                if let Some(p) = m.panes.get_mut(&pane) { queue_or_deliver(p, payload.clone()); }
             }
-            if ok && ap.kind == "pair" {
-                let payload = ap.payload.clone();
-                if let Err(e) = pair_accept(m, &payload) { proto::log(&format!("peers: aceite falhou: {e}")); }
+            if ok && kind == "pair" {
+                if let Err(e) = pair_accept(srv, m, &payload) { proto::log(&format!("peers: aceite falhou: {e}")); }
+            }
+            if kind == "file" {
+                let p: Value = serde_json::from_str(&payload).unwrap_or_default();
+                let tmp = std::path::PathBuf::from(p["tmp"].as_str().unwrap_or(""));
+                if ok {
+                    let name = p["name"].as_str().unwrap_or("arquivo").to_string();
+                    let msg = match accept_file(&tmp, &name) { Ok(d) => format!("{name} salvo em {}", d.display()), Err(e) => format!("{name}: {e}") };
+                    m.inbox.push(json!({"kind": "peer", "pane": 0, "title": format!("Arquivo de {}", p["from"].as_str().unwrap_or("?")), "body": msg, "color": "done"}));
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                }
             }
             // Clipboard ninguem espera: sai ja. Acao: quem pediu le e remove.
             m.approvals.retain(|x| x.decided.is_none() || x.kind == "action");
@@ -2271,13 +2538,69 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let text = arg_str(a, "text").filter(|t| !t.trim().is_empty()).ok_or("falta text")?.chars().take(PEER_MAX_TEXT).collect();
             let text = scrub(m, text);
             let max = m.cfg.peer_max_hops;
-            let conv = arg_str(a, "conv").map(|c| clean(c, 16)).filter(|c| !c.is_empty()).unwrap_or_else(|| proto::random_hex(4));
+            let conv = arg_str(a, "conv").map(|c| clean(c, 16)).filter(|c| !c.is_empty()).unwrap_or_else(|| crate::secure::random_hex(4));
+            if m.peers.closed.contains(&conv) { return Err(format!("conversa {conv} encerrada (painel Computadores > Conversas)")); }
             let from = m.cfg.peer_name.clone();
             let c = m.convs.entry(conv.clone()).or_insert_with(|| Conv { peer: peer.clone(), ..Default::default() });
             if c.hops >= max { return Err(format!("conversa {conv}: limite de {max} idas e voltas. Peça ao usuário para continuar.")); }
             c.hops += 1;
             if caller.0.is_some() { c.local_pane = caller.0; }
             proto::ok(json!({"addr": addr, "from": from, "conv": conv, "hops": c.hops, "to": c.remote_pane, "reply_pane": c.local_pane, "text": text}))
+        }
+        // Pedido de conexao feito pela CLI/janela: o server consulta o outro
+        // ate ele aceitar (pair_poll_loop) e recebe o pair_done.
+        "peer-pending" => {
+            let key = arg_str(a, "key").filter(|k| k.len() == 64).ok_or("falta key")?.to_string();
+            let addr = arg_str(a, "addr").ok_or("falta addr")?.to_string();
+            m.peers.pending_out.insert(key, (addr, Instant::now()));
+            proto::ok(json!({}))
+        }
+        "peer-pending-cancel" => {
+            match arg_str(a, "key") { Some(k) => { m.peers.pending_out.remove(k); } None => m.peers.pending_out.clear() }
+            proto::ok(json!({}))
+        }
+        // A CLI pareou ou mudou enderecos: le de novo so a lista de pareados.
+        "peers-reload" => {
+            m.cfg.peers = config::load_config().0.peers;
+            proto::ok(json!({}))
+        }
+        "peer-invite" => {
+            let code = crate::secure::random_hex(5);
+            m.peers.invites.retain(|_, t| Instant::now() < *t);
+            m.peers.invites.insert(code.clone(), Instant::now() + Duration::from_secs(10 * 60));
+            let port = crate::peer::port_of(&m.cfg.peer_listen);
+            let mut addrs: Vec<String> = vec![];
+            if !m.cfg.peer_listen.is_empty() {
+                if crate::peer::listens_all(&m.cfg.peer_listen) {
+                    if let Some(ip) = crate::peer::local_ip() { addrs.push(format!("{ip}:{port}")); }
+                    for i in crate::peer::interfaces() { let a = format!("{}:{port}", i.ip); if !addrs.contains(&a) { addrs.push(a); } }
+                } else if let Some(a) = crate::peer::advertised(&m.cfg.peer_listen) { addrs.push(a); }
+            }
+            if !m.cfg.peer_relay.is_empty() { addrs.push(format!("relay:{}", m.cfg.peer_relay)); }
+            if addrs.is_empty() { return Err("este computador nao escuta nem usa relay: ligue no painel Computadores".into()); }
+            let s = crate::peer::invite_string(&m.cfg.peer_name, &addrs, &code, &crate::secure::my_key());
+            proto::ok(json!({"code": code, "invite": s, "minutes": 10}))
+        }
+        "peers-state" => {
+            let pending: Vec<Value> = m.peers.pending_out.iter().map(|(k, (a, t))| json!({"key": k, "addr": a, "secs": t.elapsed().as_secs()})).collect();
+            let asks: Vec<Value> = m.approvals.iter().filter(|x| x.decided.is_none() && (x.kind == "pair" || x.kind == "file"))
+                .map(|x| json!({"id": x.id, "kind": x.kind, "text": x.text})).collect();
+            let relay = m.peers.relay.lock().unwrap().clone();
+            let invites = m.peers.invites.values().filter(|t| Instant::now() < **t).count();
+            proto::ok(json!({"pending": pending, "asks": asks, "seen": m.peers.seen, "relay": relay, "invites": invites, "key": crate::secure::my_key()}))
+        }
+        "convs" => {
+            let max = m.cfg.peer_max_hops;
+            let mut list: Vec<Value> = m.convs.iter().map(|(id, c)| json!({"conv": id, "peer": c.peer, "hops": c.hops, "max": max,
+                "local_pane": c.local_pane, "remote_pane": c.remote_pane, "closed": m.peers.closed.contains(id)})).collect();
+            list.sort_by(|a, b| a["peer"].as_str().cmp(&b["peer"].as_str()).then(a["conv"].as_str().cmp(&b["conv"].as_str())));
+            proto::ok(json!({"convs": list}))
+        }
+        "conv-close" => {
+            let conv = arg_str(a, "conv").map(|c| clean(c, 16)).filter(|c| !c.is_empty()).ok_or("falta conv")?;
+            m.convs.remove(&conv);
+            m.peers.closed.insert(conv);
+            proto::ok(json!({}))
         }
         "queue" => {
             let id = target(srv, m, a)?;
@@ -3600,7 +3923,7 @@ pub fn run() {
     let srv = Arc::new(Server {
         mux: Mutex::new(Mux {
             panes: HashMap::new(), workspaces: Vec::new(), next: 1, size: (100, 30),
-            clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0, inbox: Inbox::default(), convs: HashMap::new(), loops: HashMap::new(),
+            clients: HashMap::new(), cfg, clipboard: (0, String::new()), events: Vec::new(), event_seq: 0, inbox: Inbox::default(), convs: HashMap::new(), peers: Default::default(), loops: HashMap::new(),
             approvals: Vec::new(), approval_seq: 0, secrets, recovered: 0, resurrect: false, light: false,
             history: load_history(), budget_warned: false, ext: Default::default(), subs: 0, closed: Vec::new(), pip: None, changes: HashMap::new(),
         }),
@@ -3625,6 +3948,15 @@ pub fn run() {
             (m.cfg.peer_name.clone(), addr)
         }));
     }
+    // Relay: alcanca e e alcancado fora da rede local, sem abrir porta.
+    let (relay, relay_secret, relay_status) = { let m = srv.lock(); (m.cfg.peer_relay.clone(), m.cfg.peer_relay_secret.clone(), m.peers.relay.clone()) };
+    if !relay.is_empty() {
+        let s = srv.clone();
+        let handle: Arc<dyn Fn(std::net::TcpStream) + Send + Sync> = Arc::new(move |c| peer_conn(&s, c, true));
+        let key = crate::secure::my_key();
+        std::thread::spawn(move || crate::relay::client_loop(relay, relay_secret, key, relay_status, handle));
+    }
+    { let s = srv.clone(); std::thread::spawn(move || pair_poll_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || event_loop(s, rx)); }
     { let s = srv.clone(); std::thread::spawn(move || agent_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || autosave_loop(s)); }
@@ -3772,7 +4104,7 @@ mod tests {
         let m = Mux {
             panes: HashMap::new(), workspaces: vec![], next: 1, size: (10, 10), clients: HashMap::new(),
             cfg: config::parse(&t),
-            clipboard: (0, String::new()), events: vec![], event_seq: 0, inbox: Inbox::default(), convs: HashMap::new(), loops: HashMap::new(), approvals: vec![], approval_seq: 0,
+            clipboard: (0, String::new()), events: vec![], event_seq: 0, inbox: Inbox::default(), convs: HashMap::new(), peers: Default::default(), loops: HashMap::new(), approvals: vec![], approval_seq: 0,
             secrets: vec![], recovered: 0, resurrect: false, light: false, history: vec![], budget_warned: false, ext: Default::default(), subs: 0, closed: Vec::new(), pip: None, changes: HashMap::new(),
         };
         assert!(check_scope(&m, Caller(Some(5)), "send", &json!({"pane": 9})).is_err());

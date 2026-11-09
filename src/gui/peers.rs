@@ -1,100 +1,160 @@
-//! Painel Computadores (Ctrl+Shift+P > Computadores): liga a escuta, procura
-//! Ducks na rede (ou conecta por IP), pede conexao e lista os pareados com o
-//! estado de cada um. O pedido mostra um numero de confirmacao nas duas telas;
-//! o outro lado aceita num popup e as chaves sao trocadas sozinhas. A rede roda em threads; o resultado volta
-//! pela fila de acoes (`peer_*_done`) e um Tick.
+//! Painel Computadores (Ctrl+Shift+P > Computadores). Secoes:
+//! - Este computador: nome, rede de escuta, relay, convites, firewall, diagnostico.
+//! - Pedidos: conexoes esperando aceite (daqui e de la) e arquivos chegando.
+//! - Na rede: busca (rede local e Tailscale) e conectar por IP.
+//! - Conectados: cada pareado com sistema, tempo de resposta, versao e se a
+//!   conexao e cifrada; Enter abre agentes de la, mensagem, arquivo,
+//!   diagnostico, enderecos.
+//! - Conversas: as trocas entre agentes, com quantas idas e voltas; encerrar.
+//!
+//! A rede roda em threads; o resultado volta pela fila de acoes (`peer_*_done`)
+//! e um Tick. O estado do server (pedidos, relay, versoes) vem de `peers-state`.
 
 use super::*;
 use crate::peer;
 
+/// Icone do sistema (Nerd Font).
+fn os_icon(os: &str) -> &'static str {
+    match os { "linux" => "\u{f17c}", "windows" => "\u{f17a}", "macos" => "\u{f179}", _ => "\u{f108}" }
+}
+
 impl Gui {
-    /// Abre (ou redesenha) o painel. `ping`: testa os pareados em segundo plano.
+    /// Abre (ou redesenha) o painel. `ping`: testa os pareados e le o estado
+    /// do server em segundo plano.
     pub(super) fn open_peers(&mut self, ping: bool) {
         let name = self.cfg.peer_name.clone();
         let adv = peer::advertised(&self.cfg.peer_listen);
-        let mut items = vec![];
+        let st = self.peer_state.clone();
+        let mut items = vec![Item::new("── Este computador ──", "", "", vec![])];
+        let key = st["key"].as_str().map(crate::secure::short).unwrap_or_default();
         match &adv {
             None => {
-                let ip = peer::local_ip().unwrap_or_else(|| "0.0.0.0".into());
-                items.push(Item::new(format!("○  Desligado. Enter liga na rede local ({ip}:{})", peer::DEFAULT_PORT),
-                    "reinicia o server; os shells continuam", "peer_enable", vec![]));
+                items.push(Item::new(format!("○  {name} · {} · desligado", os_icon(std::env::consts::OS)), "Enter liga em todas as redes (reinicia o server; os shells continuam)", "peer_enable", vec![]));
             }
-            Some(a) => {
-                items.push(Item::new(format!("●  Este computador: {name} · {a}"), "Enter: trocar o nome", "peer_rename", vec![]));
-                items.push(Item::new(format!("Rede: {}", Self::listen_label(&self.cfg.peer_listen)),
+            Some(_) => {
+                items.push(Item::new(format!("●  {name} · {} {} · chave {key}…", os_icon(std::env::consts::OS), std::env::consts::OS), "Enter: trocar o nome", "peer_rename", vec![]));
+                items.push(Item::new(format!("   Rede: {}", Self::listen_label(&self.cfg.peer_listen)),
                     "Enter: escolher em qual rede escutar (casa, VMs, VPN ou todas)", "peer_listen_menu", vec![]));
             }
         }
-        // Pedido feito daqui esperando o outro aceitar (sai quando ele aparece na lista).
-        if let Some(w) = self.peer_status.get("\u{0}espera").cloned() {
-            if self.cfg.peers.iter().any(|(n, _)| *n == w) { self.peer_status.remove("\u{0}espera"); } else {
-                items.push(Item::new(format!("⏳  Esperando {w} aceitar · número de confirmação: {}", peer::confirm_code(&peer::self_token())),
-                    "aceite lá só se aparecer o mesmo número · Enter cancela", "peer_wait_cancel", vec![]));
+        let relay = if self.cfg.peer_relay.is_empty() { "desligado · para falar com computadores fora da rede".to_string() }
+            else { st["relay"].as_str().filter(|r| !r.is_empty()).map(String::from).unwrap_or_else(|| format!("{} (conectando…)", self.cfg.peer_relay)) };
+        items.push(Item::new(format!("   Relay: {relay}"), "Enter: configurar", "peer_relay_menu", vec![]));
+        items.push(Item::new("   Gerar convite", "código que conecta sem aprovação · vale 10 min, uma vez · copia para a área de transferência", "peer_invite", vec![]));
+        items.push(Item::new("   Usar convite de outro computador", "cole o código gerado lá", "peer_join_ask", vec![]));
+        if adv.is_some() {
+            let port = peer::port_of(&self.cfg.peer_listen);
+            if cfg!(windows) {
+                items.push(Item::new("   Firewall do Windows: copiar o comando que libera a porta", "cole num terminal de administrador", "peer_firewall", vec![]));
+            } else if let Some(b) = self.peer_info.get("\u{0}firewall").and_then(|v| v.as_array()).filter(|b| !b.is_empty()) {
+                let zones: Vec<String> = b.iter().filter_map(|z| z[0].as_str().map(String::from)).collect();
+                items.push(Item::new(format!("⚠  Firewall bloqueia a porta {port} (zona {})", zones.join(", ")), "Enter copia o comando que libera (precisa de senha)", "peer_copy",
+                    vec![json!(zones.iter().map(|z| peer::firewalld_cmd(z, port)).collect::<Vec<_>>().join(" && "))]));
             }
         }
-        let searching = self.peer_status.contains_key("\u{0}busca");
-        // Separa o que a busca achou: este computador (respondeu a propria
-        // busca), os ja pareados e os novos, que viram item para conectar.
+        items.push(Item::new("   Diagnosticar este computador", "escuta, firewall e relay", "peer_doctor", vec![json!("")]));
+        items.push(Item::new(format!("   Aprovar mensagens sem perguntar: {}", if self.cfg.peer_trust { "sim" } else { "não" }),
+            "Enter muda · sim só entre computadores seus", "peer_trust", vec![]));
+
+        // Pedidos: os daqui esperando o outro, os de la esperando voce.
+        let pend = st["pending"].as_array().cloned().unwrap_or_default();
+        let asks = st["asks"].as_array().cloned().unwrap_or_default();
+        if !pend.is_empty() || !asks.is_empty() { items.push(Item::new("── Pedidos ──", "", "", vec![])); }
+        for p in &pend {
+            let code = self.peer_info.get(&format!("\u{0}confirm:{}", p["key"].as_str().unwrap_or(""))).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            items.push(Item::new(format!("⏳  Esperando {} aceitar · número {code} · há {}s", p["addr"].as_str().unwrap_or(""), p["secs"]),
+                "aceite lá só se aparecer o mesmo número · Enter cancela", "peer_wait_cancel", vec![p["key"].clone()]));
+        }
+        for a in &asks {
+            let first = a["text"].as_str().unwrap_or("").lines().next().unwrap_or("").to_string();
+            let icon = if a["kind"] == "file" { "📄" } else { "❓" };
+            items.push(Item::new(format!("{icon}  {first}"), "Enter: responder", "peer_ask", vec![a["id"].clone(), a["kind"].clone(), a["text"].clone()]));
+        }
+
+        // Na rede: busca e o que ela achou.
+        items.push(Item::new("── Na rede ──", "", "", vec![]));
+        let mine = crate::secure::short(&crate::secure::my_key());
         let mut found_new = vec![];
         let mut found_known = vec![];
         for f in self.peer_found.iter().flatten() {
-            let (fname, faddr) = (f["name"].as_str().unwrap_or("duck").to_string(), f["addr"].as_str().unwrap_or("").to_string());
-            if fname == name || Some(faddr.as_str()) == adv.as_deref() || self.is_own_addr(&faddr) { continue; }
-            match self.cfg.peers.iter().find(|(n, a)| *n == fname || *a == faddr) {
+            let faddr = f["addr"].as_str().unwrap_or("").to_string();
+            let fkey = f["key"].as_str().unwrap_or("");
+            if (!fkey.is_empty() && fkey == mine) || Some(faddr.as_str()) == adv.as_deref() || self.is_own_addr(&faddr) { continue; }
+            let known = self.cfg.peers.iter().find(|(n, a)| (!fkey.is_empty() && peer::key_of(n).is_some_and(|k| k.starts_with(fkey))) || peer::split_addrs(a).contains(&faddr));
+            match known {
                 Some((n, _)) => found_known.push((n.clone(), faddr)),
-                None => found_new.push((fname, faddr, f["os"].as_str().unwrap_or("").to_string())),
+                None => found_new.push(f.clone()),
             }
         }
+        let searching = self.peer_status.contains_key("\u{0}busca");
         let hint = match (&self.peer_found, searching) {
             (_, true) => "procurando…".to_string(),
-            (None, _) => "acha os Ducks escutando nas redes deste computador".to_string(),
+            (None, _) => "rede local, VMs e Tailscale".to_string(),
             (Some(_), _) if found_new.is_empty() && found_known.is_empty() => "nenhum outro Duck respondeu · Enter procura de novo".to_string(),
             (Some(_), _) => format!("{} novo(s), {} já conectado(s) · Enter procura de novo", found_new.len(), found_known.len()),
         };
-        items.push(Item::new("Procurar computadores na rede", hint, "peer_discover", vec![]));
-        for (fname, faddr, os) in found_new {
-            items.push(Item::new(format!("+  Conectar com {fname} ({faddr})"), format!("{os} · o outro aceita lá"),
-                "peer_connect", vec![json!(fname), json!(faddr)]));
+        items.push(Item::new("   Procurar computadores", hint, "peer_discover", vec![]));
+        for f in found_new {
+            let (fname, faddr) = (f["name"].as_str().unwrap_or("duck"), f["addr"].as_str().unwrap_or(""));
+            let ts = if f["via"] == "tailscale" { " · Tailscale" } else { "" };
+            items.push(Item::new(format!("+  Conectar com {fname} ({faddr})"), format!("{} {} · Duck {}{ts} · o outro aceita lá", os_icon(f["os"].as_str().unwrap_or("")),
+                f["os"].as_str().unwrap_or(""), f["version"].as_str().unwrap_or("?")), "peer_connect", vec![json!(fname), json!(faddr)]));
         }
         for (pname, faddr) in found_known {
             items.push(Item::new(format!("✓  {pname} ({faddr}) · já conectado"), "Enter: opções", "peer_menu", vec![json!(pname)]));
         }
-        items.push(Item::new("Conectar por IP", "quando a busca não acha (outra rede, VPN) · o outro aceita lá", "peer_connect_ask", vec![]));
-        if !self.cfg.peers.is_empty() {
-            items.push(Item::new("── Computadores conectados ──", "", "", vec![]));
+        items.push(Item::new("   Conectar por IP", "outra rede, VPN, ou quando a busca não acha · o outro aceita lá", "peer_connect_ask", vec![]));
+
+        // Conectados.
+        if !self.cfg.peers.is_empty() { items.push(Item::new("── Conectados ──", "", "", vec![])); }
+        for (pname, paddrs) in self.cfg.peers.clone() {
+            let info = self.peer_info.get(&pname).cloned().unwrap_or(Value::Null);
+            let online = info["online"].as_bool() == Some(true);
+            let mark = if online { "●" } else { "○" };
+            let os = info["os"].as_str().unwrap_or("");
+            let lock = if peer::key_of(&pname).is_some() { "" } else { " · ⚠ sem criptografia: parear de novo" };
+            let ver = info["version"].as_str().or(st["seen"][&pname]["version"].as_str()).unwrap_or("").to_string();
+            let old = if !ver.is_empty() && crate::update::newer(peer::VERSION, &ver) { " · ⚠ desatualizado" } else { "" };
+            let state = match info["state"].as_str() { Some(s) => s.to_string(), None => "testando…".into() };
+            let n = peer::split_addrs(&paddrs).len();
+            let label = format!("{mark}  {} {pname} · {state}{}", os_icon(os), if ver.is_empty() { String::new() } else { format!(" · Duck {ver}") });
+            items.push(Item::new(label, format!("{n} endereço(s){old}{lock} · Enter: opções"), "peer_menu", vec![json!(pname)]));
         }
-        for (pname, paddr) in self.cfg.peers.clone() {
-            let st = self.peer_status.get(&pname).cloned().unwrap_or_else(|| "testando…".into());
-            let mark = if st.starts_with("online") { "●" } else { "○" };
-            let tok = if crate::secret::get(&format!("peer/{pname}")).is_some() { "" } else { " · sem token" };
-            items.push(Item::new(format!("{mark}  {pname} · {paddr}"), format!("{st}{tok} · Enter: opções"), "peer_menu", vec![json!(pname)]));
+
+        // Conversas entre agentes.
+        let convs = self.peer_info.get("\u{0}convs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let open: Vec<&Value> = convs.iter().filter(|c| c["closed"] != true).collect();
+        if !open.is_empty() { items.push(Item::new("── Conversas ──", "", "", vec![])); }
+        for c in open {
+            items.push(Item::new(format!("💬  {} com {} · {}/{} idas e voltas", c["conv"].as_str().unwrap_or(""), c["peer"].as_str().unwrap_or(""), c["hops"], c["max"]),
+                "Enter: encerrar (os agentes param de trocar mensagens)", "peer_conv_menu", vec![c["conv"].clone(), c["peer"].clone()]));
         }
         if adv.is_some() {
-            items.push(Item::new(format!("Aprovar mensagens sem perguntar: {}", if self.cfg.peer_trust { "sim" } else { "não" }),
-                "Enter muda · sim só entre computadores seus", "peer_trust", vec![]));
-            if cfg!(windows) {
-                items.push(Item::new("Firewall do Windows: copiar o comando que libera a porta", "cole num terminal de administrador", "peer_firewall", vec![]));
-            }
-            items.push(Item::new("Desligar (para de escutar na rede)", "reinicia o server", "peer_disable", vec![]));
+            items.push(Item::new("   Desligar (para de escutar na rede)", "reinicia o server", "peer_disable", vec![]));
         }
-        let mut o = Overlay::list("Computadores · mensagens entre agentes (duck msg)", items);
+        let mut o = Overlay::list("Computadores · agentes de computadores diferentes conversando (duck msg)", items);
         o.peers = true;
         // Redesenho (resultado de ping/busca): fica no item onde estava.
         if let Some(old) = self.overlay.as_ref().filter(|o| o.peers && o.input.is_empty()) { o.sel = old.sel.min(o.shown.len().saturating_sub(1)); }
         self.overlay = Some(o);
-        if ping { self.peers_ping(); }
+        if ping { self.peers_refresh(); }
     }
 
-    /// Testa cada pareado numa thread; o resultado chega como `peer_status_done`.
-    fn peers_ping(&mut self) {
-        for (name, addr) in self.cfg.peers.clone() {
-            self.peer_status.insert(name.clone(), "testando…".into());
-            let (q, proxy) = (self.queue.clone(), self.proxy.clone());
-            std::thread::spawn(move || {
-                let st = match peer::ping(&addr) { Ok(ms) => format!("online ({ms} ms)"), Err(e) => format!("sem resposta: {e}") };
-                q.lock().unwrap().push(("peer_status_done".into(), vec![json!(name), json!(st)]));
-                let _ = proxy.send_event(UserEv::Tick);
-            });
+    /// Em segundo plano: estado do server, conversas, firewall e ping de cada pareado.
+    fn peers_refresh(&mut self) {
+        if let Ok(v) = self.call(json!({"cmd": "peers-state"})) { self.peer_state = v; }
+        if let Ok(v) = self.call(json!({"cmd": "convs"})) { self.peer_info.insert("\u{0}convs".into(), v["convs"].clone()); }
+        let port = peer::port_of(&self.cfg.peer_listen);
+        if !self.cfg.peer_listen.is_empty() && !cfg!(windows) {
+            self.peers_bg("peer_info_done", vec![json!("\u{0}firewall")], move || Ok(json!(peer::firewalld_blocked(port))));
+        }
+        for (name, addrs) in self.cfg.peers.clone() {
+            let list = peer::split_addrs(&addrs);
+            self.peers_bg("peer_info_done", vec![json!(name)], move || Ok(match peer::ping_any(&list) {
+                Ok((i, a)) => json!({"online": true, "state": format!("{} ms", i.ms), "version": i.version, "os": i.os, "addr": a}),
+                Err(e) if e == "so pelo relay" => json!({"online": true, "state": "pelo relay"}),
+                Err(e) => json!({"online": false, "state": format!("sem resposta: {}", e.split(" · ").next().unwrap_or(&e))}),
+            }));
         }
     }
 
@@ -110,16 +170,23 @@ impl Gui {
         });
     }
 
-    /// Endereco daqui para o pedido de conexao; desligado: liga antes (o
-    /// outro precisa achar este computador para responder).
-    fn peers_ensure_on(&mut self) -> Option<String> {
-        if let Some(a) = peer::advertised(&self.cfg.peer_listen) { return Some(a); }
-        let ip = peer::local_ip()?;
-        let addr = format!("{ip}:{}", peer::DEFAULT_PORT);
-        if let Err(e) = peer::enable(&self.cfg.peer_name, &addr) { self.flash(&e); return None; }
-        self.cfg.peer_listen = addr.clone();
+    /// Escuta ligada (ou relay): o outro precisa achar este computador para
+    /// responder. Desligada: liga em todas as redes antes.
+    fn peers_ensure_on(&mut self) -> bool {
+        if peer::advertised(&self.cfg.peer_listen).is_some() || !self.cfg.peer_relay.is_empty() { return true; }
+        let addr = format!("0.0.0.0:{}", peer::DEFAULT_PORT);
+        if let Err(e) = peer::enable(&self.cfg.peer_name, &addr) { self.flash(&e); return false; }
+        self.cfg.peer_listen = addr;
         let _ = self.call(json!({"cmd": "restart-server"}));
-        Some(addr)
+        std::thread::sleep(Duration::from_millis(600));
+        true
+    }
+
+    fn peers_hint(err: &str) -> String {
+        let fw = if err.contains("timed out") || err.contains("tempo") || err.contains("refused") || err.contains("recusad") {
+            " · use Diagnosticar no painel Computadores"
+        } else { "" };
+        format!("{err}{fw}")
     }
 
     /// Descricao da escuta: "todas as redes" ou a placa e o IP.
@@ -139,11 +206,34 @@ impl Gui {
         peer::port_of(addr) == peer::port_of(&self.cfg.peer_listen) && peer::interfaces().iter().any(|i| i.ip == host)
     }
 
-    fn peers_hint(err: &str) -> String {
-        let fw = if err.contains("timed out") || err.contains("tempo") || err.contains("refused") || err.contains("recusad") {
-            " · confira se o Duck de la esta escutando (painel Computadores) e, no Windows, a porta 7878 liberada no firewall"
-        } else { "" };
-        format!("{err}{fw}")
+    /// Pergunta de aprovacao (conexao, arquivo, mensagem) como dialogo.
+    pub(super) fn approval_dialog(&mut self, id: Value, kind: &str, text: &str) {
+        let (yes, title) = match kind {
+            "clipboard" => ("Permitir copiar", "Clipboard"),
+            "peer" => ("Entregar ao agente", "Mensagem de outro computador"),
+            "pair" => ("Conectar", "Pedido de conexão"),
+            "file" => ("Aceitar o arquivo", "Arquivo de outro computador"),
+            _ => ("Permitir", "Agente pede confirmação"),
+        };
+        // Negar primeiro: Enter distraido nao libera nada.
+        let items = vec![
+            Item::new("Negar", "Esc", "approve", vec![id.clone(), json!(false)]),
+            if kind == "pair" { Item::new(yes, "guarda o outro computador dos dois lados", "peer_accept", vec![id]) }
+            else { Item::new(yes, "", "approve", vec![id, json!(true)]) },
+        ];
+        self.overlay = Some(Overlay::dialog(&format!("{title}: {text}"), items));
+    }
+
+    fn peer_set_listen(&mut self, addr: String) {
+        match config::set_local_setting("peer.listen", &format!("'{addr}'")) {
+            Ok(_) => {
+                self.cfg.peer_listen = addr.clone();
+                let _ = self.call(json!({"cmd": "restart-server"}));
+                self.flash(&format!("Escutando em {}", Self::listen_label(&addr)));
+                self.open_peers(false);
+            }
+            Err(e) => self.flash(&e),
+        }
     }
 
     pub(super) fn peers_builtin(&mut self, name: &str, args: &[Value]) -> bool {
@@ -151,24 +241,18 @@ impl Gui {
         match name {
             "peers" => self.open_peers(true),
             "peer_enable" => {
-                let Some(ip) = peer::local_ip() else { self.flash("Sem rede: nao achei o IP desta maquina"); return true };
-                let addr = format!("{ip}:{}", peer::DEFAULT_PORT);
-                match peer::enable(&self.cfg.peer_name, &addr) {
-                    Ok(_) => {
-                        self.cfg.peer_listen = addr.clone();
-                        let _ = self.call(json!({"cmd": "restart-server"}));
-                        let fw = if cfg!(windows) { " · no Windows, libere a porta: item Firewall no painel" } else { "" };
-                        self.flash(&format!("Escutando em {addr}{fw}"));
-                        self.open_peers(false);
-                    }
-                    Err(e) => self.flash(&e),
-                }
+                if let Err(e) = peer::enable(&self.cfg.peer_name, &format!("0.0.0.0:{}", peer::DEFAULT_PORT)) { self.flash(&e); return true; }
+                self.cfg.peer_listen = format!("0.0.0.0:{}", peer::DEFAULT_PORT);
+                let _ = self.call(json!({"cmd": "restart-server"}));
+                let fw = if cfg!(windows) { " · no Windows, libere a porta: item Firewall no painel" } else { "" };
+                self.flash(&format!("Escutando em todas as redes{fw}"));
+                self.open_peers(true);
             }
             "peer_disable" => match config::set_local_setting("peer.listen", "''") {
                 Ok(_) => {
                     self.cfg.peer_listen.clear();
                     let _ = self.call(json!({"cmd": "restart-server"}));
-                    self.flash("Desligado: este computador nao recebe mais mensagens");
+                    self.flash("Desligado: este computador não recebe mais mensagens");
                     self.open_peers(false);
                 }
                 Err(e) => self.flash(&e),
@@ -178,7 +262,7 @@ impl Gui {
                 let cur = self.cfg.peer_listen.trim().to_string();
                 let mark = |on: bool| if on { "●" } else { "○" };
                 let mut items = vec![Item::new(format!("{}  Todas as redes", mark(peer::listens_all(&cur))),
-                    "casa, VMs e VPN ao mesmo tempo · a conexão continua exigindo token ou aprovação", "peer_listen_set", vec![json!(format!("0.0.0.0:{port}"))])];
+                    "casa, VMs e VPN ao mesmo tempo · a conexão continua exigindo aprovação ou convite", "peer_listen_set", vec![json!(format!("0.0.0.0:{port}"))])];
                 for i in peer::interfaces() {
                     let addr = format!("{}:{port}", i.ip);
                     items.push(Item::new(format!("{}  Só {} · {}", mark(cur == addr), i.name, i.ip),
@@ -190,15 +274,100 @@ impl Gui {
             "peer_listen_set" => {
                 let addr = s(0);
                 if addr.is_empty() || addr == self.cfg.peer_listen.trim() { self.open_peers(false); return true; }
-                match config::set_local_setting("peer.listen", &format!("'{addr}'")) {
+                self.peer_set_listen(addr);
+            }
+            "peer_relay_menu" => {
+                let mut items = vec![Item::new("Usar um relay (host:porta)", "o relay roda num computador que todos alcançam: duck relay --listen 0.0.0.0:7879", "peer_relay_ask", vec![])];
+                if !self.cfg.peer_relay.is_empty() {
+                    items.push(Item::new("Senha do relay", if self.cfg.peer_relay_secret.is_empty() { "nenhuma" } else { "definida" }, "peer_relay_secret_ask", vec![]));
+                    items.push(Item::new("Desligar o relay", "", "peer_relay_set", vec![json!("")]));
+                }
+                items.push(Item::new("Voltar", "", "peers", vec![]));
+                self.overlay = Some(Overlay::list("Relay: liga computadores em redes diferentes (tudo continua cifrado de ponta a ponta)", items));
+            }
+            "peer_relay_ask" => {
+                let cur = self.cfg.peer_relay.clone();
+                self.overlay = Some(Overlay::prompt("Relay (ex.: meu-vps.com:7879)", &cur, "peer_relay_set", vec![]));
+            }
+            "peer_relay_set" => {
+                let mut r = s(0).trim().replace('\'', "");
+                if !r.is_empty() && !r.contains(':') { r = format!("{r}:7879"); }
+                match config::set_local_setting("peer.relay", &format!("'{r}'")) {
                     Ok(_) => {
-                        self.cfg.peer_listen = addr.clone();
+                        self.cfg.peer_relay = r.clone();
                         let _ = self.call(json!({"cmd": "restart-server"}));
-                        self.flash(&format!("Escutando em {}", Self::listen_label(&addr)));
-                        self.open_peers(false);
+                        self.flash(&if r.is_empty() { "Relay desligado".to_string() } else { format!("Relay: {r}. Pareie de novo (ou use convite) para os outros aprenderem o caminho") });
+                        self.open_peers(true);
                     }
                     Err(e) => self.flash(&e),
                 }
+            }
+            "peer_relay_secret_ask" => {
+                let mut o = Overlay::prompt("Senha do relay (a mesma do duck relay --secret)", "", "peer_relay_secret_set", vec![]);
+                o.secret = true;
+                self.overlay = Some(o);
+            }
+            "peer_relay_secret_set" => {
+                match config::set_local_setting("peer.relay_secret", &format!("'{}'", s(0).replace('\'', ""))) {
+                    Ok(_) => { self.cfg.peer_relay_secret = s(0); let _ = self.call(json!({"cmd": "restart-server"})); self.flash("Senha do relay guardada"); self.open_peers(true); }
+                    Err(e) => self.flash(&e),
+                }
+            }
+            "peer_invite" => {
+                if !self.peers_ensure_on() { return true; }
+                match self.call(json!({"cmd": "peer-invite"})) {
+                    Ok(v) => {
+                        let inv = v["invite"].as_str().unwrap_or("").to_string();
+                        let copied = clip_set(&inv).is_ok();
+                        let items = vec![
+                            Item::new(inv.clone(), if copied { "copiado · Enter copia de novo" } else { "Enter copia" }, "peer_copy", vec![json!(inv)]),
+                            Item::new("Voltar", "", "peers", vec![]),
+                        ];
+                        self.overlay = Some(Overlay::list("Convite (vale 10 min, uma vez). No outro: Computadores > Usar convite, ou duck peer join '<convite>'", items));
+                    }
+                    Err(e) => self.flash(&e),
+                }
+            }
+            "peer_copy" => match clip_set(&s(0)) {
+                Ok(_) => self.flash("Copiado"),
+                Err(e) => self.flash(&format!("clipboard: {e}")),
+            },
+            "peer_join_ask" => {
+                self.overlay = Some(Overlay::prompt("Convite do outro computador (duck:nome@...#...)", "", "peer_join", vec![]));
+            }
+            "peer_join" => {
+                let inv = match peer::parse_invite(&s(0)) { Ok(i) => i, Err(e) => { self.flash(&e); return true } };
+                self.flash(&format!("Conectando com {}…", inv.name));
+                self.peers_bg("peer_join_done", vec![], move || {
+                    let cfg = config::load_config().0;
+                    let mut errs = vec![];
+                    for addr in &inv.addrs {
+                        match peer::pair_request(addr, Some(&inv.code), Some(&inv.key_prefix), |_| {}) {
+                            Ok(p) if p.accepted => {
+                                let name = peer::free_name(&cfg.peers, &p.name, &p.key);
+                                let mut addrs = vec![addr.clone()];
+                                addrs.extend(inv.addrs.iter().filter(|x| *x != addr).cloned());
+                                peer::save(&name, &addrs, &p.key)?;
+                                return Ok(json!({"name": name}));
+                            }
+                            Ok(_) => errs.push(format!("{addr}: convite não aceito")),
+                            Err(e) => errs.push(format!("{addr}: {e}")),
+                        }
+                    }
+                    Err(errs.join(" · "))
+                });
+            }
+            "peer_join_done" => {
+                let r = args.first().cloned().unwrap_or(Value::Null);
+                match r["error"].as_str() {
+                    None => {
+                        let _ = self.call(json!({"cmd": "peers-reload"}));
+                        self.cfg = config::load_config().0;
+                        self.flash(&format!("Conectado com {}", r["name"].as_str().unwrap_or("?")));
+                    }
+                    Some(e) => self.flash(&Self::peers_hint(e)),
+                }
+                if self.overlay.as_ref().is_some_and(|o| o.peers) { self.open_peers(true); }
             }
             "peer_rename" => {
                 let cur = self.cfg.peer_name.clone();
@@ -207,7 +376,7 @@ impl Gui {
             "peer_rename_set" => {
                 let n = peer::clean_name(&s(0));
                 match config::set_local_setting("peer.name", &format!("'{n}'")) {
-                    Ok(_) => { self.cfg.peer_name = n.clone(); self.flash(&format!("Nome: {n}. Os ja pareados continuam te chamando pelo nome antigo ate parear de novo.")); self.open_peers(false); }
+                    Ok(_) => { self.cfg.peer_name = n.clone(); self.flash(&format!("Nome: {n}. Os já pareados continuam te chamando pelo nome antigo até parear de novo.")); self.open_peers(false); }
                     Err(e) => self.flash(&e),
                 }
             }
@@ -216,19 +385,22 @@ impl Gui {
                 let mut ports = vec![peer::DEFAULT_PORT];
                 let p = peer::port_of(&self.cfg.peer_listen);
                 if !self.cfg.peer_listen.is_empty() && p != ports[0] { ports.push(p); }
-                self.peers_bg("peer_discover_done", vec![], move || Ok(json!(peer::discover(&ports, Duration::from_millis(1500)))));
+                self.peers_bg("peer_discover_done", vec![], move || {
+                    let found = peer::discover(&ports, Duration::from_millis(1500));
+                    // Pareado achado num endereco novo: guarda (o server relê abaixo).
+                    if !peer::learn_from_discovery(&found).is_empty() { if let Ok(mut c) = crate::proto::Conn::connect() { let _ = c.call(json!({"cmd": "peers-reload"})); } }
+                    Ok(json!(found))
+                });
                 self.open_peers(false);
             }
             "peer_discover_done" => {
                 self.peer_status.remove("\u{0}busca");
                 self.peer_found = args.first().and_then(|v| v.as_array().cloned());
-                if self.peer_found.as_ref().is_some_and(|f| f.is_empty()) {
-                    self.flash("Nenhum Duck respondeu. O outro precisa estar escutando (painel Computadores) e, no Windows, com a porta UDP 7878 liberada.");
-                }
+                self.cfg.peers = config::load_config().0.peers;
                 if self.overlay.as_ref().is_some_and(|o| o.peers) { self.open_peers(false); }
             }
             "peer_connect_ask" => {
-                self.overlay = Some(Overlay::prompt("IP do outro computador (ex.: 192.168.0.20 ou 192.168.0.20:7878)", "", "peer_connect_ip", vec![]));
+                self.overlay = Some(Overlay::prompt("IP do outro computador (ex.: 192.168.0.20, 100.64.0.5:7878 ou relay:host:7879 com a chave)", "", "peer_connect_ip", vec![]));
             }
             "peer_connect_ip" => {
                 let ip = s(0).trim().to_string();
@@ -238,22 +410,37 @@ impl Gui {
             }
             "peer_connect" => {
                 let (pname, addr) = (s(0), s(1));
-                let Some(my_addr) = self.peers_ensure_on() else { return true };
-                let me = self.cfg.peer_name.clone();
+                if !self.peers_ensure_on() { return true; }
                 let label = if pname.is_empty() { addr.clone() } else { pname.clone() };
                 self.flash(&format!("Pedindo conexão a {label}…"));
                 let a = addr.clone();
-                self.peers_bg("peer_connect_done", vec![json!(label)], move || peer::pair_request(&me, &my_addr, &a, None));
+                self.peers_bg("peer_connect_done", vec![json!(label), json!(addr)], move || {
+                    // Registra o pedido no server logo apos o handshake: ele
+                    // consulta o outro ate aceitar e recebe o aviso de aceite.
+                    let reg = |k: &str| { if let Ok(mut c) = crate::proto::Conn::connect() { let _ = c.call(json!({"cmd": "peer-pending", "key": k, "addr": a})); } };
+                    let p = peer::pair_request(&a, None, None, reg)?;
+                    Ok(json!({"name": p.name, "key": p.key, "confirm": p.confirm, "accepted": p.accepted}))
+                });
                 self.open_peers(false);
             }
             "peer_connect_done" => {
-                let r = args.get(1).cloned().unwrap_or(Value::Null);
+                let r = args.get(2).cloned().unwrap_or(Value::Null);
                 match r["error"].as_str() {
+                    None if r["accepted"] == true => {
+                        let cfg = config::load_config().0;
+                        let (k, n) = (r["key"].as_str().unwrap_or(""), r["name"].as_str().unwrap_or("duck"));
+                        let name = peer::free_name(&cfg.peers, n, k);
+                        let _ = peer::save(&name, &[s(1)], k);
+                        let _ = self.call(json!({"cmd": "peer-pending-cancel", "key": k}));
+                        let _ = self.call(json!({"cmd": "peers-reload"}));
+                        self.cfg = config::load_config().0;
+                        self.flash(&format!("Já estavam pareados: {name}"));
+                    }
                     None => {
-                        // O nome de verdade vem na resposta (por IP ainda nao sabiamos).
-                        let n = r["name"].as_str().map(String::from).unwrap_or_else(|| s(0));
-                        let code = peer::confirm_code(&peer::self_token());
-                        self.peer_status.insert("\u{0}espera".into(), n.clone());
+                        let n = r["name"].as_str().unwrap_or("?").to_string();
+                        let code = r["confirm"].as_str().unwrap_or("?").to_string();
+                        self.peer_info.insert(format!("\u{0}confirm:{}", r["key"].as_str().unwrap_or("")), json!(code));
+                        if let Ok(v) = self.call(json!({"cmd": "peers-state"})) { self.peer_state = v; }
                         self.flash(&format!("Pedido enviado a {n}. Lá deve aparecer o número {code}: aceite só se for igual."));
                     }
                     Some(e) => self.flash(&format!("{}: {}", s(0), Self::peers_hint(e))),
@@ -261,57 +448,193 @@ impl Gui {
                 if self.overlay.as_ref().is_some_and(|o| o.peers) { self.open_peers(false); }
             }
             "peer_wait_cancel" => {
-                // So esquece a espera daqui; o pedido la expira quando alguem negar.
-                self.peer_status.remove("\u{0}espera");
+                let _ = self.call(json!({"cmd": "peer-pending-cancel", "key": s(0)}));
+                if let Ok(v) = self.call(json!({"cmd": "peers-state"})) { self.peer_state = v; }
                 self.open_peers(false);
+            }
+            "peer_ask" => {
+                let (id, kind, text) = (args.first().cloned().unwrap_or(json!(0)), s(1), s(2));
+                self.approval_dialog(id, &kind, &text);
             }
             "peer_accept" => {
                 let id = args.first().cloned().unwrap_or(json!(0));
                 self.builtin("approve", &[id, json!(true)]);
                 self.flash("Conectado ✓ (o outro computador foi avisado)");
             }
-            "peer_status_done" => {
-                self.peer_status.insert(s(0), s(1));
+            "peer_info_done" => {
+                let v = args.get(1).cloned().unwrap_or(Value::Null);
+                self.peer_info.insert(s(0), v);
                 if self.overlay.as_ref().is_some_and(|o| o.peers) { self.open_peers(false); }
             }
             "peer_menu" => {
                 let n = s(0);
-                let addr = self.cfg.peers.iter().find(|(p, _)| *p == n).map(|(_, a)| a.clone()).unwrap_or_default();
-                let items = vec![
-                    Item::new("Testar conexão", addr.clone(), "peer_test", vec![json!(n)]),
-                    Item::new("Mandar mensagem de teste para o agente de lá", format!("duck msg {n} \"...\""), "peer_msg", vec![json!(n)]),
-                    Item::new("Remover", "esquece o endereço e o token deste lado", "peer_remove", vec![json!(n)]),
-                    Item::new("Voltar", "", "peers", vec![]),
+                let addrs = peer::addrs_of(&n);
+                let legacy = peer::key_of(&n).is_none();
+                let mut items = vec![
+                    Item::new("Agentes de lá", "lista as sessões abertas e manda mensagem para uma", "peer_sessions", vec![json!(n)]),
+                    Item::new("Mandar mensagem ao agente de lá", format!("duck msg {n} \"...\" · vai para o agente da tela de lá"), "peer_msg", vec![json!(n), json!(null)]),
+                    Item::new("Enviar arquivo", "até 64 MB · lá vai para Downloads/Duck depois de aceito", "peer_file_ask", vec![json!(n)]),
+                    Item::new("Diagnosticar", "endereços, criptografia, versão e se o outro alcança este de volta", "peer_doctor", vec![json!(n)]),
+                    Item::new(format!("Endereços ({})", addrs.len()), addrs.join(", "), "peer_addrs", vec![json!(n)]),
                 ];
-                self.overlay = Some(Overlay::list(&format!("{n} · {addr}"), items));
+                if legacy || !addrs.is_empty() {
+                    let addr = addrs.iter().find(|a| !a.starts_with("relay:")).cloned().unwrap_or_default();
+                    if !addr.is_empty() {
+                        items.push(Item::new(if legacy { "Parear de novo (com criptografia)" } else { "Parear de novo" }, "pede conexão de novo pelo primeiro endereço", "peer_connect", vec![json!(n), json!(addr)]));
+                    }
+                }
+                items.push(Item::new("Remover", "esquece a chave e os endereços deste lado", "peer_remove", vec![json!(n)]));
+                items.push(Item::new("Voltar", "", "peers", vec![]));
+                let info = self.peer_info.get(&n).cloned().unwrap_or(Value::Null);
+                let title = format!("{} {n} · {}{}", os_icon(info["os"].as_str().unwrap_or("")), info["state"].as_str().unwrap_or(""),
+                    if legacy { " · sem criptografia" } else { " · cifrado" });
+                self.overlay = Some(Overlay::list(&title, items));
             }
-            "peer_test" => { self.open_peers(true); self.flash(&format!("Testando {}…", s(0))); }
+            "peer_addrs" => {
+                let n = s(0);
+                let mut items: Vec<Item> = peer::addrs_of(&n).into_iter().enumerate().map(|(i, a)| Item::new(format!("{}  {a}", i + 1),
+                    if i == 0 { "o primeiro é o que funcionou por último · Enter remove" } else { "Enter remove" }, "peer_addr_remove", vec![json!(n), json!(a)])).collect();
+                items.push(Item::new("Adicionar endereço", "ip:porta, ou relay:host:porta", "peer_addr_ask", vec![json!(n)]));
+                items.push(Item::new("Voltar", "", "peer_menu", vec![json!(n)]));
+                self.overlay = Some(Overlay::list(&format!("Endereços de {n} (tenta na ordem; os novos aparecem sozinhos quando ele fala daqui)"), items));
+            }
+            "peer_addr_ask" => {
+                self.overlay = Some(Overlay::prompt(&format!("Endereço novo de {}", s(0)), "", "peer_addr_add", vec![json!(s(0))]));
+            }
+            "peer_addr_add" | "peer_addr_remove" => {
+                let (n, a) = (s(0), s(1).trim().to_string());
+                let mut list = peer::addrs_of(&n);
+                if name == "peer_addr_add" {
+                    if a.is_empty() { return true; }
+                    let a = if a.contains(':') { a } else { format!("{a}:{}", peer::DEFAULT_PORT) };
+                    if !list.contains(&a) { list.push(a); }
+                } else {
+                    if list.len() <= 1 { self.flash("Precisa ficar pelo menos um endereço (ou Remover o computador)"); return true; }
+                    list.retain(|x| *x != a);
+                }
+                match peer::save_addrs(&n, &list) {
+                    Ok(_) => { let _ = self.call(json!({"cmd": "peers-reload"})); self.cfg = config::load_config().0; self.builtin("peer_addrs", &[json!(n)]); }
+                    Err(e) => self.flash(&e),
+                }
+            }
+            "peer_doctor" => {
+                let n = s(0);
+                self.flash(if n.is_empty() { "Diagnosticando…" } else { "Diagnosticando (pode levar alguns segundos)…" });
+                let who = n.clone();
+                self.peers_bg("peer_doctor_done", vec![json!(n)], move || {
+                    let cs = crate::cli::diagnose((!who.is_empty()).then_some(who.as_str()));
+                    Ok(json!(cs.into_iter().map(|c| json!({"ok": c.ok, "text": c.text})).collect::<Vec<_>>()))
+                });
+            }
+            "peer_doctor_done" => {
+                let n = s(0);
+                let r = args.get(1).cloned().unwrap_or(Value::Null);
+                if let Some(e) = r["error"].as_str() { self.flash(e); return true; }
+                let mut items: Vec<Item> = r.as_array().into_iter().flatten().map(|c| {
+                    let t = c["text"].as_str().unwrap_or("").to_string();
+                    let m = match c["ok"].as_bool() { Some(true) => "✓", Some(false) => "✗", None => "!" };
+                    // Linha com comando: Enter copia o comando.
+                    let cmd = t.split_once("Libere com: ").map(|(_, c)| c.to_string());
+                    match cmd {
+                        Some(c) => Item::new(format!("{m}  {t}"), "Enter copia o comando", "peer_copy", vec![json!(c)]),
+                        None => Item::new(format!("{m}  {t}"), "", "peer_copy", vec![json!(t)]),
+                    }
+                }).collect();
+                items.push(Item::new("Voltar", "", if n.is_empty() { "peers" } else { "peer_menu" }, if n.is_empty() { vec![] } else { vec![json!(n)] }));
+                self.overlay = Some(Overlay::list(&format!("Diagnóstico{}", if n.is_empty() { " deste computador".to_string() } else { format!(" · {n}") }), items));
+            }
+            "peer_sessions" => {
+                let n = s(0);
+                self.flash(&format!("Lendo os agentes de {n}…"));
+                let who = n.clone();
+                self.peers_bg("peer_sessions_done", vec![json!(n)], move || {
+                    let (v, _) = peer::request(&who, &json!({"sessions": 1}))?;
+                    if v["ok"].as_bool() == Some(true) { Ok(v) } else { Err(v["error"].as_str().unwrap_or("recusou").to_string()) }
+                });
+            }
+            "peer_sessions_done" => {
+                let n = s(0);
+                let r = args.get(1).cloned().unwrap_or(Value::Null);
+                if let Some(e) = r["error"].as_str() { self.flash(&format!("{n}: {}", Self::peers_hint(e))); return true; }
+                let mut items: Vec<Item> = r["sessions"].as_array().into_iter().flatten().map(|x| {
+                    let label = x["tab"].as_str().filter(|t| !t.is_empty()).or(x["title"].as_str()).unwrap_or("?");
+                    Item::new(format!("{}  {label}", match x["state"].as_str() { Some("working") => "◐", Some("blocked") => "✋", _ => "●" }),
+                        format!("{} · {} · pane {} · Enter: mandar mensagem", x["dir"].as_str().unwrap_or(""), x["state"].as_str().unwrap_or(""), x["id"]),
+                        "peer_msg", vec![json!(n), x["id"].clone()])
+                }).collect();
+                if items.is_empty() { items.push(Item::new("Nenhum agente aberto lá", "", "", vec![])); }
+                items.push(Item::new("Voltar", "", "peer_menu", vec![json!(n)]));
+                self.overlay = Some(Overlay::list(&format!("Agentes de {n}"), items));
+            }
             "peer_msg" => {
-                self.overlay = Some(Overlay::prompt(&format!("Mensagem para o agente de {}", s(0)), "Teste do Duck: responda só \"ok, recebi\".", "peer_msg_send", vec![json!(s(0))]));
+                let to = args.get(1).cloned().unwrap_or(Value::Null);
+                let title = if to.is_null() { format!("Mensagem para o agente de {}", s(0)) } else { format!("Mensagem para o pane {} de {}", to, s(0)) };
+                self.overlay = Some(Overlay::prompt(&title, "Teste do Duck: responda só \"ok, recebi\".", "peer_msg_send", vec![json!(s(0)), to]));
             }
             "peer_msg_send" => {
-                let (n, text) = (s(0), s(1));
+                let n = s(0);
+                let to = args.get(1).cloned().unwrap_or(Value::Null);
+                let text = s(2);
                 if text.trim().is_empty() { return true; }
                 let out = match self.call(json!({"cmd": "peer-out", "peer": n, "text": text})) { Ok(v) => v, Err(e) => { self.flash(&e); return true } };
-                let Some(token) = crate::secret::get(&format!("peer/{n}")) else { self.flash(&format!("Sem o token de {n}: pareie de novo")); return true };
-                let req = json!({"token": token.trim(), "from": out["from"], "conv": out["conv"], "hops": out["hops"], "to": out["to"], "reply_pane": out["reply_pane"], "text": out["text"]});
-                let addr = out["addr"].as_str().unwrap_or("").to_string();
+                let to = if to.is_null() { out["to"].clone() } else { to };
+                let req = json!({"msg": 1, "conv": out["conv"], "hops": out["hops"], "to": to, "reply_pane": out["reply_pane"], "text": out["text"]});
+                let who = n.clone();
                 self.peers_bg("peer_msg_done", vec![json!(n)], move || {
-                    let v = peer::send(&addr, &req)?;
+                    let (v, _) = peer::request(&who, &req)?;
                     if v["ok"].as_bool() == Some(true) { Ok(v) } else { Err(v["error"].as_str().unwrap_or("recusou").to_string()) }
                 });
                 self.flash(&format!("Enviando para {n}…"));
             }
-            "peer_msg_done" => {
+            "peer_msg_done" | "peer_file_done" => {
                 let r = args.get(1).cloned().unwrap_or(Value::Null);
+                let what = if name == "peer_file_done" { "Arquivo" } else { "Mensagem" };
                 match r["error"].as_str() {
-                    None if r["approval"].as_bool() == Some(true) => self.flash(&format!("Chegou em {}: espera aprovar lá", s(0))),
-                    None => self.flash(&format!("Entregue ao agente de {}", s(0))),
+                    None if r["approval"].as_bool() == Some(true) => self.flash(&format!("{what} chegou em {}: espera aprovar lá", s(0))),
+                    None => self.flash(&format!("{what} entregue em {}", s(0))),
                     Some(e) => self.flash(&format!("{}: {}", s(0), Self::peers_hint(e))),
                 }
             }
+            "peer_file_ask" => {
+                self.overlay = Some(Overlay::prompt(&format!("Arquivo para {} (caminho completo)", s(0)), "", "peer_file_send", vec![json!(s(0))]));
+            }
+            "peer_file_send" => {
+                let (n, path) = (s(0), s(1).trim().trim_matches(['"', '\'']).to_string());
+                if path.is_empty() { return true; }
+                self.flash(&format!("Enviando {path} para {n}…"));
+                let who = n.clone();
+                self.peers_bg("peer_file_done", vec![json!(n)], move || {
+                    use base64::Engine;
+                    let data = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+                    if data.len() > 64 << 20 { return Err("máximo 64 MB".into()); }
+                    let fname = std::path::Path::new(&path).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| "arquivo".into());
+                    let req = json!({"file": 1, "name": fname, "data": base64::engine::general_purpose::STANDARD.encode(&data)});
+                    let (v, _) = peer::request(&who, &req)?;
+                    if v["ok"].as_bool() == Some(true) { Ok(v) } else { Err(v["error"].as_str().unwrap_or("recusou").to_string()) }
+                });
+            }
+            "peer_conv_menu" => {
+                let (c, p) = (s(0), s(1));
+                let items = vec![
+                    Item::new("Encerrar a conversa", "mensagens novas dela são recusadas dos dois lados", "peer_conv_close", vec![json!(c)]),
+                    Item::new("Voltar", "", "peers", vec![]),
+                ];
+                self.overlay = Some(Overlay::list(&format!("Conversa {c} com {p}"), items));
+            }
+            "peer_conv_close" => {
+                match self.call(json!({"cmd": "conv-close", "conv": s(0)})) {
+                    Ok(_) => { self.flash(&format!("Conversa {} encerrada", s(0))); self.open_peers(true); }
+                    Err(e) => self.flash(&e),
+                }
+            }
             "peer_remove" => match peer::remove(&s(0)) {
-                Ok(_) => { self.peer_status.remove(&s(0)); self.flash(&format!("{} removido", s(0))); }
+                Ok(_) => {
+                    let _ = self.call(json!({"cmd": "peers-reload"}));
+                    self.cfg = config::load_config().0;
+                    self.peer_info.remove(&s(0));
+                    self.flash(&format!("{} removido", s(0)));
+                    self.open_peers(false);
+                }
                 Err(e) => self.flash(&e),
             },
             "peer_trust" => {
