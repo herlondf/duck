@@ -11,6 +11,7 @@
 //!   duck hook                                       hook do Claude Code
 //!   duck doctor | run | fleet | mcp | view          ferramentas
 //!   duck guard install|check|scan                   barra segredo/palavra no commit e no push
+//!   duck why <pane> | queue ls|rm|up|now <pane>      estado do agente explicado; fila de recados
 //!   duck init | install | plugin                    config, boot e plugins
 
 pub mod cli;
@@ -69,6 +70,8 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("url") => cli::url(&args[1..]),
         Some("secret") => cli::secret(&args[1..]),
         Some("msg") => cli::msg(&args[1..]),
+        Some("why") => cli::why(&args[1..]),
+        Some("queue") => cli::queue(&args[1..]),
         Some("peer") => cli::peer(&args[1..]),
         Some("send-file") => cli::send_file(&args[1..]),
         Some("relay") => relay::main(&args[1..]),
@@ -77,7 +80,7 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("toast") => toast::run(args.get(1).map(String::as_str).unwrap_or("")),
         Some("--version" | "-V") => { println!("duck {}", env!("CARGO_PKG_VERSION")); 0 }
         Some("--help" | "-h") => {
-            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan | msg <peer>[/aba] [--to aba] texto | send-file <peer> <arq> | peer list|find|connect|invite|join|doctor|sessions | relay | update [--check|--release|--source]");
+            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan | why <pane> | queue ls|add|rm|up|now <pane> | msg <peer>[/aba] [--to aba] texto | send-file <peer> <arq> | peer list|find|connect|invite|join|doctor|sessions | relay | update [--check|--release|--source]");
             0
         }
         _ => {

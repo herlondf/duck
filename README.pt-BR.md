@@ -156,7 +156,7 @@ Windows.
 | `Ctrl+Shift+S` / `Ctrl+Alt+N` | Trocar / criar workspace |
 | `Ctrl+Alt+M` | Mover a aba para outro workspace |
 | `Ctrl+Shift+A` | Agent Manager: todos os agentes numa grade ao vivo |
-| `Ctrl+Shift+I` / `Ctrl+Shift+Y` | Painel do agente / linha do tempo da sessão |
+| `Ctrl+Shift+I` / `Ctrl+Shift+Y` | Painel dos agentes (todos, aprovar, fila) / linha do tempo da sessão |
 | `Ctrl+Shift+E` | Corrigir com agente o último comando que falhou |
 | `Ctrl+Shift+Enter` | Editor de comando em várias linhas (desfazer, seleção) |
 | `Ctrl+,` | Configurações: temas, sliders, shaders, fontes |
@@ -165,6 +165,34 @@ Embaixo ficam um badge por extensão (Sistema, Agentes, Azure…; clique abre o
 painel) e a barra com os atalhos principais. Tudo se configura em
 `~/.duck.lua`; veja o [duck.example.lua](duck.example.lua), que traz exemplos
 comentados de todas as extensões.
+
+### Agentes
+
+Cada agente fica num de quatro estados, com forma diferente além da cor:
+▲ pede aprovação, ✓ terminou e ninguém viu ainda, ◉ trabalhando, ○ parado.
+"Terminou" vira "parado" quando você olha o pane; até lá a aba e o workspace
+(barra lateral, chip do workspace e seletor) ficam marcados.
+`Ctrl+Shift+I` abre o painel dos agentes: todos os do workspace (`t` mostra
+todos os workspaces), agrupados pela conta do Claude, com o uso de 5h/7d
+quando a extensão Uso do Claude está ligada. Com o painel em foco: `Enter`
+vai para o pane, `y`/`n` aprovam ou negam, `m` manda recado, `b`/`w`/`d`/`i`/`a`
+filtram, `/` busca, `Tab` anda pela fila de recados (`x` cancela, `u` sobe,
+`e` entrega agora), `c` recolhe em bolinhas, `Esc` devolve o teclado.
+
+Pelo shell: `duck why <pane>` explica o estado (hook ou heurística, último
+evento, glifo do título, última saída, pergunta na tela, fila), e `duck queue
+ls|add|rm|up|now <pane> [n]` lista e edita os recados na fila; o `now`
+entrega na hora, mesmo com o agente trabalhando.
+
+**Qualquer programa informa o próprio estado** com um OSC, sem hook:
+
+```sh
+printf '\e]7501;state=working;app=aider\a'             # working, blocked, done, idle, none
+printf '\e]7501;state=blocked;msg=rodar as migrations?\a' # msg= aparece no painel (vai até o fim)
+```
+
+Como os hooks do Claude Code, ele vale mais que a heurística (por 10 minutos
+depois do último aviso); `state=none` tira o agente do pane.
 
 ## Extensões
 

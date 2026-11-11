@@ -142,7 +142,8 @@ pub struct Agent {
     pub name: String,
     pub state: String,
     pub since: u64,
-    /// "hook" (o agente avisou) ou "auto" (heuristica). Hook manda.
+    /// "hook" (o agente avisou), "osc" (OSC 7501 do programa) ou "auto"
+    /// (heuristica). Hook e OSC mandam.
     pub source: String,
     pub session: Option<String>,
     pub config_dir: Option<String>,
@@ -163,6 +164,17 @@ pub struct Agent {
     pub prompt: Option<String>,
     #[serde(default)]
     pub step: Option<String>,
+    /// Texto do estado: o pedido de aprovacao (Bash(npm test)) ou o `msg=` do OSC 7501.
+    #[serde(default)]
+    pub msg: Option<String>,
+    /// Ultimo evento do hook (PreToolUse, Stop...) ou "osc", e quando (epoch).
+    #[serde(default)]
+    pub event: Option<String>,
+    #[serde(default)]
+    pub event_at: Option<u64>,
+    /// Quando passou a done: o `wait --state done` vale mesmo se ja virou idle (visto).
+    #[serde(default)]
+    pub done_at: Option<u64>,
     #[serde(skip)]
     pub hook_at: Option<Instant>,
 }
@@ -728,6 +740,7 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
     let mut finished: Option<u64> = None;
     let mut done_cmd: Option<Value> = None;
     let mut had_prompt_marks = false;
+    let mut agent_osc: Vec<AgentOsc> = Vec::new();
     for (end, ev) in osc_events(data) {
         p.advance(&data[pos..end]);
         pos = end;
@@ -735,6 +748,8 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
             Osc::Cwd(c) => p.cwd = c,
             Osc::Notify => if !seen && !replay { p.attention = true },
             Osc::Progress(st, v) => p.progress = (st != 0).then_some((st, v)),
+            // O replay e saida velha: o estado de agora nao vem dele.
+            Osc::Agent(a) => if !replay { agent_osc.push(a) },
             Osc::Prompt => {
                 had_prompt_marks = true;
                 // Prompt novo = nenhum app no controle. Um TUI que saiu sem
@@ -806,6 +821,10 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
         m.history.push(serde_json::from_str(&line).unwrap_or(h));
         if m.history.len() > 50_000 { m.history.drain(..10_000); }
     }
+    for a in agent_osc {
+        set_state(&mut m, id, &a.state, a.app.as_deref(), "osc");
+        if let Some(ag) = m.panes.get_mut(&id).and_then(|p| p.agent.as_mut()) { if a.msg.is_some() { ag.msg = a.msg; } }
+    }
     let Some(p) = m.panes.get_mut(&id) else { return true };
     if let Some(ms) = finished {
         if !seen { p.attention = true; }
@@ -815,7 +834,31 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
     true
 }
 
-enum Osc { Cwd(String), Notify, Progress(u8, u8), Prompt, InputStart, CmdStart, CmdEnd(i32) }
+enum Osc { Cwd(String), Notify, Progress(u8, u8), Prompt, InputStart, CmdStart, CmdEnd(i32), Agent(AgentOsc) }
+
+/// OSC 7501: o programa do pane diz o proprio estado de agente.
+/// `ESC ] 7501 ; state=working ; app=aider ; msg=lendo arquivos BEL`.
+#[derive(Debug, PartialEq)]
+struct AgentOsc { state: String, app: Option<String>, msg: Option<String> }
+
+/// Corpo depois de "7501;". `msg=` vai ate o fim (pode ter ';').
+fn parse_agent_osc(body: &str) -> Option<AgentOsc> {
+    let (mut state, mut app, mut msg) = (None, None, None);
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (part, tail) = rest.split_once(';').unwrap_or((rest, ""));
+        let (k, v) = part.split_once('=').unwrap_or((part, ""));
+        match k.trim() {
+            "msg" => { msg = Some(clean(rest.split_once('=').map(|x| x.1).unwrap_or(""), 200)); break; }
+            "state" => state = Some(v.trim().to_lowercase()),
+            "app" => app = Some(clean(v.trim(), 40)),
+            _ => {}
+        }
+        rest = tail;
+    }
+    let state = state.filter(|s| ["working", "blocked", "done", "idle", "none"].contains(&s.as_str()))?;
+    Some(AgentOsc { state, app: app.filter(|a| !a.is_empty()), msg: msg.filter(|m| !m.trim().is_empty()) })
+}
 
 /// Acha os OSC de interesse e devolve (fim da sequencia, evento).
 /// ponytail: sequencia partida entre dois reads se perde; o shell reemite a
@@ -847,6 +890,8 @@ fn osc_events(data: &[u8]) -> Vec<(usize, Osc)> {
                 let st = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0u8);
                 let pct = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0u8);
                 Some(Osc::Progress(st, pct.min(100)))
+            } else if let Some(r) = body.strip_prefix("7501;") {
+                parse_agent_osc(r).map(Osc::Agent)
             } else if body.starts_with("9;") || body.starts_with("777;notify") {
                 Some(Osc::Notify)
             } else if let Some(k) = body.strip_prefix("133;") {
@@ -1715,11 +1760,26 @@ fn is_seen(m: &Mux, id: Id) -> bool {
     })
 }
 
-fn clear_seen(m: &mut Mux) {
+/// Pane visto: a atencao sai e o "terminou" vira "parado" (done = terminou e
+/// ninguem viu ainda, como no herdr). true = algum estado mudou.
+fn clear_seen(m: &mut Mux) -> bool {
     let ids: Vec<Id> = m.panes.keys().copied().collect();
+    let mut changed = false;
     for id in ids {
-        if is_seen(m, id) { if let Some(p) = m.panes.get_mut(&id) { p.attention = false; } }
+        if !is_seen(m, id) { continue; }
+        let Some(p) = m.panes.get_mut(&id) else { continue };
+        p.attention = false;
+        if p.agent.as_mut().is_some_and(mark_seen) { changed = true; emit(m, "agent-state-changed", id); }
     }
+    changed
+}
+
+/// done visto vira idle. true = mudou.
+fn mark_seen(a: &mut Agent) -> bool {
+    if a.state != "done" { return false; }
+    a.state = "idle".into();
+    a.since = now_secs();
+    true
 }
 
 fn set_state(m: &mut Mux, id: Id, state: &str, name: Option<&str>, source: &str) {
@@ -1731,11 +1791,15 @@ fn set_state(m: &mut Mux, id: Id, state: &str, name: Option<&str>, source: &str)
     }
     let a = p.agent.get_or_insert_with(|| Agent { name: name.unwrap_or("agent").into(), ..Default::default() });
     if let Some(n) = name { a.name = n.into(); }
-    if source == "hook" { a.hook_at = Some(Instant::now()); }
+    // Hook e OSC 7501 vem do proprio agente: a heuristica espera.
+    if source == "hook" || source == "osc" { a.hook_at = Some(Instant::now()); a.event_at = Some(now_secs()); }
+    if source == "osc" { a.event = Some("osc".into()); }
     a.source = source.into();
     if a.state == state { return; }
     a.state = state.into();
     a.since = now_secs();
+    a.msg = None;
+    if state == "done" { a.done_at = Some(a.since); }
     // Atencao so na passagem para blocked/done (nao a cada troca enquanto ela
     // continua marcada, senao cada working->done de novo avisava outra vez).
     let call = (state == "blocked" || state == "done") && !seen;
@@ -1926,17 +1990,14 @@ fn agent_loop(srv: Arc<Server>) {
                 continue;
             }
             if hook_fresh { continue; }
-            let screen = {
-                let rows = p.term.screen_lines() as i32;
-                (rows.saturating_sub(12)..rows).map(|l| line_text(&p.term, l)).collect::<Vec<_>>().join("\n")
-            };
+            let screen = screen_tail(p);
             // Claude Code: o titulo diz o estado (spinner = trabalhando, ✳ = parado).
             // A saida nao serve: parado, ele ainda redesenha a linha de status.
             let idle_title = p.title.starts_with('✳');
             let was_working = p.agent.as_ref().filter(|a| a.state == "working");
             // So "terminou" (com aviso) se trabalhou de verdade, nao por um repaint.
             let long_work = was_working.is_some_and(|a| now_secs().saturating_sub(a.since) >= 8);
-            let state = if BLOCKED_HINTS.iter().any(|h| screen.contains(h)) {
+            let state = if blocked_hint(&screen).is_some() {
                 "blocked"
             } else if spinner || (!idle_title && p.last_output.elapsed() < Duration::from_millis(1500)) {
                 "working"
@@ -1979,9 +2040,82 @@ fn drain_queues(m: &mut Mux) -> bool {
 /// saida ha alguns segundos e nenhuma pergunta na tela.
 fn looks_parked(p: &Pane) -> bool {
     if !p.title.starts_with('✳') || p.last_output.elapsed() < MSG_QUIET { return false; }
+    blocked_hint(&screen_tail(p)).is_none()
+}
+
+/// As 12 ultimas linhas da tela (onde aparecem as perguntas do agente).
+fn screen_tail(p: &Pane) -> String {
     let rows = p.term.screen_lines() as i32;
-    let screen = (rows.saturating_sub(12)..rows).map(|l| line_text(&p.term, l)).collect::<Vec<_>>().join("\n");
-    !BLOCKED_HINTS.iter().any(|h| screen.contains(h))
+    (rows.saturating_sub(12)..rows).map(|l| line_text(&p.term, l)).collect::<Vec<_>>().join("\n")
+}
+
+fn blocked_hint(screen: &str) -> Option<&'static str> { BLOCKED_HINTS.iter().copied().find(|h| screen.contains(h)) }
+
+/// O que o glifo do titulo diz (Claude Code: spinner braille trabalhando, ✳ parado).
+fn title_glyph(title: &str) -> (String, &'static str) {
+    let c = title.chars().next();
+    let g = c.map(String::from).unwrap_or_default();
+    match c {
+        Some(c) if ('\u{2800}'..='\u{28ff}').contains(&c) => (g, "spinner: trabalhando"),
+        Some('✳') => (g, "✳: parado"),
+        _ => (g, "sem glifo de agente"),
+    }
+}
+
+/// `duck why`: de onde vem o estado do agente do pane, com os sinais que a
+/// heuristica olha. `lines` e o mesmo em texto, para a CLI e o painel.
+fn why(p: &Pane, id: Id) -> Value {
+    let now = now_secs();
+    let ago = |s: u64| fmt_ago(now.saturating_sub(s));
+    let a = p.agent.as_ref();
+    let hint = blocked_hint(&screen_tail(p));
+    let (glyph, glyph_says) = title_glyph(&p.title);
+    let hook_age = a.and_then(|a| a.hook_at).map(|t| t.elapsed().as_secs());
+    let hook_fresh = hook_age.is_some_and(|s| s < 600);
+    let out_age = p.last_output.elapsed().as_secs();
+    let delivered = p.delivered_at.map(|t| t.elapsed().as_secs());
+    let mut lines = Vec::new();
+    match a {
+        None => lines.push("sem agente neste pane".to_string()),
+        Some(a) => {
+            lines.push(format!("{} {} ha {} (fonte: {})", a.name, a.state, ago(a.since), if a.source.is_empty() { "?" } else { &a.source }));
+            match (&a.event, a.event_at) {
+                (Some(e), Some(t)) => lines.push(format!("ultimo evento: {e} ha {}", ago(t))),
+                _ => lines.push("nenhum evento de hook/OSC (estado pela heuristica)".into()),
+            }
+            if hook_fresh { lines.push("hook/OSC recente (< 10 min): a heuristica nao mexe no estado".into()); }
+            else if a.source != "auto" { lines.push("hook/OSC antigo (> 10 min): a heuristica volta a valer".into()); }
+            if let Some(m) = &a.msg { lines.push(format!("texto: {m}")); }
+        }
+    }
+    lines.push(format!("titulo: {} ({glyph_says})", if glyph.is_empty() { "vazio".into() } else { glyph.clone() }));
+    lines.push(format!("ultima saida ha {}", fmt_ago(out_age)));
+    lines.push(match hint { Some(h) => format!("tela tem pergunta: \"{h}\""), None => "tela sem pergunta (BLOCKED_HINTS)".into() });
+    lines.push(format!("fila: {} recado(s){}", p.queue.len(), if p.ready_for_msg() { ", pronto para receber" } else { "" }));
+    if let Some(d) = delivered { lines.push(format!("ultimo recado entregue ha {}", fmt_ago(d))); }
+    json!({
+        "pane": id, "state": a.map(|a| a.state.clone()), "source": a.map(|a| a.source.clone()),
+        "since_secs": a.map(|a| now.saturating_sub(a.since)), "event": a.and_then(|a| a.event.clone()),
+        "event_secs": a.and_then(|a| a.event_at).map(|t| now.saturating_sub(t)), "hook_fresh": hook_fresh,
+        "title": p.title, "title_glyph": glyph, "title_says": glyph_says, "last_output_secs": out_age,
+        "blocked_hint": hint, "queue": p.queue.len(), "delivered_secs": delivered, "ready": p.ready_for_msg(),
+        "lines": lines,
+    })
+}
+
+fn fmt_ago(s: u64) -> String {
+    if s < 60 { format!("{s}s") } else if s < 3600 { format!("{}min", s / 60) } else if s < 86400 { format!("{}h", s / 3600) } else { format!("{}d", s / 86400) }
+}
+
+/// Fila de recados: rm (cancela), up (sobe um), now (tira para entregar ja).
+/// Devolve o recado tirado (rm/now).
+fn queue_op(q: &mut Vec<String>, op: &str, i: usize) -> Result<Option<String>, String> {
+    if i >= q.len() { return Err(format!("recado {} nao existe (fila com {})", i + 1, q.len())); }
+    match op {
+        "rm" | "now" => Ok(Some(q.remove(i))),
+        "up" => { if i > 0 { q.swap(i, i - 1); } Ok(None) }
+        _ => Err(format!("operacao de fila desconhecida: {op}")),
+    }
 }
 
 // ------------------------------------------------------------------ frames
@@ -2008,14 +2142,19 @@ fn view(m: &mut Mux, client: &str, ws: &str) {
     m.clients.entry(client.into()).or_insert(ClientView { workspace: ws.into(), focused: true }).workspace = ws.into();
 }
 
-fn tab_state(m: &Mux, t: &Tab) -> (String, bool) {
+/// O estado que mais pede voce: blocked > done (nao visto) > working > idle.
+fn worst_state(a: String, b: String) -> String {
     let rank = |s: &str| match s { "blocked" => 4, "done" => 3, "working" => 2, "idle" => 1, _ => 0 };
+    if rank(&b) > rank(&a) { b } else { a }
+}
+
+fn tab_state(m: &Mux, t: &Tab) -> (String, bool) {
     let mut best = String::new();
     let mut att = false;
     for id in t.all() {
         if let Some(p) = m.panes.get(&id) {
             att |= p.attention;
-            if let Some(a) = &p.agent { if rank(&a.state) > rank(&best) { best = a.state.clone(); } }
+            if let Some(a) = &p.agent { best = worst_state(best, a.state.clone()); }
         }
     }
     (best, att)
@@ -2191,7 +2330,7 @@ fn profile_name(dir: &str) -> String {
 
 fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> {
     let wi = client_ws(m, srv, client)?;
-    clear_seen(m);
+    if clear_seen(m) { srv.notify(); }
     let (cols, rows) = m.size;
     let area = Rect { x: 0, y: 0, w: cols.max(2), h: rows.max(2) };
     let ws = &m.workspaces[wi];
@@ -2233,6 +2372,11 @@ fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> 
         })
     }).collect();
     let workspaces: Vec<String> = m.workspaces.iter().map(|w| w.name.clone()).collect();
+    // Estado de cada workspace (o pior das abas): o seletor e a barra lateral marcam.
+    let ws_states: serde_json::Map<String, Value> = m.workspaces.iter().map(|w| {
+        let (st, att) = w.tabs.iter().map(|t| tab_state(m, t)).fold((String::new(), false), |(b, a), (s, x)| (worst_state(b, s), a || x));
+        (w.name.clone(), json!([st, att]))
+    }).collect();
     let mut counts = HashMap::from([("working", 0), ("blocked", 0), ("done", 0), ("idle", 0)]);
     for p in m.panes.values() {
         if let Some(a) = &p.agent { if let Some(c) = counts.get_mut(a.state.as_str()) { *c += 1; } }
@@ -2264,7 +2408,7 @@ fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> 
     }
     let approvals: Vec<&Approval> = m.approvals.iter().filter(|a| a.decided.is_none()).collect();
     Ok(json!({
-        "t": "frame", "workspace": ws_name, "workspaces": workspaces, "tabs": tabs,
+        "t": "frame", "workspace": ws_name, "workspaces": workspaces, "ws_states": ws_states, "tabs": tabs,
         "active_pane": active, "cols": cols, "rows": rows, "panes": panes,
         "agents": counts, "clipboard": [m.clipboard.0, m.clipboard.1],
         "closed": m.closed.len(),
@@ -2307,8 +2451,8 @@ fn target(srv: &Arc<Server>, m: &mut Mux, a: &Value) -> Result<Id, String> {
 #[derive(Clone, Copy)]
 struct Caller(Option<Id>);
 
-const READ_CMDS: [&str; 15] = ["ping", "list", "read", "states", "events", "frame", "doctor", "grep", "last-output", "wait", "last-failure", "history", "blocks", "block-output", "search-all"];
-const MUTATING_PANE: [&str; 7] = ["send", "paste", "close", "scroll", "set-state", "clear-attention", "private"];
+const READ_CMDS: [&str; 18] = ["ping", "list", "read", "states", "events", "frame", "doctor", "grep", "last-output", "wait", "last-failure", "history", "blocks", "block-output", "search-all", "agents", "why", "queue-ls"];
+const MUTATING_PANE: [&str; 10] = ["send", "paste", "close", "scroll", "set-state", "clear-attention", "private", "queue-rm", "queue-up", "queue-now"];
 
 fn is_descendant(m: &Mux, id: Id, of: Id) -> bool {
     let mut cur = Some(id);
@@ -2370,7 +2514,7 @@ fn needs_approval(m: &Mux, caller: Caller, cmd: &str, a: &Value) -> Option<Strin
                 format!("O pane {me} quer fechar o pane {t} ({title}).")
             })
         }
-        "send" | "paste" => {
+        "send" | "paste" | "queue-now" => {
             let t = arg_id(a, "pane")?;
             let busy = m.panes.get(&t).and_then(|p| p.agent.as_ref()).is_some_and(|ag| ag.state == "working");
             (t != me && busy && !is_descendant(m, t, me)).then(|| {
@@ -2697,6 +2841,50 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let p = m.panes.get_mut(&id).unwrap();
             if queue_or_deliver(p, text) { proto::ok(json!({"delivered": true})) }
             else { proto::ok(json!({"queued": p.queue.len()})) }
+        }
+        "queue-ls" => {
+            let id = target(srv, m, a)?;
+            proto::ok(json!({"pane": id, "queue": m.panes[&id].queue}))
+        }
+        "queue-rm" | "queue-up" | "queue-now" => {
+            // index 0-based; o "now" sem index entrega o primeiro.
+            let id = target(srv, m, a)?;
+            let i = a.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let p = m.panes.get_mut(&id).unwrap();
+            let op = cmd.trim_start_matches("queue-");
+            let taken = queue_op(&mut p.queue, op, i)?;
+            // Entregar agora: sem esperar o agente parar (o usuario mandou).
+            if op == "now" { if let Some(t) = &taken { deliver(p, t); p.attention = false; } }
+            proto::ok(json!({"pane": id, "queue": p.queue, "delivered": op == "now"}))
+        }
+        "why" => {
+            let id = target(srv, m, a)?;
+            proto::ok(why(&m.panes[&id], id))
+        }
+        "agents" => {
+            // Todos os agentes, de todos os workspaces (a janela filtra), com a fila e o "why".
+            let mut out = Vec::new();
+            for w in &m.workspaces {
+                for (ti, t) in w.tabs.iter().enumerate() {
+                    for id in t.all() {
+                        let Some(p) = m.panes.get(&id) else { continue };
+                        let Some(ag) = &p.agent else { continue };
+                        let tab = if !t.title.is_empty() { t.title.split('|').next().unwrap_or("").trim().to_string() } else {
+                            p.cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("").to_string()
+                        };
+                        out.push(json!({
+                            "pane": id, "workspace": w.name, "tab": if tab.is_empty() { format!("aba {}", ti + 1) } else { tab }, "tab_index": ti + 1,
+                            "profile": ag.config_dir.as_deref().map(profile_name).unwrap_or_else(|| "pessoal".into()),
+                            "name": ag.name, "state": ag.state, "since": ag.since, "source": ag.source,
+                            "step": ag.step, "msg": ag.msg, "prompt": ag.prompt,
+                            "todo": ag.todo_done.zip(ag.todo_total), "tokens": ag.context_tokens, "session_tokens": ag.session_tokens,
+                            "session": ag.session, "config_dir": ag.config_dir, "cwd": p.cwd,
+                            "queue": p.queue, "attention": p.attention, "why": why(p, id)["lines"],
+                        }));
+                    }
+                }
+            }
+            proto::ok(json!({"agents": out, "now": now_secs()}))
         }
         "record" => {
             let id = target(srv, m, a)?;
@@ -3131,6 +3319,8 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
                     }
                     if let Some(t) = arg_str(a, "prompt").map(|t| clean(&t.replace(['\n', '\r'], " "), 400)).filter(|t| !t.trim().is_empty()) { ag.prompt = Some(t); }
                     if let Some(t) = a.get("step") { ag.step = t.as_str().map(|t| clean(t, 200)).filter(|t| !t.is_empty()); }
+                    if let Some(e) = arg_str(a, "event") { ag.event = Some(clean(e, 40)); }
+                    if let Some(t) = arg_str(a, "msg").map(|t| clean(&t.replace(['\n', '\r'], " "), 200)).filter(|t| !t.trim().is_empty()) { ag.msg = Some(t); }
                 }
                 if let Some(c) = arg_str(a, "cwd") { if !c.is_empty() { p.cwd = clean(c, 1024); } }
                 // Agente no WSL aberto com `wsl` num pane do Windows: o pane passa a
@@ -3452,12 +3642,17 @@ fn wait(srv: &Arc<Server>, a: &Value) -> Result<Value, String> {
     let want: Vec<String> = arg_str(a, "state").unwrap_or("blocked,done,idle").split(',').map(String::from).collect();
     let timeout = Duration::from_secs_f64(a.get("timeout").and_then(|v| v.as_f64()).unwrap_or(600.0));
     let start = Instant::now();
+    let t0 = now_secs();
     loop {
         {
             let m = srv.lock();
             let Some(p) = m.panes.get(&id) else { return Ok(proto::ok(json!({"state": "closed"}))) };
             let st = p.agent.as_ref().map(|a| a.state.clone()).unwrap_or_default();
             if want.contains(&st) { return Ok(proto::ok(json!({"state": st}))); }
+            // Terminou e ja foi visto (virou idle) entre duas olhadas: vale como done.
+            if want.iter().any(|w| w == "done") && p.agent.as_ref().and_then(|a| a.done_at).is_some_and(|d| d >= t0) {
+                return Ok(proto::ok(json!({"state": "done"})));
+            }
         }
         if start.elapsed() > timeout { return Err("timeout".into()); }
         let g = srv.gen.lock().unwrap_or_else(|e| e.into_inner());
@@ -4250,6 +4445,66 @@ mod tests {
         assert!(matches!(&ev[1].1, Osc::Cwd(c) if c == "C:/x y"));
         assert!(matches!(ev[2].1, Osc::CmdEnd(2)));
         assert_eq!(ev[0].0, 9); // logo depois do BEL
+    }
+
+    #[test]
+    fn osc_agent_state() {
+        let ev = osc_events(b"x\x1b]7501;state=working;app=aider\x07y\x1b]7501;state=blocked;msg=rodar: a; b\x1b\\");
+        assert_eq!(ev.len(), 2);
+        assert!(matches!(&ev[0].1, Osc::Agent(a) if a.state == "working" && a.app.as_deref() == Some("aider") && a.msg.is_none()));
+        // msg vai ate o fim, com ';'.
+        assert!(matches!(&ev[1].1, Osc::Agent(a) if a.state == "blocked" && a.msg.as_deref() == Some("rodar: a; b")));
+        assert_eq!(parse_agent_osc("app=x;state=DONE"), Some(AgentOsc { state: "done".into(), app: Some("x".into()), msg: None }));
+        assert_eq!(parse_agent_osc("state=none").map(|a| a.state), Some("none".into()));
+        // Estado desconhecido ou ausente: ignorado.
+        assert_eq!(parse_agent_osc("state=dancing"), None);
+        assert_eq!(parse_agent_osc("app=x"), None);
+        assert!(osc_events(b"\x1b]7501;state=bogus\x07").is_empty());
+    }
+
+    #[test]
+    fn queue_ops() {
+        let mut q: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(queue_op(&mut q, "up", 2), Ok(None));
+        assert_eq!(q, ["a", "c", "b"]);
+        assert_eq!(queue_op(&mut q, "up", 0), Ok(None)); // o primeiro fica
+        assert_eq!(q, ["a", "c", "b"]);
+        assert_eq!(queue_op(&mut q, "rm", 1), Ok(Some("c".into())));
+        assert_eq!(queue_op(&mut q, "now", 0), Ok(Some("a".into())));
+        assert_eq!(q, ["b"]);
+        assert!(queue_op(&mut q, "rm", 5).is_err());
+        assert!(queue_op(&mut q, "xx", 0).is_err());
+    }
+
+    #[test]
+    fn done_visto_vira_idle() {
+        let mut a = Agent { state: "done".into(), since: 1, done_at: Some(1), ..Default::default() };
+        assert!(mark_seen(&mut a));
+        assert_eq!(a.state, "idle");
+        assert!(a.since > 1);
+        assert_eq!(a.done_at, Some(1)); // o wait --state done ainda ve que terminou
+        assert!(!mark_seen(&mut a));
+        for st in ["blocked", "working"] {
+            let mut a = Agent { state: st.into(), ..Default::default() };
+            assert!(!mark_seen(&mut a));
+            assert_eq!(a.state, st);
+        }
+        // Rollup: pede > terminou (nao visto) > trabalhando > parado.
+        let w = ["idle", "working", "done", "blocked", "working"].iter().fold(String::new(), |b, s| worst_state(b, s.to_string()));
+        assert_eq!(w, "blocked");
+        assert_eq!(worst_state("idle".into(), "done".into()), "done");
+        assert_eq!(worst_state("working".into(), String::new()), "working");
+    }
+
+    #[test]
+    fn why_helpers() {
+        assert_eq!(title_glyph("⠋ claude").1, "spinner: trabalhando");
+        assert_eq!(title_glyph("✳ Claude Code").1, "✳: parado");
+        assert_eq!(title_glyph("").0, "");
+        assert_eq!(blocked_hint("bla\nDo you want to proceed?"), Some("Do you want to"));
+        assert_eq!(blocked_hint("nada"), None);
+        assert_eq!(fmt_ago(40), "40s");
+        assert_eq!(fmt_ago(7200), "2h");
     }
 
     #[test]

@@ -98,6 +98,8 @@ pub fn hook() -> i32 {
         req["distro"] = json!(d);
         if !req["config_dir"].as_str().unwrap_or("").starts_with('/') { req["config_dir"] = json!(""); }
     }
+    req["event"] = json!(name);
+    if state == "blocked" { if let Some(t) = ask_text(&ev) { req["msg"] = json!(t); } }
     if name == "UserPromptSubmit" {
         if let Some(p) = ev["prompt"].as_str() { req["prompt"] = json!(p.chars().take(400).collect::<String>()); }
     }
@@ -119,6 +121,69 @@ pub fn hook() -> i32 {
     }
     if let Ok(mut c) = Conn::connect() { let _ = c.call(req); }
     0
+}
+
+/// O que o agente pede: "Bash(npm test)" (ferramenta e o essencial da entrada)
+/// ou a mensagem da Notification.
+fn ask_text(ev: &Value) -> Option<String> {
+    if let Some(tool) = ev["tool_name"].as_str() {
+        let i = &ev["tool_input"];
+        let arg = ["command", "file_path", "path", "url", "pattern", "description"].iter().find_map(|k| i[*k].as_str()).unwrap_or("");
+        let arg: String = arg.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
+        return Some(if arg.is_empty() { tool.to_string() } else { format!("{tool}({arg})") });
+    }
+    ev["message"].as_str().map(|m| m.chars().take(160).collect())
+}
+
+/// `duck why [pane]`: por que o agente do pane esta no estado que esta.
+pub fn why(args: &[String]) -> i32 {
+    let pane = args.iter().find(|a| !a.starts_with("--")).cloned().or_else(|| crate::proto::env("PANE"));
+    let Some(pane) = pane.and_then(|p| p.parse::<u64>().ok()) else { eprintln!("uso: duck why <pane>  (ou de dentro de um pane do Duck)"); return 2 };
+    let Ok(mut c) = Conn::connect() else { eprintln!("duck: server indisponivel"); return 1 };
+    match c.call(json!({"cmd": "why", "pane": pane})) {
+        Ok(v) if args.iter().any(|a| a == "--json") => { println!("{}", serde_json::to_string_pretty(&v).unwrap()); 0 }
+        Ok(v) => {
+            println!("pane {pane}");
+            for l in v["lines"].as_array().into_iter().flatten() { println!("  {}", l.as_str().unwrap_or("")); }
+            0
+        }
+        Err(e) => { eprintln!("duck: {e}"); 1 }
+    }
+}
+
+/// `duck queue ls|add|rm|up|now [pane] [n|texto]`: a fila de recados do agente.
+/// n comeca em 1 (como no `ls`). Sem pane, o $DUCK_PANE.
+pub fn queue(args: &[String]) -> i32 {
+    let usage = "uso: duck queue ls [pane] | add <pane> <texto> | rm <pane> <n> | up <pane> <n> | now <pane> [n]";
+    let Some(op) = args.first().map(String::as_str) else { eprintln!("{usage}"); return 2 };
+    let rest: Vec<&String> = args[1..].iter().filter(|a| a.as_str() != "--json").collect();
+    let pane = rest.first().and_then(|p| p.parse::<u64>().ok()).or_else(|| crate::proto::env("PANE").and_then(|p| p.parse().ok()));
+    let Some(pane) = pane else { eprintln!("{usage}"); return 2 };
+    let n = rest.get(1).and_then(|x| x.parse::<u64>().ok()).unwrap_or(1).max(1) - 1;
+    let req = match op {
+        "ls" | "list" => json!({"cmd": "queue-ls", "pane": pane}),
+        "add" => json!({"cmd": "queue", "pane": pane, "text": rest.iter().skip(1).map(|s| s.as_str()).collect::<Vec<_>>().join(" ")}),
+        "rm" | "up" | "now" => json!({"cmd": format!("queue-{op}"), "pane": pane, "index": n}),
+        _ => { eprintln!("{usage}"); return 2 }
+    };
+    let Ok(mut c) = Conn::connect() else { eprintln!("duck: server indisponivel"); return 1 };
+    match c.call(req) {
+        Ok(v) if args.iter().any(|a| a == "--json") => { println!("{}", serde_json::to_string_pretty(&v).unwrap()); 0 }
+        Ok(v) => {
+            if v["delivered"] == true { println!("entregue ao pane {pane}"); }
+            let q = v["queue"].as_array().cloned().unwrap_or_default();
+            if op == "add" && v["queued"].is_number() { println!("na fila ({})", v["queued"]); }
+            if v["queue"].is_array() {
+                if q.is_empty() { println!("fila do pane {pane} vazia"); }
+                for (i, t) in q.iter().enumerate() {
+                    let t: String = t.as_str().unwrap_or("").replace('\n', " ").chars().take(100).collect();
+                    println!("{:>3}  {t}", i + 1);
+                }
+            }
+            0
+        }
+        Err(e) => { eprintln!("duck: {e}"); 1 }
+    }
 }
 
 /// Notification de "parado esperando voce" (nao de permissao).

@@ -157,7 +157,7 @@ quick-terminal hotkey and Mica/Acrylic are Windows-only.
 | `Ctrl+Shift+S` / `Ctrl+Alt+N` | Switch / create workspace |
 | `Ctrl+Alt+M` | Move the tab to another workspace |
 | `Ctrl+Shift+A` | Agent Manager: every agent in a live grid |
-| `Ctrl+Shift+I` / `Ctrl+Shift+Y` | Agent panel / session timeline |
+| `Ctrl+Shift+I` / `Ctrl+Shift+Y` | Agents panel (all agents, approve, queue) / session timeline |
 | `Ctrl+Shift+E` | Fix the last failed command with an agent |
 | `Ctrl+Shift+Enter` | Multi-line command editor (undo, selection) |
 | `Ctrl+,` | Settings: themes, sliders, shaders, fonts |
@@ -166,6 +166,34 @@ At the bottom there is one badge per extension (System, Agents, Azure…;
 click opens the panel) and a bar with the main shortcuts. Everything is
 configurable in `~/.duck.lua`; see [duck.example.lua](duck.example.lua), which
 has commented examples for every extension. The interface is in Portuguese.
+
+### Agents
+
+Each agent is in one of four states, with a distinct shape as well as color:
+▲ asking for approval, ✓ finished and not looked at yet, ◉ working, ○ idle.
+"Finished" turns into "idle" once you look at the pane; until then the tab,
+the workspace (sidebar, workspace chip and switcher) keep the mark.
+`Ctrl+Shift+I` opens the agents panel: every agent in the workspace (`t`
+shows all workspaces), grouped by Claude account with its 5h/7d usage when
+the Claude usage extension is on. With the panel focused: `Enter` jumps to
+the pane, `y`/`n` approve or deny, `m` queues a message, `b`/`w`/`d`/`i`/`a`
+filter, `/` searches, `Tab` walks the message queue (`x` cancel, `u` move up,
+`e` deliver now), `c` collapses it into dots, `Esc` hands the keyboard back.
+
+From the shell: `duck why <pane>` explains the state (hook or heuristic, last
+event, title glyph, last output, question on screen, queue), and `duck queue
+ls|add|rm|up|now <pane> [n]` lists and edits the queued messages; `now`
+delivers right away, even while the agent works.
+
+**Any program can report its state** with an OSC escape, without hooks:
+
+```sh
+printf '\e]7501;state=working;app=aider\a'           # working, blocked, done, idle, none
+printf '\e]7501;state=blocked;msg=run migrations?\a'  # msg= is shown in the panel (goes to the end)
+```
+
+Like the Claude Code hooks, it beats the heuristic (for 10 minutes after the
+last report); `state=none` drops the agent from the pane.
 
 ## Extensions
 

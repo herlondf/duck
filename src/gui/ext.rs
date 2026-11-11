@@ -341,7 +341,7 @@ impl Gui {
         if info.manifest["builtin"] == true {
             items.push(if on { Item::new("Desativar", "tira o badge da barra", "ext_toggle", vec![json!(name), json!(false)]) }
                        else { Item::new("Ativar", "mostra o badge na barra", "ext_toggle", vec![json!(name), json!(true)]) });
-            let (label, act) = if name == "agents" { ("Abrir painel do agente", "agent_panel") } else { ("Abrir painel do sistema", "sys_panel") };
+            let (label, act) = if name == "agents" { ("Abrir painel dos agentes", "agent_panel") } else { ("Abrir painel do sistema", "sys_panel") };
             items.push(Item::new(label, "", act, vec![]));
             self.overlay = Some(Overlay::list(&format!("{} · interna do Duck", info.title), items));
             return;

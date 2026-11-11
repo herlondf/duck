@@ -25,13 +25,15 @@ use crate::proto::Conn;
 use crate::render::{lin, Layer, Quad, Renderer, TextItem};
 
 mod access;
+mod agents;
 mod ext;
 mod best;
 mod graph;
 mod peers;
 mod update;
 mod ui;
-use ui::{Ac, AgentPanel, Composer, Hit};
+use agents::AgentPanel;
+use ui::{Ac, Composer, Hit};
 
 // ------------------------------------------------------------------ frame
 
@@ -116,6 +118,8 @@ struct Approval { id: u64, kind: String, text: String }
 struct Frame {
     workspace: String,
     workspaces: Vec<String>,
+    /// Estado de cada workspace (o pior das abas) e se algo nele chama atencao.
+    #[serde(default)] ws_states: HashMap<String, (String, bool)>,
     tabs: Vec<TabInfo>,
     active_pane: u64,
     cols: u16,
@@ -1288,6 +1292,7 @@ impl Gui {
             "best_choose" => self.best_choose(n(0, 0) as usize, args.get(1).cloned().unwrap_or(Value::Null)),
             "agent_grid" => self.open_grid(),
             "agent_graph" => self.open_graph(),
+            n if n.starts_with("agents_") => self.agents_builtin(n, args),
             "queue_message" => {
                 let target = args.first().and_then(|v| v.as_u64()).unwrap_or(ap);
                 self.overlay = Some(Overlay::prompt("Recado para o agente (entregue quando ele parar)", "", "queue_send", vec![json!(target)]));
@@ -1511,7 +1516,7 @@ impl Gui {
             b("Inicio: projetos, sessoes e acoes", "home", vec![]),
             b("Modo foco (esconde abas e escurece o resto)", "focus_mode", vec![]),
             b("Barra lateral de abas: recolher/abrir", "toggle_sidebar", vec![]),
-            b("Agentes: painel lateral do agente (plano, tokens)", "agent_panel", vec![]),
+            b("Agentes: painel com todos os agentes (aprovar, recados, fila)", "agent_panel", vec![]),
             b("Caixa de entrada: o que espera você e os avisos que passaram", "inbox", vec![]),
             b("Loop: o agente trabalha até a verificação passar (testes, build)", "loop_prompt", vec![]),
             b("Loop: parar o loop do agente", "loop_stop", vec![]),
@@ -1612,7 +1617,10 @@ impl Gui {
 
     fn open_workspaces(&mut self) {
         let mut items: Vec<Item> = self.frame.workspaces.iter().map(|w| {
-            Item::new(w.clone(), if *w == self.frame.workspace { "atual" } else { "" }, "workspace", vec![json!(w)])
+            let st = self.frame.ws_states.get(w).map(|s| s.0.as_str()).unwrap_or("");
+            let roll = match st { "blocked" => "▲ agente pede", "done" => "✓ agente terminou", "working" => "◉ trabalhando", _ => "" };
+            let hint = match (*w == self.frame.workspace, roll.is_empty()) { (true, true) => "atual".to_string(), (true, false) => format!("{roll} · atual"), (false, _) => roll.to_string() };
+            Item::new(w.clone(), hint, "workspace", vec![json!(w)])
         }).collect();
         // Pastas do zoxide: escolher cria o workspace ja nela (como o
         // smart_workspace_switcher do WezTerm).
@@ -2122,6 +2130,7 @@ impl Gui {
         if self.hints.is_some() { return self.hints_key(&ev); }
         if self.overlay.is_some() { return self.overlay_key(&ev); }
         if self.copy.is_some() { return self.copy_key(&ev); }
+        if self.agent_panel.as_ref().is_some_and(|a| a.focused) && self.agents_key(&ev) { return; }
 
         let name = key_name(&ev);
         let mods = self.mods;

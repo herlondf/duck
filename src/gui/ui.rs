@@ -18,15 +18,6 @@ pub(super) struct Chrome { pub top: f32, pub bottom: f32, pub left: f32, pub rig
 #[derive(Clone)]
 pub(super) struct Hit { pub r: [f32; 4], pub action: Action }
 
-pub(super) struct AgentPanel {
-    pub pane: u64, pub name: String, pub profile: String, pub state: String,
-    pub ctx: Option<u64>, pub session_tokens: Option<u64>, pub plan: Vec<(String, String)>, pub fetched: Instant,
-    pub todo: Option<(u64, u64)>,
-    /// Arquivos mexidos na pasta do agente: (status, caminho, +, -) e a pasta.
-    pub files: Vec<(String, String, i64, i64)>,
-    pub cwd: String,
-}
-
 pub(super) struct Composer {
     pub pane: u64, pub text: Vec<char>, pub cur: usize, pub anchor: Option<usize>,
     pub undo: Vec<(Vec<char>, usize)>, pub redo: Vec<(Vec<char>, usize)>,
@@ -91,7 +82,7 @@ fn draw_preedit(l: &mut Layer, pre: &(String, Option<usize>), x0: f32, y: f32, c
 }
 
 /// Cor do avatar do perfil do agente: da config ou derivada do nome.
-fn avatar_color(theme: &Theme, ui: &config::Ui, profile: &str) -> Rgb {
+pub(super) fn avatar_color(theme: &Theme, ui: &config::Ui, profile: &str) -> Rgb {
     if let Some(c) = ui.agent_colors.get(profile) { return *c; }
     let opts = [theme.accent, theme.done, theme.working, theme.palette[5], theme.palette[6], theme.blocked];
     let h = profile.bytes().fold(7u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
@@ -221,7 +212,8 @@ impl Gui {
             top: if tb == "top" || self.custom_titlebar() { bar_h } else { 0.0 },
             bottom: tabs_h + foot_h + keys_h, tabs_h, foot_h, keys_h,
             left: if tb == "left" { if self.sidebar_collapsed { 52.0 } else { self.cfg.ui.sidebar_width } } else { 0.0 },
-            right: if self.ext_panel.is_some() || self.agent_panel.is_some() || self.sys_panel { self.ext_w } else { 0.0 },
+            right: if self.agent_panel.as_ref().is_some_and(|a| a.collapsed) { 30.0 }
+                else if self.ext_panel.is_some() || self.agent_panel.is_some() || self.sys_panel { self.ext_w } else { 0.0 },
             bar_h, margin,
         }
     }
@@ -377,6 +369,7 @@ impl Gui {
         let ext_siblings: Vec<(String, String)> = ext_view.as_ref().map(|cv| self.exts.views.iter().filter(|v| v.ext == cv.ext).map(|v| (v.key(), v.title.clone())).collect()).unwrap_or_default();
         let ext_open = self.ext_panel.clone();
         let (sys_open, agent_open) = (self.sys_panel, self.agent_panel.is_some());
+        let agent_usage = if agent_open { super::agents::usage_by_profile(&self.exts) } else { HashMap::new() };
         let chrome = self.chrome();
         let (ox, oy) = self.grid_origin();
         self.origin = (ox, oy);
@@ -389,6 +382,10 @@ impl Gui {
         let anim_on = ui.animations;
         let t_now = self.started.elapsed().as_secs_f32();
         let ws_name = self.frame.workspace.clone();
+        let ws_rank = |s: &str| match s { "blocked" => 2, "done" => 1, _ => 0 };
+        let other_ws = self.frame.ws_states.iter().filter(|(n, s)| **n != ws_name && ws_rank(&s.0) > 0)
+            .map(|(_, s)| s.0.clone()).max_by_key(|s| ws_rank(s));
+        let ws_glyph = |theme: &Theme, st: &str| match st { "blocked" => Some(("▲", theme.working)), "done" => Some(("✓", theme.done)), "working" => Some(("◉", theme.accent)), _ => None };
         let mut animating = false;
         let mut pulse = false;
         self.hits.clear();
@@ -908,12 +905,15 @@ impl Gui {
             }
             // Chip do workspace (troca de workspace).
             let wsz = 0.85;
-            let ww = r.measure(&ws_name, true, wsz) + 34.0;
+            // Outro workspace com agente pedindo ou que terminou (nao visto): o chip avisa.
+            let mark = other_ws.as_deref().and_then(|s| ws_glyph(&theme, s));
+            let ww = r.measure(&ws_name, true, wsz) + 34.0 + if mark.is_some() { 14.0 } else { 0.0 };
             let wr = [x, 7.0, ww, bar_h - 14.0];
             let hv = inside(wr, mouse);
             base.shapes.push(Shape::rect(wr[0], wr[1], wr[2], wr[3], lin(mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }), 1.0), 7.0));
             base.texts.push(TextItem { size: 0.85, ..txt(x + 8.0, (bar_h - ch * 0.85) / 2.0, "\u{f009}", theme.accent) });
             base.texts.push(uit(x + 24.0, (bar_h - ch * wsz) / 2.0, &ws_name, theme.fg, wsz));
+            if let Some((g, c)) = mark { base.texts.push(TextItem { size: 0.75, ..txt(x + ww - 20.0, (bar_h - ch * 0.75) / 2.0, g, c) }); }
             self.hits.push(Hit { r: wr, action: Action::Builtin("workspace_switch".into(), vec![]) });
             x += ww + 8.0;
             let mut rx = w;
@@ -974,12 +974,14 @@ impl Gui {
             let mut x = 8.0;
             if chrome.top == 0.0 {
                 let wsz = 0.78;
-                let ww = r.measure(&ws_name, true, wsz) + 30.0;
+                let mark = other_ws.as_deref().and_then(|s| ws_glyph(&theme, s));
+                let ww = r.measure(&ws_name, true, wsz) + 30.0 + if mark.is_some() { 14.0 } else { 0.0 };
                 let wr = [x, py, ww, ph];
                 let hv = inside(wr, mouse);
                 base.shapes.push(Shape::rect(wr[0], wr[1], wr[2], wr[3], lin(mix(theme.tab_bar, theme.fg, if hv { 0.14 } else { 0.07 }), 1.0), ph / 2.0));
                 base.texts.push(TextItem { size: 0.78, ..txt(x + 8.0, cy(0.78), "\u{f009}", theme.accent) });
                 base.texts.push(uit(x + 22.0, cy(wsz), &ws_name, theme.fg, wsz));
+                if let Some((g, c)) = mark { base.texts.push(TextItem { size: 0.7, ..txt(x + ww - 18.0, cy(0.7), g, c) }); }
                 self.hits.push(Hit { r: wr, action: Action::Builtin("workspace_switch".into(), vec![]) });
                 x += ww + 10.0;
             }
@@ -1030,7 +1032,7 @@ impl Gui {
                     bx += cwid + 4.0;
                 }
                 let action = match (key.strip_prefix("duck:"), key.split_once("/!")) {
-                    (Some(a), _) => Action::Builtin(a.into(), vec![]),
+                    (Some(a), _) => Action::Builtin(a.into(), vec![json!("toggle")]),
                     (None, Some((ext, cmd))) => Action::Builtin("ext_command".into(), vec![json!(ext), json!(cmd)]),
                     (None, None) => Action::Builtin("ext_view".into(), vec![json!(key)]),
                 };
@@ -1161,8 +1163,15 @@ impl Gui {
                 let hv = inside(rr, mouse);
                 if hv { base.shapes.push(Shape::rect(rr[0], rr[1], rr[2], rr[3], lin(mix(theme.tab_bar, theme.fg, 0.08), 1.0), 6.0)); }
                 base.texts.push(TextItem { size: 0.9, ..txt(14.0, y + (row_h - ch * 0.9) / 2.0, if cur { "\u{f07c}" } else { "\u{f07b}" }, if cur { theme.accent } else { theme.muted }) });
+                let mark = self.frame.ws_states.get(&wsn).and_then(|s| ws_glyph(&theme, &s.0));
                 if !collapsed {
-                    base.texts.push(TextItem { bold: cur, clip_right: Some(sw - 10.0), ..uit(36.0, y + (row_h - ch * 0.9) / 2.0, &wsn, if cur { theme.fg } else { theme.muted }, 0.9) });
+                    let clip = if mark.is_some() { sw - 30.0 } else { sw - 10.0 };
+                    base.texts.push(TextItem { bold: cur, clip_right: Some(clip), ..uit(36.0, y + (row_h - ch * 0.9) / 2.0, &wsn, if cur { theme.fg } else { theme.muted }, 0.9) });
+                }
+                // O pior estado do workspace: pede (▲) e terminou (✓) ficam ate alguem olhar.
+                if let Some((g, c)) = mark {
+                    let gx = if collapsed { sw - 16.0 } else { sw - 26.0 };
+                    base.texts.push(TextItem { size: 0.75, ..txt(gx, y + (row_h - ch * 0.75) / 2.0, g, c) });
                 }
                 self.hits.push(Hit { r: rr, action: Action::Builtin("workspace".into(), vec![json!(wsn)]) });
                 y += row_h + 2.0;
@@ -1227,89 +1236,10 @@ impl Gui {
             self.hits.push(Hit { r: br, action: Action::Builtin("toggle_sidebar".into(), vec![]) });
         }
 
-        // ---- painel do agente (direita)
-        if let Some(ap) = &self.agent_panel {
-            let (x0, y0, pw, ph) = (w - chrome.right, chrome.top, chrome.right, h - chrome.top - chrome.bottom);
-            base.shapes.push(Shape::rect(x0, y0, pw, ph, lin(theme.tab_bar, alpha), 0.0));
-            base.quads.push(Quad { x: x0, y: y0, w: 1.0, h: ph, color: lin(theme.border, 0.6) });
-            let mut y = y0 + 14.0;
-            let ac = avatar_color(&theme, &ui, &ap.profile);
-            draw_avatar(r, &mut base, x0 + 14.0, y, 30.0, ac, if ap.profile.is_empty() { &ap.name } else { &ap.profile });
-            base.texts.push(TextItem { bold: true, ..uit(x0 + 54.0, y - 1.0, &format!("{} · {}", ap.name, if ap.profile.is_empty() { "pessoal" } else { &ap.profile }), theme.fg, 0.95) });
-            let (sg, sc, sa) = state_glyph(&theme, &TabInfo { state: ap.state.clone(), ..Default::default() }, t_now);
-            if ap.state == "working" { pulse = true; }
-            base.texts.push(TextItem { alpha: sa, ..uit(x0 + 54.0, y + ch * 0.95, &format!("{sg} {}", state_label(&ap.state)), sc, 0.85) });
-            let xr = [x0 + pw - 30.0, y0 + 10.0, 20.0, 20.0];
-            base.texts.push(uit(xr[0] + 4.0, xr[1], "✕", if inside(xr, mouse) { theme.fg } else { theme.muted }, 0.8));
-            self.hits.push(Hit { r: xr, action: Action::Builtin("agent_panel".into(), vec![]) });
-            y += 46.0;
-            let line = |r: &mut Renderer, l: &mut Layer, y: &mut f32, k: &str, v: String| {
-                l.texts.push(uit(x0 + 16.0, *y, k, theme.muted, 0.85));
-                let vw = r.measure(&v, true, 0.85);
-                l.texts.push(uit(x0 + pw - 16.0 - vw, *y, &v, theme.fg, 0.85));
-                *y += ch * 1.2;
-            };
-            let k = |n: u64| if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) } else { format!("{}k", n / 1000) };
-            if let Some(c) = ap.ctx { line(r, &mut base, &mut y, "Contexto", format!("{} tokens", k(c))); }
-            if let Some(s) = ap.session_tokens { line(r, &mut base, &mut y, "Sessao", format!("{} tokens", k(s))); }
-            if ui.token_price > 0.0 {
-                if let Some(s) = ap.session_tokens { line(r, &mut base, &mut y, "Custo estimado", format!("US$ {:.2}", s as f64 / 1e6 * ui.token_price)); }
-            }
-            y += 8.0;
-            let (done, total) = if ap.plan.is_empty() { ap.todo.map(|(d, t)| (d as usize, t as usize)).unwrap_or((0, 0)) }
-                else { (ap.plan.iter().filter(|p| p.0 == "completed").count(), ap.plan.len()) };
-            base.texts.push(TextItem { bold: true, ..uit(x0 + 16.0, y, &format!("Plano  {done}/{total}"), theme.fg, 0.9) });
-            y += ch * 1.3;
-            if total > 0 {
-                let f = done as f32 / total as f32;
-                base.shapes.push(Shape::rect(x0 + 16.0, y - 6.0, pw - 32.0, 3.0, lin(theme.muted, 0.25), 1.5));
-                base.shapes.push(Shape::rect(x0 + 16.0, y - 6.0, (pw - 32.0) * f, 3.0, lin(theme.done, 1.0), 1.5));
-            }
-            let bottom_buttons = y0 + ph - 46.0;
-            for (st, subject) in &ap.plan {
-                if y > bottom_buttons - ch * 1.3 { break; }
-                let (g, c) = match st.as_str() { "completed" => ("\u{f058}", theme.done), "in_progress" => ("\u{f192}", theme.accent), _ => ("\u{f10c}", theme.muted) };
-                base.texts.push(TextItem { size: 0.85, ..txt(x0 + 16.0, y, g, c) });
-                base.texts.push(TextItem { clip_right: Some(x0 + pw - 12.0), ..uit(x0 + 36.0, y, subject, if st == "completed" { theme.muted } else { theme.fg }, 0.85) });
-                y += ch * 1.25;
-            }
-            if ap.plan.is_empty() { base.texts.push(uit(x0 + 16.0, y, if total > 0 { "Itens do plano nao encontrados no transcript" } else { "Sem plano (TaskCreate/TodoWrite) nesta sessao" }, theme.muted, 0.8)); y += ch * 1.25; }
-            // Arquivos mexidos no repo do agente (git), maiores mudancas primeiro.
-            if !ap.files.is_empty() && y < bottom_buttons - ch * 3.0 {
-                y += 10.0;
-                let (ta, td) = ap.files.iter().fold((0, 0), |s, f| (s.0 + f.2, s.1 + f.3));
-                base.texts.push(TextItem { bold: true, ..uit(x0 + 16.0, y, &format!("Arquivos mexidos  {}", ap.files.len()), theme.fg, 0.9) });
-                let tot = format!("+{ta} −{td}");
-                let tw = r.measure(&tot, true, 0.8);
-                base.texts.push(uit(x0 + pw - 16.0 - tw, y + 1.0, &tot, theme.muted, 0.8));
-                y += ch * 1.3;
-                for (st, path, a, d) in &ap.files {
-                    if y > bottom_buttons - ch * 1.3 { break; }
-                    let rr = [x0 + 8.0, y - 2.0, pw - 16.0, ch * 1.15];
-                    if inside(rr, mouse) { base.shapes.push(Shape::rect(rr[0], rr[1], rr[2], rr[3], lin(mix(theme.tab_bar, theme.fg, 0.08), 1.0), 5.0)); }
-                    let sc = match st.as_str() { "??" | "A" => theme.done, "D" => theme.blocked, _ => theme.working };
-                    base.texts.push(uit(x0 + 16.0, y, if st == "??" { "+" } else { st }, sc, 0.8));
-                    let nums = format!("+{a} −{d}");
-                    let nw = r.measure(&nums, true, 0.75);
-                    base.texts.push(uit(x0 + pw - 16.0 - nw, y + 1.0, &nums, theme.muted, 0.75));
-                    // Caminho longo: mostra o fim (o nome do arquivo).
-                    let shown = if path.chars().count() > 46 { format!("…{}", path.chars().rev().take(45).collect::<Vec<_>>().into_iter().rev().collect::<String>()) } else { path.clone() };
-                    base.texts.push(TextItem { clip_right: Some(x0 + pw - 24.0 - nw), ..uit(x0 + 36.0, y, &shown, theme.fg, 0.8) });
-                    let full = std::path::Path::new(&ap.cwd).join(path).to_string_lossy().to_string();
-                    self.hits.push(Hit { r: rr, action: Action::Builtin("preview_file".into(), vec![json!(full)]) });
-                    y += ch * 1.15;
-                }
-            }
-            let mut bx = x0 + 12.0;
-            for (label, act, args) in [("Linha do tempo", "agent_timeline", vec![]), ("Recado", "queue_message", vec![json!(ap.pane)]), ("Diff", "agent_diff", vec![])] {
-                let bw = r.measure(label, true, 0.8) + 18.0;
-                let br = [bx, bottom_buttons + 8.0, bw, 28.0];
-                let hv = inside(br, mouse);
-                base.shapes.push(Shape::rect(br[0], br[1], br[2], br[3], lin(if hv { theme.accent } else { mix(theme.tab_bar, theme.fg, 0.1) }, if hv { 0.35 } else { 1.0 }), 7.0));
-                base.texts.push(uit(bx + 9.0, br[1] + (28.0 - ch * 0.8) / 2.0, label, theme.fg, 0.8));
-                self.hits.push(Hit { r: br, action: Action::Builtin(act.into(), args) });
-                bx += bw + 6.0;
-            }
+        // ---- painel dos agentes (direita)
+        if let Some(ap) = self.agent_panel.as_mut() {
+            let rect = [w - chrome.right, chrome.top, chrome.right, h - chrome.top - chrome.bottom];
+            pulse |= super::agents::draw_agent_panel(ap, r, &mut base, &mut self.hits, &theme, &ui, &agent_usage, rect, mouse, alpha, t_now);
         }
 
         // ---- painel de extensao (direita)
@@ -1606,6 +1536,12 @@ impl Gui {
         if pressed && self.splash.take().is_some() { return self.redraw(); }
         if pressed && button == MouseButton::Left {
             if let (Some(dir), Some(r)) = (self.resize_edge, &self.r) { let _ = r.window.drag_resize_window(dir); return; }
+            // Painel dos agentes: clique nele traz o teclado; fora dele, devolve ao terminal.
+            if self.agent_panel.is_some() && self.overlay.is_none() {
+                let edge = self.r.as_ref().map(|r| r.width() - self.chrome().right).unwrap_or(f32::MAX);
+                let (top, bottom) = { let c = self.chrome(); (c.top, self.r.as_ref().map(|r| r.height() - c.bottom).unwrap_or(0.0)) };
+                if let Some(a) = self.agent_panel.as_mut() { a.focused = x >= edge && y > top && y < bottom; }
+            }
             // Editor de comando: clique posiciona o cursor.
             if let (Some(c), Some(r)) = (self.composer.as_mut(), &self.r) {
                 if inside(c.geom, (x, y)) {
@@ -1986,7 +1922,12 @@ impl Gui {
                 }
             }
             "agent_panel" => {
-                if self.agent_panel.take().is_none() { self.sys_panel = false; self.ext_panel = None; self.refresh_agent_panel(true); }
+                // Aberto sem foco: o atalho so traz o foco; com foco, fecha.
+                match self.agent_panel.as_mut() {
+                    Some(a) if !a.focused && args.is_empty() => a.focused = true,
+                    Some(_) => self.agent_panel = None,
+                    None => { self.sys_panel = false; self.ext_panel = None; self.refresh_agent_panel(true); }
+                }
                 self.stats.lock().unwrap().want_procs = self.sys_panel;
                 self.send_size();
             }
@@ -2239,47 +2180,36 @@ impl Gui {
 
     // -------------------------------------------------------------- paineis
 
+    /// Painel dos agentes: le todos os agentes do server (a cada 1 s com o
+    /// painel aberto) e, do selecionado, o plano e os arquivos (a cada 3 s).
     pub(super) fn refresh_agent_panel(&mut self, open: bool) {
-        if !open && self.agent_panel.as_ref().is_some_and(|a| a.fetched.elapsed() < Duration::from_secs(2)) { return; }
-        let want = self.agent_panel.as_ref().map(|a| a.pane);
-        let pick = |p: &PaneView| !p.agent.is_empty();
-        let pane = want.filter(|id| self.frame.panes.iter().any(|p| p.id == *id))
-            .or_else(|| self.active().filter(|p| pick(p)).map(|p| p.id))
-            .or_else(|| self.frame.panes.iter().find(|p| pick(p)).map(|p| p.id))
-            .or(want);
-        let Some(pane) = pane else {
-            if open { self.flash("Nenhum agente nesta aba (Ctrl+Shift+N abre um)"); }
-            return;
-        };
-        let Ok(v) = self.call(json!({"cmd": "list"})) else { return };
-        let mut found = None;
-        for w in v["workspaces"].as_array().into_iter().flatten() {
-            for t in w["tabs"].as_array().into_iter().flatten() {
-                for p in t["panes"].as_array().into_iter().flatten() {
-                    if p["id"].as_u64() == Some(pane) { found = Some(p["agent"].clone()); }
-                }
-            }
+        if !open && self.agent_panel.as_ref().is_some_and(|a| a.fetched.elapsed() < Duration::from_secs(1)) { return; }
+        let Ok(v) = self.call(json!({"cmd": "agents"})) else { return };
+        let rows: Vec<super::agents::AgentRow> = v["agents"].as_array().into_iter().flatten().map(super::agents::AgentRow::from_json).collect();
+        let active = self.frame.active_pane;
+        let ws = self.frame.workspace.clone();
+        let ap = self.agent_panel.get_or_insert_with(super::agents::AgentPanel::new);
+        if open {
+            ap.focused = true;
+            if rows.iter().any(|r| r.pane == active) { ap.pane = active; }
         }
-        let Some(a) = found.filter(|a| !a.is_null()) else {
-            if open { self.flash("Este pane nao tem agente"); }
-            return;
-        };
-        let dir = a["config_dir"].as_str().unwrap_or("").to_string();
-        let plan = a["session"].as_str().and_then(|s| find_transcript(&dir, s))
+        ap.rows = rows;
+        ap.now = v["now"].as_u64().unwrap_or(0);
+        ap.fetched = Instant::now();
+        ap.ws = ws;
+        ap.fix_sel();
+        let Some(row) = ap.selected().cloned() else { return };
+        if ap.detail_pane == row.pane && ap.detail_at.elapsed() < Duration::from_secs(3) { return; }
+        ap.detail_pane = row.pane;
+        ap.detail_at = Instant::now();
+        let plan = row.session.as_deref().and_then(|s| find_transcript(&row.config_dir, s))
             .map(|p| crate::cli::transcript_plan(&p.to_string_lossy())).unwrap_or_default();
-        let profile = if dir.is_empty() { String::new() } else {
-            let b = dir.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("").trim_start_matches(".claude").trim_start_matches(['-', '_']).to_string();
-            if b.is_empty() { "pessoal".into() } else { b }
-        };
-        let ch = self.call(json!({"cmd": "changes", "pane": pane})).unwrap_or_default();
+        let ch = self.call(json!({"cmd": "changes", "pane": row.pane})).unwrap_or_default();
         let files = ch["list"].as_array().into_iter().flatten().filter_map(|f| Some((f[0].as_str()?.to_string(), f[1].as_str()?.to_string(), f[2].as_i64().unwrap_or(0), f[3].as_i64().unwrap_or(0)))).collect();
-        self.agent_panel = Some(AgentPanel {
-            files, cwd: ch["cwd"].as_str().unwrap_or("").to_string(),
-            pane, name: a["name"].as_str().unwrap_or("agente").to_string(), profile,
-            state: a["state"].as_str().unwrap_or("").to_string(), ctx: a["context_tokens"].as_u64(),
-            session_tokens: a["session_tokens"].as_u64(), plan, fetched: Instant::now(),
-            todo: a["todo_done"].as_u64().zip(a["todo_total"].as_u64()),
-        });
+        if let Some(ap) = self.agent_panel.as_mut() {
+            ap.plan = plan;
+            ap.files = files;
+        }
     }
 
     /// Linha do tempo da sessao do agente: pedidos, ferramentas, arquivos, erros.
@@ -2898,16 +2828,17 @@ struct TabCtx<'a> { theme: &'a Theme, mouse: (f32, f32), t: f32, drag: Option<(u
 
 fn state_glyph(theme: &Theme, t: &TabInfo, now: f32) -> (&'static str, Rgb, f32) {
     match t.state.as_str() {
-        "working" => ("●", theme.accent, 0.35 + 0.65 * (now * 3.2).sin().abs()),
-        "blocked" => ("●", theme.working, 1.0),
+        // Forma diferente por estado (nao so a cor): ◉ trabalhando, ▲ pede, ✓ terminou, ○ parado.
+        "working" => ("◉", theme.accent, 0.35 + 0.65 * (now * 3.2).sin().abs()),
+        "blocked" => ("▲", theme.working, 1.0),
         "done" => ("✓", theme.done, 1.0),
         _ if t.attention => ("●", theme.blocked, 1.0),
-        "idle" => ("●", theme.idle, 0.5),
+        "idle" => ("○", theme.idle, 0.6),
         _ => ("", theme.muted, 1.0),
     }
 }
 
-fn state_label(s: &str) -> &'static str {
+pub(super) fn state_label(s: &str) -> &'static str {
     match s { "working" => "trabalhando", "blocked" => "pede aprovacao", "done" => "terminou", "idle" => "parado", _ => "" }
 }
 
