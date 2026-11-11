@@ -19,6 +19,8 @@ pub mod config;
 pub mod ext;
 pub mod gui;
 pub mod guard;
+#[cfg(target_os = "linux")]
+pub mod linux;
 pub mod peer;
 pub mod secure;
 pub mod relay;
@@ -69,6 +71,7 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("view") => cli::view(&args[1..]),
         Some("play") => cli::play(&args[1..]),
         Some("url") => cli::url(&args[1..]),
+        Some("quick") => cli::quick(),
         Some("secret") => cli::secret(&args[1..]),
         Some("msg") => cli::msg(&args[1..]),
         Some("why") => cli::why(&args[1..]),
@@ -83,7 +86,7 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("toast") => toast::run(args.get(1).map(String::as_str).unwrap_or("")),
         Some("--version" | "-V") => { println!("duck {}", env!("CARGO_PKG_VERSION")); 0 }
         Some("--help" | "-h") => {
-            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--statusline settings.json] [--quick] | config set <chave> <valor> | statusline | plugin add|list|update | guard install|scan | why <pane> | queue ls|add|rm|up|now <pane> | msg <peer>[/aba] [--to aba] texto | send-file <peer> <arq> | peer list|find|connect|invite|join|doctor|sessions | relay | update [--check|--release|--source]");
+            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--statusline settings.json] [--quick] | config set <chave> <valor> | statusline | quick | plugin add|list|update | guard install|scan | why <pane> | queue ls|add|rm|up|now <pane> | msg <peer>[/aba] [--to aba] texto | send-file <peer> <arq> | peer list|find|connect|invite|join|doctor|sessions | relay | update [--check|--release|--source]");
             0
         }
         _ => {

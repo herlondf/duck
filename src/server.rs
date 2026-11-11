@@ -4238,6 +4238,8 @@ fn diff_frame(f: &mut Value, sent: &mut HashMap<u64, (u16, u16, Vec<u64>)>) {
 }
 
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    crate::linux::warm();
     // Um server antigo deste perfil (pipe sem a marca do perfil) ainda vivo:
     // nao sobe outro em paralelo (os dois adotariam os mesmos shells).
     if proto::legacy_pipe_name().is_some() && proto::Conn::connect().is_ok() {

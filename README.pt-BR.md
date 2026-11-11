@@ -162,8 +162,15 @@ token?). Cada problema vem com o comando que resolve.
 
 **Estado por sistema:** o Windows é o de uso diário. No Linux o projeto
 compila e passa nos testes, mas foi pouco usado na prática. O macOS ainda não
-foi testado. A tecla global do quick terminal e o Mica/Acrylic são só do
-Windows.
+foi testado. Mica/Acrylic são só do Windows. No Linux os avisos saem pelo
+desktop (org.freedesktop.Notifications): pedido de aprovação vem com
+**Aprovar**/**Negar** e os outros com **Abrir**, que leva ao pane (servidor sem
+botões: aviso simples). A tecla global do quick terminal usa o portal
+GlobalShortcuts no Wayland (KDE, GNOME 48+) e o XGrabKey no X11; sem nenhum
+dos dois, ligue `duck quick` a um atalho nas configurações do sistema (o
+`duck doctor` diz qual vale). No Wayland o quick terminal abre onde o
+compositor quiser, não preso no topo. Os dois ainda foram pouco usados na
+prática.
 
 ## Primeiros passos
 

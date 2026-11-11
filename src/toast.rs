@@ -46,6 +46,12 @@ fn send(note: &Value) -> bool {
 /// dos cartoes estiver no ar: nunca abre um so para isso.
 pub fn dismiss_pane(pane: u64) {
     if pane != 0 { let _ = send(&serde_json::json!({"dismiss": pane})); }
+    // Linux: os avisos do desktop sobre o pane tambem saem.
+    #[cfg(target_os = "linux")]
+    if pane != 0 {
+        let mine: Vec<String> = ["approve", "deny", "focus"].iter().map(|k| format!("duck://{k}/{pane}")).collect();
+        crate::linux::close_where(|u| mine.iter().any(|m| m == u));
+    }
 }
 
 /// Tela cheia, jogo ou apresentacao: nao cobrir com um cartao.

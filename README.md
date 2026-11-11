@@ -163,8 +163,16 @@ server, hooks, shell integration and the enabled extensions (built? token
 missing?). Each problem comes with the command that fixes it.
 
 **Platform status:** Windows is the daily driver. Linux builds and passes the
-test suite, but has had little interactive use. macOS is untested. The global
-quick-terminal hotkey and Mica/Acrylic are Windows-only.
+test suite, but has had little interactive use. macOS is untested.
+Mica/Acrylic are Windows-only. On Linux notifications go through the desktop
+(org.freedesktop.Notifications): approval requests carry **Aprovar**/**Negar**
+buttons and the others an **Abrir** button that jumps to the pane (servers
+without actions get a plain notification). The quick-terminal hotkey uses the
+GlobalShortcuts portal on Wayland (KDE, GNOME 48+) and XGrabKey on X11; when
+neither works, bind `duck quick` in the desktop's keyboard settings
+(`duck doctor` tells you which one applies). On Wayland the compositor places
+the quick terminal; it is not pinned to the top. Both have seen little real
+use so far.
 
 ## First steps
 

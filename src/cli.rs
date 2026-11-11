@@ -587,6 +587,21 @@ pub fn doctor() -> i32 {
         crate::update::Auto::Off => println!("-- atualizacao: desligada (update_check = false)"),
     }
     println!("{}mascara de segredos na tela{}", ok(cfg.secret_mask), if cfg.secret_mask { "" } else { "  (secret_mask = false na config)" });
+    #[cfg(target_os = "linux")]
+    {
+        match crate::linux::hotkey_probe() {
+            Ok(w) => println!("ok tecla global do quick terminal: {w}, {}", cfg.quick_key),
+            Err(e) => println!("!! atalho global indisponivel: {e}\n    {}", crate::linux::HOTKEY_HINT),
+        }
+        if let Some(s) = crate::linux::hotkey_status() { println!("    quick terminal da ultima vez: {}", s.trim()); }
+        use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
+        let up = crate::gui::quick_pipe().to_ns_name::<GenericNamespaced>().and_then(Stream::connect).is_ok();
+        println!("    {}", if up { "quick terminal no ar" } else { "quick terminal fechado (duck --quick abre; duck quick alterna)" });
+        match crate::linux::notify_probe() {
+            Ok(s) => println!("ok avisos do desktop: {s}"),
+            Err(e) => println!("!! avisos do desktop: {e} (fica o cartao do Duck no canto)"),
+        }
+    }
     doctor_extensions();
     0
 }
@@ -1053,6 +1068,12 @@ pub fn url(args: &[String]) -> i32 {
         let _ = c.call(json!({"cmd": "raise", "pane": 0}));
         return 0;
     }
+    // Pedido do Duck (aviso do desktop no Linux): duck://approval/<id>/yes|no.
+    if let Some((id, ans)) = rest.strip_prefix("approval/").and_then(|r| r.split_once('/')) {
+        let Ok(id) = id.parse::<u64>() else { return 2 };
+        let Ok(mut c) = Conn::connect() else { return 1 };
+        return if c.call(json!({"cmd": "approve", "id": id, "ok": ans == "yes"})).is_ok() { 0 } else { 1 };
+    }
     let (what, id) = rest.split_once('/').unwrap_or((rest, "0"));
     let Ok(pane) = id.parse::<u64>() else { return 2 };
     let Ok(mut c) = Conn::connect() else { return 1 };
@@ -1065,6 +1086,27 @@ pub fn url(args: &[String]) -> i32 {
         }
     }
     0
+}
+
+/// `duck quick`: alterna o quick terminal. Para o atalho do proprio desktop
+/// quando a tecla global nao pega (Wayland sem portal, macOS). Sem nenhum no
+/// ar, abre um (comeca escondido) e alterna.
+pub fn quick() -> i32 {
+    use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
+    if !cfg!(unix) { eprintln!("no Windows o quick terminal abre pela tecla global (quick_terminal.key na config)"); return 2; }
+    // O desktop passa o token de ativacao: a janela vem com foco.
+    let tok = std::env::var("XDG_ACTIVATION_TOKEN").unwrap_or_default();
+    let send = || crate::gui::quick_pipe().to_ns_name::<GenericNamespaced>().and_then(Stream::connect)
+        .and_then(|mut s| s.write_all(format!("toggle {tok}\n").as_bytes())).is_ok();
+    if send() { return 0; }
+    let Some(exe) = crate::gui_exe().or_else(|| crate::proto::current_exe().ok()) else { return 1 };
+    if crate::proto::spawn_detached(&[exe.to_string_lossy().to_string(), "--quick".into()], &[]).is_err() { eprintln!("nao abri o quick terminal"); return 1; }
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if send() { return 0; }
+    }
+    eprintln!("o quick terminal nao respondeu");
+    1
 }
 
 /// `duck play <arquivo.cast>`: reproduz uma gravacao com o tempo original

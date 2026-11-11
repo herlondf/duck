@@ -112,7 +112,12 @@ struct PaneView {
 }
 
 #[derive(Deserialize, Default, Clone)]
-struct Approval { id: u64, kind: String, text: String }
+struct Approval {
+    id: u64, kind: String, text: String,
+    #[cfg(target_os = "linux")]
+    #[serde(default)]
+    pane: u64,
+}
 
 #[derive(Deserialize, Default, Clone)]
 struct Frame {
@@ -380,7 +385,12 @@ const DANGEROUS: &str = r"(?i)(\bsudo\b|\brm\s+-[a-z]*[rf]|\b(curl|wget|iwr|irm|
 // ------------------------------------------------------------------ app
 
 #[derive(Debug)]
-pub enum UserEv { Frame, Reload, Tick, Quick, Connected, Ext, Access(accesskit_winit::Event) }
+pub enum UserEv {
+    Frame, Reload, Tick, Quick, Connected, Ext, Access(accesskit_winit::Event),
+    /// Botao de um aviso do desktop (url duck://).
+    #[cfg(target_os = "linux")]
+    Notify(String),
+}
 
 impl From<accesskit_winit::Event> for UserEv {
     fn from(e: accesskit_winit::Event) -> UserEv { UserEv::Access(e) }
@@ -1185,6 +1195,9 @@ impl Gui {
             "approve" => {
                 self.cmd(json!({"cmd": "approve", "id": n(0, 0), "ok": args.get(1).and_then(|v| v.as_bool()).unwrap_or(false)}));
                 self.asked.remove(&(n(0, 0) as u64));
+                // Respondido aqui: o aviso do desktop com os botoes sai.
+                #[cfg(target_os = "linux")]
+                { let pre = format!("duck://approval/{}/", n(0, 0)); crate::linux::close_where(|u| u.starts_with(&pre)); }
             }
             "copy" => self.copy_selection(),
             "paste" => {
@@ -2316,7 +2329,7 @@ impl Gui {
                 if self.overlay.as_ref().is_none_or(|o| o.peers) {
                     self.asked.insert(a.id);
                     self.approval_dialog(json!(a.id), &a.kind, &a.text);
-                    if !self.focused { toast("Duck pede confirmacao", &a.text); }
+                    if !self.focused { approval_toast("Duck pede confirmacao", &a); }
                 } else if peerish && self.shown_notices.insert(format!("ask{}", a.id)) {
                     // Outra janela aberta por cima: avisa e espera fechar (fica tambem em Computadores > Pedidos).
                     self.flash("Pedido de outro computador: feche esta tela para responder (ou Computadores > Pedidos)");
@@ -2324,7 +2337,7 @@ impl Gui {
                 // Pedido de outro computador: chama atencao na barra de tarefas.
                 if peerish && !self.focused {
                     if let Some(r) = &self.r { r.window.request_user_attention(Some(winit::window::UserAttentionType::Critical)); }
-                    if !self.asked.contains(&a.id) { toast("Duck: pedido de outro computador", &a.text); }
+                    if !self.asked.contains(&a.id) { approval_toast("Duck: pedido de outro computador", &a); }
                 }
             }
             if f.resurrect && self.overlay.is_none() && self.shown_notices.insert("resurrect".into()) {
@@ -2427,7 +2440,9 @@ impl Gui {
                 "budget" => toast("Orcamento de tokens", &format!("Os agentes ja gastaram {} tokens nesta rodada", ev["tokens"])),
                 "command-finished" => {
                     let secs = ev["duration_ms"].as_u64().unwrap_or(0) / 1000;
-                    toast("Comando terminou", &format!("{what} · {secs}s · {}", self.pane_place(pane)));
+                    // Linux: o aviso do desktop ganha o botao de ir ao pane.
+                    let acts: Vec<(String, String)> = if cfg!(target_os = "linux") { vec![("Abrir".into(), format!("duck://focus/{pane}"))] } else { vec![] };
+                    toast_actions("Comando terminou", &format!("{what} · {secs}s · {}", self.pane_place(pane)), &acts);
                 }
                 _ => {}
             }
@@ -2752,6 +2767,9 @@ pub fn toast_actions(title: &str, msg: &str, actions: &[(String, String)]) { toa
 /// Aviso no canto da tela com o tema do Duck (cor da barra lateral opcional).
 /// Em tela cheia, ou sem o duckw, cai no toast nativo do Windows.
 pub fn toast_card(title: &str, msg: &str, actions: &[(String, String)], color: Option<&str>) {
+    // Linux: aviso do desktop (org.freedesktop.Notifications) com os botoes; o cartao so sem servidor de avisos.
+    #[cfg(target_os = "linux")]
+    if crate::linux::notify(title, msg, actions) { return; }
     let note = json!({"title": title, "body": msg, "color": color, "actions": actions.iter().map(|(l, u)| json!([l, u])).collect::<Vec<_>>()});
     if crate::toast::show(&note) { return; }
     native_toast(title, msg, actions)
@@ -2779,6 +2797,43 @@ fn native_toast(title: &str, msg: &str, actions: &[(String, String)]) {
     { let _ = actions; let _ = std::process::Command::new("notify-send").args([title, msg]).spawn(); }
 }
 
+/// Pedido de aprovacao fora da janela. Linux: Aprovar/Negar no proprio aviso
+/// (mesmo caminho do dialogo); Abrir traz a janela e o pane.
+fn approval_toast(title: &str, a: &Approval) {
+    #[cfg(target_os = "linux")]
+    {
+        let acts = vec![("Aprovar".into(), format!("duck://approval/{}/yes", a.id)), ("Negar".into(), format!("duck://approval/{}/no", a.id)),
+            ("Abrir".into(), format!("duck://focus/{}", a.pane))];
+        toast_card(title, &a.text, &acts, Some("working"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    toast(title, &a.text);
+}
+
+/// Socket do quick terminal (`duck quick` alterna por ele).
+pub fn quick_pipe() -> String { crate::proto::pipe_name().replace(".sock", "-quick.sock") }
+
+/// `duck quick` (atalho do proprio desktop) alterna o quick terminal: linha
+/// "toggle [token de ativacao]" no socket.
+#[cfg(unix)]
+fn quick_listen(proxy: EventLoopProxy<UserEv>) {
+    use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+    use std::io::BufRead;
+    let Ok(l) = quick_pipe().to_ns_name::<GenericNamespaced>().and_then(|n| ListenerOptions::new().name(n).create_sync()) else {
+        crate::proto::log("quick terminal: outro ja esta no ar (duck quick fala com ele)");
+        return;
+    };
+    std::thread::spawn(move || {
+        for conn in l.incoming().flatten() {
+            let Some(Ok(line)) = std::io::BufReader::new(conn).lines().next() else { continue };
+            if !line.starts_with("toggle") { continue; }
+            #[cfg(target_os = "linux")]
+            crate::linux::set_token(line.split_whitespace().nth(1).map(String::from));
+            if proxy.send_event(UserEv::Quick).is_err() { return; }
+        }
+    });
+}
+
 /// Acrylic/Mica do Windows 11 e barra de titulo escura.
 fn apply_backdrop(window: &Window, kind: &str) {
     #[cfg(not(windows))]
@@ -2803,10 +2858,20 @@ fn apply_backdrop(window: &Window, kind: &str) {
 
 /// Tecla global do quick terminal ("CTRL+'", "ALT+F12"...): thread com fila de
 /// mensagens propria; cada WM_HOTKEY alterna a janela.
-fn register_hotkey(spec: &str, proxy: EventLoopProxy<UserEv>) {
-    // ponytail: tecla global so no Windows; Linux/macOS usam o atalho do sistema para `duck --quick`.
-    #[cfg(not(windows))]
+/// Linux: portal GlobalShortcuts (Wayland) ou XGrabKey (X11); sem nenhum, fica
+/// o `duck quick` no atalho do desktop (o `duck doctor` mostra o motivo).
+fn register_hotkey(spec: &str, proxy: EventLoopProxy<UserEv>, el: &ActiveEventLoop) {
+    #[cfg(unix)]
+    quick_listen(proxy.clone());
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::wayland::ActiveEventLoopExtWayland;
+        crate::linux::hotkey(spec, el.is_wayland(), move |tok| { crate::linux::set_token(tok); let _ = proxy.send_event(UserEv::Quick); });
+    }
+    // ponytail: macOS sem tecla global; usa o atalho do sistema para `duck quick`.
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = (spec, proxy);
+    let _ = el;
     #[cfg(windows)]
     {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, VkKeyScanW, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN};
@@ -2979,11 +3044,69 @@ impl Gui {
         let _ = std::fs::write(crate::proto::data_dir().join("window.json"), g.to_string());
     }
 
-    fn toggle_quick(&mut self) {
+    fn toggle_quick(&mut self, el: &ActiveEventLoop) {
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::ActiveEventLoopExtWayland;
+            if el.is_wayland() { return self.toggle_quick_wayland(el); }
+        }
+        let _ = el;
         let Some(r) = &self.r else { return };
         self.quick_visible = !self.quick_visible;
         r.window.set_visible(self.quick_visible);
         if self.quick_visible { r.window.focus_window(); }
+    }
+
+    /// Wayland: esconder = soltar a janela; mostrar = janela nova (com o token
+    /// de ativacao do portal ou do `duck quick`, para vir com foco).
+    #[cfg(target_os = "linux")]
+    fn toggle_quick_wayland(&mut self, el: &ActiveEventLoop) {
+        use winit::platform::startup_notify::WindowAttributesExtStartupNotify;
+        self.quick_visible = !self.quick_visible;
+        if !self.quick_visible {
+            // A janela some sem mandar Focused(false): avisa o server aqui.
+            self.r = None;
+            self.access = None;
+            self.focused = false;
+            self.cmd(json!({"cmd": "window-focus", "focused": false}));
+            return;
+        }
+        let mut attrs = self.window_attrs(el);
+        if let Some(t) = crate::linux::take_token() { attrs = attrs.with_activation_token(winit::window::ActivationToken::from_raw(t)); }
+        let Ok(w) = el.create_window(attrs) else { self.quick_visible = false; return };
+        self.access = Some(accesskit_winit::Adapter::with_event_loop_proxy(el, &w, self.proxy.clone()));
+        let transparent = self.cfg.opacity < 1.0 || self.cfg.backdrop != "none";
+        self.r = Some(Renderer::new(Arc::new(w), &self.cfg.font_family, &self.cfg.font_dirs, self.cfg.font_size + self.font_delta,
+            self.cfg.line_height, transparent, &self.cfg.gpu_backend));
+        self.load_config();
+        self.send_size();
+        self.redraw();
+    }
+
+    /// Botao de um aviso do desktop. Aprovar/Negar vao pelo mesmo caminho do
+    /// dialogo; focar traz a janela e o pane; o resto vai pelo `duck url`.
+    #[cfg(target_os = "linux")]
+    fn notify_action(&mut self, url: &str) {
+        let parts: Vec<&str> = url.trim_start_matches("duck://").split('/').collect();
+        match parts.as_slice() {
+            ["approval", id, ok] => {
+                let Ok(id) = id.parse::<u64>() else { return };
+                let yes = *ok == "yes";
+                let pair = self.frame.approvals.iter().any(|a| a.id == id && a.kind == "pair");
+                // O dialogo desse pedido na janela fecha junto.
+                let mine = |i: &Item| matches!(&i.action, Action::Builtin(n, a) if (n == "approve" || n == "peer_accept") && a.first() == Some(&json!(id)));
+                if self.overlay.as_ref().is_some_and(|o| o.items.iter().any(mine)) { self.overlay = None; }
+                if yes && pair { self.builtin("peer_accept", &[json!(id)]); } else { self.builtin("approve", &[json!(id), json!(yes)]); }
+                self.redraw();
+            }
+            ["focus", pane] => {
+                let pane = pane.parse::<u64>().unwrap_or(0);
+                if pane != 0 { self.cmd(json!({"cmd": "focus", "pane": pane})); }
+                crate::toast::dismiss_pane(pane);
+                if let Some(r) = &self.r { r.window.set_minimized(false); r.window.focus_window(); }
+            }
+            _ => { let u = url.to_string(); std::thread::spawn(move || crate::cli::url(&[u])); }
+        }
     }
 
     fn set_light(&mut self, light: bool) {
@@ -3005,9 +3128,9 @@ impl Gui {
     }
 }
 
-impl ApplicationHandler<UserEv> for Gui {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.r.is_some() { return; }
+impl Gui {
+    /// Atributos da janela (a do quick terminal no Wayland e recriada cada vez que aparece).
+    fn window_attrs(&self, el: &ActiveEventLoop) -> winit::window::WindowAttributes {
         let transparent = self.cfg.opacity < 1.0 || self.cfg.backdrop != "none";
         let mut attrs = Window::default_attributes()
             .with_title("Duck")
@@ -3028,7 +3151,6 @@ impl ApplicationHandler<UserEv> for Gui {
             attrs = attrs.with_decorations(false).with_window_level(WindowLevel::AlwaysOnTop).with_visible(false)
                 .with_position(pos)
                 .with_inner_size(PhysicalSize::new(size.width, (size.height as f32 * self.cfg.quick_height) as u32));
-            register_hotkey(&self.cfg.quick_key, self.proxy.clone());
         }
         // Posicao e tamanho da ultima vez (fora o quick terminal).
         let geo: Option<Value> = (!self.quick).then(|| std::fs::read(crate::proto::data_dir().join("window.json")).ok()
@@ -3044,9 +3166,25 @@ impl ApplicationHandler<UserEv> for Gui {
             let (iw, ih) = rgba.dimensions();
             if let Ok(icon) = winit::window::Icon::from_rgba(rgba.into_raw(), iw, ih) { attrs = attrs.with_window_icon(Some(icon)); }
         }
+        attrs
+    }
+}
+
+impl ApplicationHandler<UserEv> for Gui {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.r.is_some() { return; }
+        // Quick terminal escondido no Wayland fica sem janela: nao recomeca.
+        #[cfg(target_os = "linux")]
+        {
+            static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if self.quick && STARTED.swap(true, Ordering::SeqCst) { return; }
+        }
+        let attrs = self.window_attrs(el);
         // O AccessKit precisa da janela ainda invisivel: cria, liga o leitor de tela e mostra.
         let maximize = attrs.maximized;
-        attrs = attrs.with_visible(false);
+        let attrs = attrs.with_visible(false);
+        let transparent = self.cfg.opacity < 1.0 || self.cfg.backdrop != "none";
+        if self.quick { register_hotkey(&self.cfg.quick_key, self.proxy.clone(), el); }
         let window = Arc::new(el.create_window(attrs).expect("janela"));
         self.access = Some(accesskit_winit::Adapter::with_event_loop_proxy(el, &window, self.proxy.clone()));
         if !self.quick {
@@ -3066,6 +3204,17 @@ impl ApplicationHandler<UserEv> for Gui {
         self.send_size();
         self.cmd(json!({"cmd": "window-focus", "focused": true}));
         if self.light { self.cmd(json!({"cmd": "theme-mode", "mode": "light"})); }
+        #[cfg(target_os = "linux")]
+        {
+            // Botoes dos avisos do desktop voltam para este loop.
+            let proxy = self.proxy.clone();
+            crate::linux::on_action(Box::new(move |u| { let _ = proxy.send_event(UserEv::Notify(u)); }));
+            crate::linux::warm();
+            // Wayland nao esconde janela (set_visible nao existe la): o quick
+            // terminal escondido fica sem janela e ganha uma nova ao aparecer.
+            use winit::platform::wayland::ActiveEventLoopExtWayland;
+            if self.quick && el.is_wayland() { self.r = None; }
+        }
 
         // Estatisticas para a barra (CPU/RAM) e relogio: um tick a cada 2s.
         let stats = self.stats.clone();
@@ -3147,10 +3296,10 @@ impl ApplicationHandler<UserEv> for Gui {
         }
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, ev: UserEv) {
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEv) {
         let t0 = Instant::now();
         let what = format!("{ev:?}");
-        self.user_event_inner(ev);
+        self.user_event_inner(el, ev);
         let ms = t0.elapsed().as_millis();
         if ms > 250 { gui_log(&format!("{ms} ms em evento {what} (workspace {})", self.frame.workspace)); }
     }
@@ -3170,7 +3319,7 @@ impl ApplicationHandler<UserEv> for Gui {
 }
 
 impl Gui {
-    fn user_event_inner(&mut self, ev: UserEv) {
+    fn user_event_inner(&mut self, el: &ActiveEventLoop, ev: UserEv) {
         match ev {
             UserEv::Frame => self.take_frame(),
             UserEv::Reload => {
@@ -3189,10 +3338,12 @@ impl Gui {
                 if self.agent_panel.is_some() { self.refresh_agent_panel(false); }
                 self.redraw()
             }
-            UserEv::Quick => self.toggle_quick(),
+            UserEv::Quick => self.toggle_quick(el),
             UserEv::Connected => { self.send_size(); self.cmd(json!({"cmd": "window-focus", "focused": self.focused})); }
             UserEv::Ext => self.ext_poll(),
             UserEv::Access(e) => self.access_event(e.window_event),
+            #[cfg(target_os = "linux")]
+            UserEv::Notify(u) => self.notify_action(&u),
         }
     }
 
@@ -3210,9 +3361,13 @@ fn gui_log(msg: &str) {
 }
 
 impl Gui {
-    fn window_event_inner(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
+    fn window_event_inner(&mut self, el: &ActiveEventLoop, id: WindowId, ev: WindowEvent) {
+        // Wayland: o quick terminal troca de janela; eventos da que saiu nao valem.
+        #[cfg(target_os = "linux")]
+        if self.quick && self.r.as_ref().is_none_or(|r| r.window.id() != id) { return; }
+        let _ = id;
         match ev {
-            WindowEvent::CloseRequested => if self.quick { self.toggle_quick() } else { el.exit() },
+            WindowEvent::CloseRequested => if self.quick { self.toggle_quick(el) } else { el.exit() },
             WindowEvent::Resized(s) => {
                 // Minimizada o Windows manda 160x28 (ou 0x0): os terminais nao
                 // encolhem (senao tudo requebra) e a memoria da GPU e solta.
@@ -3236,7 +3391,7 @@ impl Gui {
                 if !f { self.preedit = (String::new(), None); }
                 self.cmd(json!({"cmd": "window-focus", "focused": f}));
                 // Quick terminal some ao perder o foco, como o do Ghostty.
-                if self.quick && !f && self.quick_visible { self.toggle_quick(); }
+                if self.quick && !f && self.quick_visible { self.toggle_quick(el); }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.key(event),
