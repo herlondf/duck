@@ -65,6 +65,31 @@ fn shift(l: &mut Layer, from: (usize, usize, usize), dx: f32) {
 }
 fn bit(b: bool) -> f32 { if b { 1.0 } else { 0.0 } }
 
+/// Caractere de duas celulas (CJK, Hangul, largura cheia): a composicao do IME segue a grade.
+pub(super) fn wide(c: char) -> bool {
+    matches!(c as u32, 0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x1F300..=0x1F64F | 0x20000..=0x3FFFD)
+}
+
+/// Texto em composicao do IME em (x, y): fundo, sublinhado e o cursor dele.
+fn draw_preedit(l: &mut Layer, pre: &(String, Option<usize>), x0: f32, y: f32, cw: f32, ch: f32, bg: [f32; 4], theme: &Theme) {
+    if pre.0.is_empty() { return; }
+    let (mut x, mut caret, mut at) = (x0, None, 0);
+    let mut glyphs = vec![];
+    for c in pre.0.chars() {
+        if pre.1 == Some(at) { caret = Some(x); }
+        let wd = if wide(c) { 2.0 } else { 1.0 } * cw;
+        glyphs.push((x, c));
+        x += wd;
+        at += c.len_utf8();
+    }
+    if caret.is_none() && pre.1.is_some() { caret = Some(x); }
+    l.shapes.push(Shape::rect(x0, y, x - x0, ch, bg, 0.0));
+    l.shapes.push(Shape::rect(x0, y + ch - 2.0, x - x0, 1.5, lin(theme.fg, 0.9), 0.0));
+    if let Some(cx) = caret { l.shapes.push(Shape::rect(cx, y + 1.0, 2.0, ch - 2.0, lin(theme.cursor, 1.0), 1.0)); }
+    for (gx, c) in glyphs { l.texts.push(mt(gx, y, &c.to_string(), theme.fg)); }
+}
+
 /// Cor do avatar do perfil do agente: da config ou derivada do nome.
 fn avatar_color(theme: &Theme, ui: &config::Ui, profile: &str) -> Rgb {
     if let Some(c) = ui.agent_colors.get(profile) { return *c; }
@@ -369,6 +394,11 @@ impl Gui {
         self.hits.clear();
         self.tab_rects.clear();
         let drag_target = self.pane_drag.filter(|d| d.2).and_then(|(src, _, _)| self.pane_at_px(mouse.0, mouse.1).filter(|t| *t != src));
+        // IME: composicao em curso e onde fica a janela de candidatos.
+        let preedit = self.preedit.clone();
+        let ime_on = self.cfg.ime;
+        let mut ime_spot: Option<[f32; 4]> = None;
+        let typing_elsewhere = self.overlay.is_some() || self.composer.is_some() || self.grid.is_some() || self.graph.is_some();
         let r = self.r.as_mut().unwrap();
         let maximized = r.window.is_maximized();
         let (cw, ch) = (r.cell_w, r.cell_h);
@@ -704,11 +734,17 @@ impl Gui {
                     _ => layer.shapes.push(Shape::ring(x, y, cw, ch, lin(theme.muted, 1.0), 2.0, 1.0)),
                 }
             }
+            // IME: candidatos junto do cursor e a composicao desenhada nele, sublinhada.
+            if let (true, true, false, Some((cc, cr, _))) = (ime_on, is_active, typing_elsewhere, &p.cursor) {
+                let (tx, ty) = (px + *cc as f32 * cw, py + *cr as f32 * ch);
+                ime_spot = Some([tx, ty, cw, ch]);
+                draw_preedit(&mut over, &preedit, tx, ty, cw, ch, lin(pane_bg, 1.0), &theme);
+            }
             if let Some(c) = self.copy.as_ref().filter(|c| c.pane == p.id) {
                 over.quads.push(Quad { x: px + c.cur.col as f32 * cw, y: py + c.cur.row as f32 * ch, w: cw, h: ch, color: lin(theme.accent, 0.6) });
             }
             // Sugestao inline (texto fantasma) depois do cursor.
-            if let (Some(g), true, Some((cc, cr, _))) = (&ghost, is_active, &p.cursor) {
+            if let (Some(g), true, true, Some((cc, cr, _))) = (&ghost, is_active, preedit.0.is_empty(), &p.cursor) {
                 let gx = px + (*cc as f32 + 1.0) * cw;
                 let room = ((p.w as i32 - *cc as i32 - 1).max(0)) as usize;
                 let shown: String = g.chars().take(room).collect();
@@ -1434,6 +1470,11 @@ impl Gui {
                 }
                 let (cl, ccol) = pos(c.cur);
                 if cl >= first { modal.shapes.push(Shape::rect(tx + ccol as f32 * cw, ty + (cl - first) as f32 * ch + 1.0, 2.0, ch - 2.0, lin(theme.cursor, 1.0), 1.0)); }
+                if ime_on && self.overlay.is_none() && cl >= first {
+                    let (ix, iy) = (tx + ccol as f32 * cw, ty + (cl - first) as f32 * ch);
+                    ime_spot = Some([ix, iy, cw, ch]);
+                    draw_preedit(&mut modal, &preedit, ix, iy, cw, ch, lin(theme.tab_bar, 1.0), &theme);
+                }
                 modal.texts.push(uit(tx, by + bh - ch - 6.0, "Enter envia · Shift+Enter quebra linha · Ctrl+Z desfaz · Esc fecha", theme.muted, 0.75));
             }
         }
@@ -1492,7 +1533,8 @@ impl Gui {
 
         // ---- overlay (paleta, seletores, prompts, dialogos, previa, slider)
         if let Some(o) = &self.overlay {
-            draw_overlay(r, &mut modal, &mut self.hits, o, &theme, mouse, w, h, chrome.top);
+            let pre = if ime_on { preedit.0.as_str() } else { "" };
+            if let Some(sp) = draw_overlay(r, &mut modal, &mut self.hits, o, &theme, mouse, w, h, chrome.top, pre) { if ime_on { ime_spot = Some(sp); } }
         }
 
         // ---- apresentacao: o pato se monta pixel a pixel, balanca e some
@@ -1541,6 +1583,14 @@ impl Gui {
         }
         r.draw(clear, &[base, flt, over, modal]);
         if r.animated() { r.window.request_redraw(); }
+        // Janela de candidatos do IME no cursor (so quando muda de lugar).
+        if let Some(sp) = ime_spot {
+            let a = [sp[0] as i32, sp[1] as i32, sp[2].max(1.0) as i32, sp[3].max(1.0) as i32];
+            if self.ime_area != Some(a) {
+                r.window.set_ime_cursor_area(winit::dpi::PhysicalPosition::new(a[0], a[1]), winit::dpi::PhysicalSize::new(a[2] as u32, a[3] as u32));
+                self.ime_area = Some(a);
+            }
+        }
         // Proximo quadro: animacao (60 fps) ou pulso/piscar (15 fps).
         let next = if animating { Some(now + Duration::from_millis(16)) }
             else if pulse || blinking { Some(now + Duration::from_millis(66)) }
@@ -2462,6 +2512,8 @@ impl Gui {
             set("Variante da fonte ss01", "ui.font_features", "{ 'ss01' }"),
             set("Recolher saidas com mais de 300 linhas", "ui.collapse_lines", "300"),
             set("Nunca recolher saidas", "ui.collapse_lines", "0"),
+            set("Metodo de entrada (IME, japones/chines/coreano): sim", "ime", "true"),
+            set("Metodo de entrada (IME): nao", "ime", "false"),
             Item::new("Shader: CRT (curvatura e scanlines)", "", "shader_pick", vec![json!("crt")]),
             Item::new("Shader: brilho (glow)", "", "shader_pick", vec![json!("glow")]),
             Item::new("Shader: grao de filme", "", "shader_pick", vec![json!("grain")]),
@@ -2995,9 +3047,11 @@ fn tabs_row(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, rects: &mut Ve
 }
 
 /// Paleta, listas, prompts, dialogos com botoes, previa de arquivo e slider.
+/// Devolve onde fica o cursor do campo de texto (janela de candidatos do IME).
 #[allow(clippy::too_many_arguments)]
-fn draw_overlay(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, o: &Overlay, theme: &Theme, mouse: (f32, f32), w: f32, h: f32, top: f32) {
+fn draw_overlay(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, o: &Overlay, theme: &Theme, mouse: (f32, f32), w: f32, h: f32, top: f32, pre: &str) -> Option<[f32; 4]> {
     let (cw, ch) = (r.cell_w, r.cell_h);
+    let mut spot = None;
     l.shapes.push(Shape::rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, 0.40], 0.0));
     let card = |l: &mut Layer, x: f32, y: f32, ww: f32, hh: f32| {
         l.shapes.push(Shape::shadow(x, y + 6.0, ww, hh, [0.0, 0.0, 0.0, 0.55], 14.0, 18.0));
@@ -3159,11 +3213,16 @@ fn draw_overlay(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, o: &Overla
             l.shapes.push(Shape::ring(fr[0], fr[1], fr[2], fr[3], lin(theme.accent, 0.6), 8.0, 1.0));
             let iy = cy + (row_h + 4.0 - ch) / 2.0;
             l.texts.push(TextItem { size: 0.9, ..mt(fr[0] + 10.0, iy, if is_list { "\u{f002}" } else { "\u{f054}" }, theme.muted) });
-            if o.input.is_empty() && is_list {
+            if o.input.is_empty() && is_list && pre.is_empty() {
                 l.texts.push(uit(fr[0] + 32.0, iy, "Digite para filtrar…", theme.muted, 0.9));
+                spot = Some([fr[0] + 32.0, iy, cw, ch]);
             } else {
                 let shown = if o.secret { "•".repeat(o.input.chars().count()) } else { o.input.clone() };
-                l.texts.push(TextItem { clip_right: Some(fr[0] + fr[2] - 8.0), ..mt(fr[0] + 32.0, iy, &format!("{shown}▏"), theme.fg) });
+                let pre = if o.secret { "•".repeat(pre.chars().count()) } else { pre.to_string() };
+                l.texts.push(TextItem { clip_right: Some(fr[0] + fr[2] - 8.0), ..mt(fr[0] + 32.0, iy, &format!("{shown}{pre}▏"), theme.fg) });
+                let sx = fr[0] + 32.0 + r.measure(&shown, false, 1.0);
+                if !pre.is_empty() { l.shapes.push(Shape::rect(sx, iy + ch - 2.0, r.measure(&pre, false, 1.0).min(fr[0] + fr[2] - 8.0 - sx).max(0.0), 1.5, lin(theme.fg, 0.9), 0.0)); }
+                spot = Some([sx, iy, cw, ch]);
             }
             cy += row_h + 14.0;
             if is_list {
@@ -3209,6 +3268,7 @@ fn draw_overlay(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, o: &Overla
             let _ = bit(true);
         }
     }
+    spot
 }
 
 /// Transcript da sessao: <perfil>/projects/*/<sessao>.jsonl.

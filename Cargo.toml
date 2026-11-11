@@ -12,6 +12,8 @@ codegen-units = 1
 strip = true
 
 [dependencies]
+accesskit = "0.25.2"
+accesskit_winit = "0.34.2"
 alacritty_terminal = "0.26.0"
 arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
 glyphon = "0.12.0"

@@ -260,6 +260,8 @@ pub struct Config {
     pub quick_height: f32,
     pub shader: Option<String>,
     pub visual_bell: bool,
+    /// Metodo de entrada (IME: japones, chines, coreano...): composicao no cursor.
+    pub ime: bool,
     pub token_budget: u64,
     /// Mensagens entre computadores (`duck msg`): onde escutar ("" = desligado),
     /// nome deste computador, entrega sem aprovacao e limite de idas e voltas.
@@ -555,6 +557,7 @@ pub fn parse(t: &Table) -> Config {
         quick_height: t.get::<Table>("quick_terminal").ok().map(|q| n(&q, "height", 0.45) as f32).unwrap_or(0.45),
         shader: t.get::<Option<String>>("shader").ok().flatten(),
         visual_bell: t.get::<Option<bool>>("visual_bell").ok().flatten().unwrap_or(true),
+        ime: t.get::<Option<bool>>("ime").ok().flatten().unwrap_or(true),
         token_budget: n(t, "token_budget", 0.0) as u64,
         peer_listen, peer_name, peer_name_explicit,
         peer_trust: t.get::<Table>("peer").ok().and_then(|p| p.get::<Option<bool>>("trust").ok().flatten()).unwrap_or(false),

@@ -47,6 +47,7 @@ return {
   -- background = { gradient = { '#1e1e2e', '#2a1f3d' } },
   -- shader = 'C:/caminho/crt.wgsl',  -- WGSL com fn effect(uv, time, size) -> vec4 (ver README)
   visual_bell = true,          -- o pane pisca de leve no lugar do beep
+  ime = true,                  -- metodo de entrada (japones, chines, coreano...): composicao no cursor
   max_fps = 0,                 -- 0 = vsync; 30 economiza bateria
   gpu_backend = 'dx12',        -- 'dx12' | 'vulkan' | 'gl'
   -- Quick terminal (duck --quick): tecla global desce o terminal no topo.

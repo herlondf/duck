@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -24,6 +24,7 @@ use crate::config::{self, set_local_setting, Config, Rgb, Theme};
 use crate::proto::Conn;
 use crate::render::{lin, Layer, Quad, Renderer, TextItem};
 
+mod access;
 mod ext;
 mod best;
 mod graph;
@@ -375,7 +376,11 @@ const DANGEROUS: &str = r"(?i)(\bsudo\b|\brm\s+-[a-z]*[rf]|\b(curl|wget|iwr|irm|
 // ------------------------------------------------------------------ app
 
 #[derive(Debug)]
-pub enum UserEv { Frame, Reload, Tick, Quick, Connected, Ext }
+pub enum UserEv { Frame, Reload, Tick, Quick, Connected, Ext, Access(accesskit_winit::Event) }
+
+impl From<accesskit_winit::Event> for UserEv {
+    fn from(e: accesskit_winit::Event) -> UserEv { UserEv::Access(e) }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 struct Cell { col: i32, row: i32 }
@@ -546,6 +551,16 @@ pub struct Gui {
     /// Arrastando o cabecalho de um pane (pane, inicio, mexeu): soltar sobre
     /// outro troca os dois de lugar.
     pane_drag: Option<(u64, (f32, f32), bool)>,
+    /// Leitor de tela (src/gui/access.rs): adaptador, ligado pelo leitor,
+    /// nos mandados da ultima vez e foco.
+    access: Option<accesskit_winit::Adapter>,
+    access_on: bool,
+    access_prev: HashMap<accesskit::NodeId, accesskit::Node>,
+    access_focus: accesskit::NodeId,
+    /// IME: texto em composicao (e posicao do cursor nele, em bytes) e a
+    /// ultima area mandada para a janela de candidatos.
+    preedit: (String, Option<usize>),
+    ime_area: Option<[i32; 4]>,
 }
 
 /// Menu por assunto: a paleta so com os comandos cujo rotulo (ou dica) comeca
@@ -610,6 +625,8 @@ impl Gui {
             usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), last_loop_check: String::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
             tab_cur: 0, tab_prev: 0, palette_rank: load_palette_rank(), scroll_base: HashMap::new(), pane_drag: None,
             peer_status: HashMap::new(), peer_found: None, peer_info: HashMap::new(), peer_state: Value::Null, update_ver: None, updating: false,
+            access: None, access_on: false, access_prev: HashMap::new(), access_focus: accesskit::NodeId(0),
+            preedit: (String::new(), None), ime_area: None,
         };
         g.load_config();
         g.update_watch();
@@ -740,6 +757,8 @@ impl Gui {
             r.set_font(&self.cfg.font_family, (self.cfg.font_size + self.font_delta) * 96.0 / 72.0 * scale, self.cfg.line_height);
             r.set_style(&self.cfg.ui.font, self.cfg.ui.font_weight, &self.cfg.ui.font_features);
             apply_backdrop(&r.window, &self.cfg.backdrop);
+            r.window.set_ime_allowed(self.cfg.ime);
+            if !self.cfg.ime { self.preedit = (String::new(), None); self.ime_area = None; }
             if let Err(e) = r.set_background(bg.image.as_deref(), bg.opacity) { errs.push(format!("imagem de fundo: {e}")); }
             if let Err(e) = r.set_shader(shader.as_deref()) { errs.push(format!("shader: {e}")); }
         }
@@ -2092,6 +2111,8 @@ impl Gui {
 
     fn key(&mut self, mut ev: KeyEvent) {
         if ev.state != ElementState::Pressed { return; }
+        // Compondo no IME: a tecla e dele (o texto vem no Commit).
+        if !self.preedit.0.is_empty() { return; }
         if !self.dead_key(&mut ev) { return; }
         if self.splash.take().is_some() { return self.redraw(); }
         self.last_key = Instant::now();
@@ -2825,6 +2846,47 @@ impl Gui {
         }
         true
     }
+
+    /// IME (japones, chines, coreano; no macOS tambem as teclas mortas):
+    /// a composicao e desenhada no cursor e o texto pronto chega no Commit.
+    fn ime(&mut self, ev: Ime) {
+        match ev {
+            Ime::Enabled => {}
+            Ime::Disabled => self.preedit = (String::new(), None),
+            Ime::Preedit(t, cur) => { self.last_key = Instant::now(); self.preedit = (t, cur.map(|c| c.1)); }
+            Ime::Commit(t) => { self.preedit = (String::new(), None); self.dead = None; self.ime_commit(&t); }
+        }
+        self.redraw();
+    }
+
+    /// Texto composto pelo IME: vai para onde a tecla digitada iria (editor,
+    /// campo da paleta ou o pane), na mesma ordem de `key()`.
+    fn ime_commit(&mut self, t: &str) {
+        let t: String = t.chars().filter(|c| !c.is_control()).collect();
+        if t.is_empty() { return; }
+        self.splash = None;
+        self.last_key = Instant::now();
+        if self.overlay.is_none() {
+            if let Some(c) = self.composer.as_mut() {
+                c.undo.push((c.text.clone(), c.cur));
+                if c.undo.len() > 200 { c.undo.remove(0); }
+                c.redo.clear();
+                if let Some((a, b)) = c.anchor.filter(|a| *a != c.cur).map(|a| (a.min(c.cur), a.max(c.cur))) { c.text.drain(a..b); c.cur = a; }
+                c.anchor = None;
+                for ch in t.chars() { c.text.insert(c.cur, ch); c.cur += 1; }
+                return;
+            }
+            if self.grid.is_some() || self.graph.is_some() { return; }
+        }
+        if self.hints.is_some() { return; }
+        if let Some(o) = self.overlay.as_mut() {
+            if matches!(o.kind, OverlayKind::List | OverlayKind::Prompt(..)) { o.input.push_str(&t); o.filter(); }
+            return;
+        }
+        if self.copy.is_some() { return; }
+        self.sel = None;
+        self.send_keys(&t);
+    }
 }
 
 fn encode_key(ev: &KeyEvent, mods: ModifiersState, app_cursor: bool) -> Option<String> {
@@ -2971,7 +3033,15 @@ impl ApplicationHandler<UserEv> for Gui {
             let (iw, ih) = rgba.dimensions();
             if let Ok(icon) = winit::window::Icon::from_rgba(rgba.into_raw(), iw, ih) { attrs = attrs.with_window_icon(Some(icon)); }
         }
+        // O AccessKit precisa da janela ainda invisivel: cria, liga o leitor de tela e mostra.
+        let maximize = attrs.maximized;
+        attrs = attrs.with_visible(false);
         let window = Arc::new(el.create_window(attrs).expect("janela"));
+        self.access = Some(accesskit_winit::Adapter::with_event_loop_proxy(el, &window, self.proxy.clone()));
+        if !self.quick {
+            window.set_visible(true);
+            if maximize { window.set_maximized(true); }
+        }
         if !self.quick { self.splash = Some(Instant::now()); }
         apply_backdrop(&window, &self.cfg.backdrop);
         self.light = self.cfg.theme_light.is_some() && window.theme() == Some(winit::window::Theme::Light);
@@ -3078,6 +3148,7 @@ impl ApplicationHandler<UserEv> for Gui {
         // Diagnostico: o que travar a janela (>250 ms) vai para gui.log.
         let t0 = Instant::now();
         let what = match &ev { WindowEvent::KeyboardInput { event, .. } => format!("tecla {:?} {:?}", event.logical_key, self.mods), e => format!("{e:?}").chars().take(60).collect() };
+        if let (Some(a), Some(r)) = (self.access.as_mut(), self.r.as_ref()) { a.process_event(&r.window, &ev); }
         self.window_event_inner(el, id, ev);
         let ms = t0.elapsed().as_millis();
         if ms > 250 {
@@ -3110,6 +3181,7 @@ impl Gui {
             UserEv::Quick => self.toggle_quick(),
             UserEv::Connected => { self.send_size(); self.cmd(json!({"cmd": "window-focus", "focused": self.focused})); }
             UserEv::Ext => self.ext_poll(),
+            UserEv::Access(e) => self.access_event(e.window_event),
         }
     }
 
@@ -3149,12 +3221,15 @@ impl Gui {
             WindowEvent::ThemeChanged(t) => self.set_light(t == winit::window::Theme::Light),
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                // Composicao largada ao sair da janela nao pode prender o teclado.
+                if !f { self.preedit = (String::new(), None); }
                 self.cmd(json!({"cmd": "window-focus", "focused": f}));
                 // Quick terminal some ao perder o foco, como o do Ghostty.
                 if self.quick && !f && self.quick_visible { self.toggle_quick(); }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.key(event),
+            WindowEvent::Ime(ime) => self.ime(ime),
             WindowEvent::CursorMoved { position: PhysicalPosition { x, y }, .. } => self.mouse_move(x as f32, y as f32),
             WindowEvent::MouseInput { state, button, .. } => self.mouse_button(state, button),
             WindowEvent::MouseWheel { delta, .. } => {
@@ -3172,6 +3247,7 @@ impl Gui {
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
+                self.access_tick();
                 if self.r.as_ref().is_some_and(|r| r.lost.load(Ordering::SeqCst)) { self.rebuild_renderer(); }
             }
             _ => {}
