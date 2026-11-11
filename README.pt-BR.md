@@ -76,15 +76,39 @@ curl -fsSL https://raw.githubusercontent.com/herlondf/duck/main/get.sh | sh
 irm https://raw.githubusercontent.com/herlondf/duck/main/get.ps1 | iex   # instala em %LOCALAPPDATA%\Duck; precisa do PowerShell 7
 ```
 
+Na primeira instalação aparece um checklist com o recomendado já marcado;
+digite os números para ligar/desligar e Enter para confirmar:
+
+```
+Duck: o que configurar?
+  1 [x] hooks do Claude Code em: ~/.claude ~/.claude-trabalho
+  2 [x] statusline do Claude Code (uso de 5h/7d para o Uso do Claude e as Rotinas; a sua fica)
+  3 [x] shell integration bash/zsh e PATH em ~/.bashrc
+  4 [x] ~/.duck.lua
+  5 [x] atalho no menu de aplicativos
+  6 [x] abrir no login, restaurando a ultima sessao
+  7 [x] atualizacoes automaticas (baixa, confere e instala; reinicia o server quando nenhum agente trabalha)
+  8 [ ] extensoes: ligar o Uso do Claude (precisa do Node 18+; as outras em Ctrl+Shift+P)
+Numeros ligam/desligam (ex.: 6 8), Enter confirma:
+```
+
+No `curl | sh` as respostas vêm do terminal (`/dev/tty`); sem terminal, ou com
+`--yes` / `-Yes`, vale o padrão. No fim aparece um resumo e o `duck doctor`.
 Opções do instalador vão depois de `sh -s --` (Linux) ou com
-`& ([scriptblock]::Create((irm .../get.ps1))) -Boot` (Windows).
+`& ([scriptblock]::Create((irm .../get.ps1))) -Boot` (Windows); qualquer uma de
+`--all`, `--boot`, `--claude-hooks`, `--extensions` (ou `-All`, `-Boot`...)
+pula o checklist. `--wizard` / `-Wizard` mostra de novo numa reinstalação.
 
-**Atualizações:** o Duck procura release novo uma vez por dia e avisa. Depois,
-**Ctrl+Shift+P > Atualizar o Duck** (ou `duck update`) baixa, confere, instala e
-reinicia o server; os shells continuam. Desliga com `update_check = false`.
+**Atualizações:** automáticas. Uma vez por dia o Duck procura release novo; se
+houver, baixa, confere o SHA-256, instala e reinicia o server, e os shells
+continuam. Ele espera um momento quieto: nenhum agente trabalhando ou pedindo
+aprovação e nenhum comando rodando (tenta de novo a cada 2 minutos). Depois
+avisa "Duck atualizado para vX.Y.Z"; feche e abra a janela para a interface
+nova. `update_auto = false` só avisa (aí **Ctrl+Shift+P > Atualizar o Duck** ou
+`duck update` instala); `update_check = false` desliga tudo.
 
-A instalação pelo código (clone + `./install.sh`) não muda com o `duck update`
-puro. No Linux, `duck update --release` (ou **Ctrl+Shift+P > Atualizar o
+A instalação pelo código (clone + `./install.sh`) nunca se atualiza sozinha,
+só avisa, e não muda com o `duck update` puro. No Linux, `duck update --release` (ou **Ctrl+Shift+P > Atualizar o
 Duck: trocar pelo release**) passa para a instalação do release: os mesmos
 `~/.local/bin/duck` e `duckw`, e daí em diante o `duck update` atualiza
 sozinho; o clone fica onde está. `duck update --source` faz `git pull
@@ -109,15 +133,15 @@ git clone https://github.com/herlondf/duck.git
 cd duck
 pwsh -File .\install.ps1 -All         # tudo: compila, PATH, ~/.duck.lua, menu Iniciar, abre no logon,
                                       # hooks e statusline do Claude Code, extensões compiladas
-pwsh -File .\install.ps1              # só o terminal (as opções avulsas: -Boot, -ClaudeHooks, -Extensions)
+pwsh -File .\install.ps1              # 1a vez: o checklist acima (as opções avulsas: -Boot, -ClaudeHooks, -Extensions)
 ```
 
 ### Linux
 
 ```bash
 git clone https://github.com/herlondf/duck.git && cd duck
-./install.sh                 # compila, ~/.local/bin, PATH, shell integration, ~/.duck.lua, atalho no menu de apps
-./install.sh --all           # + abre no login, hooks do Claude Code, extensões
+./install.sh                 # compila, ~/.local/bin, PATH; na 1a vez, o checklist acima
+./install.sh --all           # sem perguntas: + abre no login, hooks e statusline do Claude Code, extensões
 ```
 
 Falta o Rust ou os pacotes de build (gcc, pkg-config, libs de X11/Wayland)? O

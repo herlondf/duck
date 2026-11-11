@@ -65,8 +65,13 @@ return {
   -- Windows: aba nova rele PATH e variaveis do registro (programa instalado com
   -- o Duck aberto ja aparece, sem reiniciar o server). false = env do server.
   refresh_env = true,
-  -- Procura versao nova uma vez por dia e avisa (Ctrl+Shift+P > Atualizar o Duck).
+  -- Procura versao nova uma vez por dia. Instalacao do release: baixa, confere
+  -- e instala sozinho, e reinicia o server quando nenhum agente esta
+  -- trabalhando nem comando rodando (os shells continuam). update_auto = false
+  -- so avisa (Ctrl+Shift+P > Atualizar o Duck); update_check = false desliga tudo.
+  -- Pelo codigo (clone + install) so avisa.
   update_check = true,
+  update_auto = true,
   notify_command_secs = 30,    -- avisa quando um comando longo termina fora de foco
   -- Dominio = comando que abre o shell. Aparece na paleta ("Novo pane: ...").
   -- Perfil visual: {cmd=..., background='#2b1111', tab_color='#f38ba8'}.

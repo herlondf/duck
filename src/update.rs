@@ -125,15 +125,78 @@ pub fn check_cached(max_age: Duration) -> Option<String> {
 
 /// Baixa e instala a versao `ver`. No Windows ja reinicia o server; no
 /// Linux/macOS quem chamou reinicia.
-pub fn install(ver: &str) -> Result<String, String> {
-    install_platform(&format!("v{}", ver.trim_start_matches('v')))
+pub fn install(ver: &str) -> Result<String, String> { install_with(ver, true) }
+
+/// Como `install`, mas sem reiniciar o server em nenhum sistema: a
+/// atualizacao automatica reinicia so num momento quieto (`busy_reason`).
+pub fn install_no_restart(ver: &str) -> Result<String, String> { install_with(ver, false) }
+
+fn install_with(ver: &str, restart: bool) -> Result<String, String> {
+    let ver = ver.trim_start_matches('v');
+    let r = install_platform(&format!("v{ver}"), restart)?;
+    let _ = std::fs::write(installed_file(), ver);
+    Ok(r)
 }
 
+fn installed_file() -> PathBuf { crate::proto::data_dir().join("update-installed") }
+
+/// Versao que o ultimo `install` deixou no disco. A janela aberta continua
+/// na versao antiga ate ser reaberta: isso evita instalar a mesma de novo.
+pub fn installed_marker() -> Option<String> {
+    std::fs::read_to_string(installed_file()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// O que a consulta diaria faz com uma versao nova.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Auto {
+    /// `update_check = false`: nem consulta.
+    Off,
+    /// So avisa (pelo codigo, ou `update_auto = false`).
+    Notify,
+    /// Baixa, confere, instala e reinicia o server sozinho.
+    Install,
+}
+
+pub fn auto_mode(check: bool, auto: bool, kind: &Kind) -> Auto {
+    match (check, auto, kind) {
+        (false, _, _) => Auto::Off,
+        (true, true, Kind::Release) => Auto::Install,
+        _ => Auto::Notify,
+    }
+}
+
+/// Instalar `latest` sozinho? So se e mais nova que a rodando e que a ja
+/// instalada no disco (janela velha aberta depois de uma atualizacao).
+pub fn should_auto_install(latest: &str, cur: &str, installed: Option<&str>) -> bool {
+    newer(latest, cur) && installed.is_none_or(|i| newer(latest, i))
+}
+
+/// Por que nao e hora de reiniciar o server, pela resposta do `list`: agente
+/// trabalhando ou pedindo aprovacao, ou comando rodando num pane. None: quieto.
+pub fn busy_reason(list: &Value) -> Option<String> {
+    let panes = list["workspaces"].as_array().into_iter().flatten()
+        .flat_map(|w| w["tabs"].as_array().into_iter().flatten())
+        .flat_map(|t| t["panes"].as_array().into_iter().flatten());
+    let (mut agents, mut cmds) = (0, 0);
+    for p in panes {
+        if matches!(p["agent"]["state"].as_str(), Some("working" | "blocked")) { agents += 1; }
+        else if p["running"].as_bool() == Some(true) { cmds += 1; }
+    }
+    match (agents, cmds) {
+        (0, 0) => None,
+        (a, 0) => Some(format!("{a} agente(s) trabalhando")),
+        (0, c) => Some(format!("{c} comando(s) rodando")),
+        (a, c) => Some(format!("{a} agente(s) trabalhando e {c} comando(s) rodando")),
+    }
+}
+
+/// Linux/macOS: o get.sh da versao nova (o server quem chamou reinicia).
+/// DUCK_NO_WIZARD: atualizacao nao pergunta nada, nem por /dev/tty.
 #[cfg(not(windows))]
-fn install_platform(tag: &str) -> Result<String, String> {
+fn install_platform(tag: &str, _restart: bool) -> Result<String, String> {
     let base = format!("https://raw.githubusercontent.com/{}/{tag}", repo());
     let out = quiet(std::process::Command::new("sh").args(["-c", &format!("curl -fsSL {base}/get.sh | sh")])
-        .env("DUCK_VERSION", tag).env("DUCK_REPO", repo()).stdin(std::process::Stdio::null()))
+        .env("DUCK_VERSION", tag).env("DUCK_REPO", repo()).env("DUCK_NO_WIZARD", "1").stdin(std::process::Stdio::null()))
         .output().map_err(|e| format!("sh: {e}"))?;
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if out.status.success() { Ok(text) } else { Err(text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("instalador falhou").trim().to_string()) }
@@ -145,7 +208,7 @@ fn install_platform(tag: &str) -> Result<String, String> {
 /// pacote com curl.exe, confere o SHA256, extrai com tar.exe, troca os
 /// binarios (exe em uso: renomeia e copia o novo) e reinicia o server.
 #[cfg(windows)]
-fn install_platform(tag: &str) -> Result<String, String> {
+fn install_platform(tag: &str, restart: bool) -> Result<String, String> {
     use std::path::Path;
     const PKG: &str = "duck-windows-x86_64.zip";
     let exe = crate::proto::current_exe().map_err(|e| e.to_string())?;
@@ -192,9 +255,9 @@ fn install_platform(tag: &str) -> Result<String, String> {
 
     // Server rodando: reinicia com o binario novo (os shells continuam). De
     // dentro de um pane o token do pane nao pode reiniciar: sai do ambiente.
-    let _ = quiet(std::process::Command::new(bin.join("duck.exe")).args(["cli", "restart-server"])
+    if restart { let _ = quiet(std::process::Command::new(bin.join("duck.exe")).args(["cli", "restart-server"])
         .env_remove("DUCK_TOKEN").env_remove("DUCK_PANE").env_remove("LASSO_TOKEN").env_remove("LASSO_PANE")
-        .stdin(std::process::Stdio::null())).output();
+        .stdin(std::process::Stdio::null())).output(); }
     Ok(format!("Duck {tag} instalado em {}", root.display()))
 }
 
@@ -277,7 +340,7 @@ fn source_hint(root: &str) -> String {
 /// O que dizer quando ha versao nova (aviso da janela e `duck update --check`).
 pub fn how_to(latest: &str) -> String {
     match kind() {
-        Kind::Release => format!("Duck {latest} disponivel (esta: {}) · Ctrl+Shift+P > Atualizar o Duck", current()),
+        Kind::Release => format!("Duck {latest} disponivel (esta: {}) · Ctrl+Shift+P > Atualizar o Duck (update_auto = true atualiza sozinho)", current()),
         Kind::Source(root) => format!("Duck {latest} disponivel (esta: {}) · {}", current(), source_hint(&root)),
     }
 }
@@ -433,6 +496,7 @@ pub fn main(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn versions() {
@@ -549,6 +613,39 @@ mod tests {
         assert!(!is_clone(&other));
         assert!(is_clone(&clone));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn auto_modes() {
+        let rel = Kind::Release;
+        let src = Kind::Source("/c".into());
+        assert_eq!(auto_mode(true, true, &rel), Auto::Install);
+        assert_eq!(auto_mode(true, false, &rel), Auto::Notify);
+        assert_eq!(auto_mode(false, true, &rel), Auto::Off);
+        // Pelo codigo nunca se instala sozinho.
+        assert_eq!(auto_mode(true, true, &src), Auto::Notify);
+        assert_eq!(auto_mode(false, false, &src), Auto::Off);
+    }
+
+    #[test]
+    fn auto_install_once() {
+        assert!(should_auto_install("0.4.0", "0.3.0", None));
+        assert!(!should_auto_install("0.3.0", "0.3.0", None));
+        // Ja instalada no disco, janela velha aberta: nao repete.
+        assert!(!should_auto_install("0.4.0", "0.3.0", Some("0.4.0")));
+        assert!(should_auto_install("0.4.1", "0.3.0", Some("0.4.0")));
+        // Marcador de uma versao antiga (voltou de versao a mao): instala.
+        assert!(should_auto_install("0.4.0", "0.3.0", Some("0.2.0")));
+    }
+
+    #[test]
+    fn busy() {
+        let list = |panes: Value| json!({"workspaces": [{"tabs": [{"panes": panes}]}]});
+        assert_eq!(busy_reason(&json!({})), None);
+        assert_eq!(busy_reason(&list(json!([{"agent": null}, {"agent": {"state": "done"}}, {"agent": {"state": "idle"}, "running": false}]))), None);
+        assert_eq!(busy_reason(&list(json!([{"agent": {"state": "working"}}]))), Some("1 agente(s) trabalhando".into()));
+        assert_eq!(busy_reason(&list(json!([{"agent": {"state": "blocked"}}, {"running": true}]))), Some("1 agente(s) trabalhando e 1 comando(s) rodando".into()));
+        assert_eq!(busy_reason(&list(json!([{"running": true}, {"running": true}]))), Some("2 comando(s) rodando".into()));
     }
 
     #[test]

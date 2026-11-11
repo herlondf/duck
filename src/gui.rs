@@ -423,6 +423,8 @@ pub struct Gui {
     /// Versao nova publicada (aviso e item "Atualizar o Duck").
     update_ver: Option<String>,
     updating: bool,
+    /// Atualizacao automatica esperando um momento quieto (um timer por vez).
+    update_retry: bool,
     proxy: EventLoopProxy<UserEv>,
     client: String,
     conn: Arc<Mutex<Option<Conn>>>,
@@ -628,7 +630,7 @@ impl Gui {
             collapsed: HashMap::new(), pinned: HashMap::new(), search_hits: None, composer: None, ac: None, ac_dismissed: String::new(),
             usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), last_loop_check: String::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
             tab_cur: 0, tab_prev: 0, palette_rank: load_palette_rank(), scroll_base: HashMap::new(), pane_drag: None,
-            peer_status: HashMap::new(), peer_found: None, peer_info: HashMap::new(), peer_state: Value::Null, update_ver: None, updating: false,
+            peer_status: HashMap::new(), peer_found: None, peer_info: HashMap::new(), peer_state: Value::Null, update_ver: None, updating: false, update_retry: false,
             access: None, access_on: false, access_prev: HashMap::new(), access_focus: accesskit::NodeId(0),
             preedit: (String::new(), None), ime_area: None,
         };

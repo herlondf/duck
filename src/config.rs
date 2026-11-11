@@ -252,6 +252,9 @@ pub struct Config {
     pub refresh_env: bool,
     /// Procura versao nova do Duck (uma vez por dia) e avisa na janela.
     pub update_check: bool,
+    /// Instalacao do release: baixa, confere e instala a versao nova sozinho
+    /// (reinicia o server num momento quieto). false = so avisa.
+    pub update_auto: bool,
     pub theme_light: Option<Theme>,
     pub background: Background,
     pub tab_rules: Vec<(String, Rgb)>,
@@ -544,6 +547,7 @@ pub fn parse(t: &Table) -> Config {
         shell_integration: t.get::<Option<bool>>("shell_integration").ok().flatten().unwrap_or(true),
         refresh_env: t.get::<Option<bool>>("refresh_env").ok().flatten().unwrap_or(true),
         update_check: t.get::<Option<bool>>("update_check").ok().flatten().unwrap_or(true),
+        update_auto: t.get::<Option<bool>>("update_auto").ok().flatten().unwrap_or(true),
         theme_light,
         background: t.get::<Table>("background").map(|b| Background {
             image: b.get::<Option<String>>("image").ok().flatten(),

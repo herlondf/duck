@@ -429,10 +429,13 @@ config. Nos exemplos, troque os nomes de conta e as URLs pelos seus.
 
 - **Serve para:** limites de 5 horas e de 7 dias, custo do dia e sessões
   recentes, por perfil do Claude Code (`~/.claude`, `~/.claude-trabalho`…).
-- **Precisa:** do statusline do Duck. O `install.ps1 -ClaudeHooks` liga sozinho
-  onde não há statusline. Se você já tem um, chame
-  `<duck>\bin\duck-statusline.ps1` de dentro dele, passando o mesmo stdin, ou
-  grave você mesmo o JSON (os campos estão no cabeçalho do script).
+- **Precisa:** do statusline do Duck. O checklist da instalação (item
+  "statusline do Claude Code"), o `install.ps1 -ClaudeHooks` e o
+  `./install.sh --claude-hooks` ligam sozinhos onde não há statusline; num
+  perfil avulso, `duck install --statusline ~/.claude-x/settings.json`. Se você
+  já tem um, chame `duck statusline` (Linux/macOS) ou
+  `<duck>\bin\duck-statusline.ps1` (Windows) de dentro dele, passando o mesmo
+  stdin, ou grave você mesmo o JSON (os campos estão no cabeçalho do script).
 - **Config:** `['claude-usage'] = { enabled = true, warn_percent = 80 }`.
 
 ### Git, Portas, Notas, Snippets

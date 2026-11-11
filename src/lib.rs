@@ -29,6 +29,7 @@ pub mod colr;
 pub mod render;
 pub mod secret;
 pub mod server;
+pub mod setup;
 pub mod toast;
 pub mod update;
 
@@ -76,11 +77,13 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("send-file") => cli::send_file(&args[1..]),
         Some("relay") => relay::main(&args[1..]),
         Some("update") => update::main(&args[1..]),
+        Some("statusline") => setup::statusline(),
+        Some("config") => setup::config(&args[1..]),
         Some("guard") => guard::main(&args[1..]),
         Some("toast") => toast::run(args.get(1).map(String::as_str).unwrap_or("")),
         Some("--version" | "-V") => { println!("duck {}", env!("CARGO_PKG_VERSION")); 0 }
         Some("--help" | "-h") => {
-            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--quick] | plugin add|list|update | guard install|scan | why <pane> | queue ls|add|rm|up|now <pane> | msg <peer>[/aba] [--to aba] texto | send-file <peer> <arq> | peer list|find|connect|invite|join|doctor|sessions | relay | update [--check|--release|--source]");
+            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--statusline settings.json] [--quick] | config set <chave> <valor> | statusline | plugin add|list|update | guard install|scan | why <pane> | queue ls|add|rm|up|now <pane> | msg <peer>[/aba] [--to aba] texto | send-file <peer> <arq> | peer list|find|connect|invite|join|doctor|sessions | relay | update [--check|--release|--source]");
             0
         }
         _ => {

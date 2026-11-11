@@ -242,6 +242,10 @@ pub fn install(args: &[String]) -> i32 {
         let Some(path) = args.get(i + 1) else { eprintln!("uso: duck install --hooks <settings.json>"); return 2 };
         return install_hooks(path, &exe.to_string_lossy());
     }
+    if let Some(i) = args.iter().position(|a| a == "--statusline") {
+        let Some(path) = args.get(i + 1) else { eprintln!("uso: duck install --statusline <settings.json>"); return 2 };
+        return crate::setup::install_statusline(path, &exe);
+    }
     let quick = args.iter().any(|a| a == "--quick");
     let home = crate::config::home();
     // Linux: autostart do desktop (XDG). macOS: LaunchAgent.
@@ -547,6 +551,12 @@ pub fn doctor() -> i32 {
             HookState::Legacy => println!("!! hooks do Duck em ~/{name}/settings.json no formato antigo (trava o Claude sem Git Bash): {}", hooks_fix_cmd(&settings)),
             HookState::Invalid(e) => println!("!! ~/{name}/settings.json invalido: {e}"),
         }
+        // Statusline: alimenta o "Uso do Claude" e o limite das Rotinas.
+        match crate::setup::statusline_state(&settings) {
+            crate::setup::StatusState::Duck => println!("ok statusline do Duck em ~/{name}"),
+            crate::setup::StatusState::Other => println!("-- statusline sua em ~/{name} (Uso do Claude: chame `duck statusline` de dentro dela)"),
+            crate::setup::StatusState::Missing => println!("-- sem statusline em ~/{name}: duck install --statusline \"{}\"", settings.display()),
+        }
     }
     let script = crate::proto::data_dir().join("shell").join("duck.sh");
     if cfg!(windows) {
@@ -569,6 +579,12 @@ pub fn doctor() -> i32 {
     if repo {
         let on = crate::guard::installed(&here);
         println!("{}guarda de commit/push neste repo{}", ok(on), if on { format!(" ({} palavra(s) proibida(s))", cfg.guard_words.len()) } else { "  (duck guard install)".into() });
+    }
+    // Atualizacoes: sozinha so na instalacao do release.
+    match crate::update::auto_mode(cfg.update_check, cfg.update_auto, &crate::update::kind()) {
+        crate::update::Auto::Install => println!("ok atualizacao automatica (release; update_auto = false so avisa)"),
+        crate::update::Auto::Notify => println!("-- atualizacao: so avisa ({})", if matches!(crate::update::kind(), crate::update::Kind::Release) { "update_auto = false" } else { "instalacao pelo codigo: duck update --check" }),
+        crate::update::Auto::Off => println!("-- atualizacao: desligada (update_check = false)"),
     }
     println!("{}mascara de segredos na tela{}", ok(cfg.secret_mask), if cfg.secret_mask { "" } else { "  (secret_mask = false na config)" });
     doctor_extensions();

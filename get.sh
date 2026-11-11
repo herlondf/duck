@@ -4,7 +4,13 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/herlondf/duck/main/get.sh | sh
 #   curl -fsSL .../get.sh | sh -s -- --boot --claude-hooks     (opcoes do install.sh)
+#   curl -fsSL .../get.sh | sh -s -- --yes                     (sem perguntas: o padrao do checklist)
 #   DUCK_VERSION=v0.1.0 sh get.sh                              (uma versao especifica)
+#
+# Na primeira instalacao o install.sh mostra um checklist (hooks e statusline
+# do Claude Code, shell integration, ~/.duck.lua, menu, login, atualizacoes
+# automaticas, extensoes); no `curl | sh` ele le as respostas do /dev/tty.
+# First install shows a checklist; under `curl | sh` answers come from /dev/tty.
 set -eu
 
 repo="${DUCK_REPO:-herlondf/duck}"

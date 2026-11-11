@@ -4,7 +4,12 @@
 
     irm https://raw.githubusercontent.com/herlondf/duck/main/get.ps1 | iex
     & ([scriptblock]::Create((irm .../get.ps1))) -Boot -ClaudeHooks    (opcoes do install.ps1)
+    & ([scriptblock]::Create((irm .../get.ps1))) -Yes                  (sem perguntas: o padrao do checklist)
     $env:DUCK_VERSION = 'v0.1.0'; irm .../get.ps1 | iex               (uma versao especifica)
+
+  Na primeira instalacao o install.ps1 mostra um checklist (hooks e statusline
+  do Claude Code, ~/.duck.lua, menu Iniciar, logon, atualizacoes automaticas,
+  extensoes): numeros ligam/desligam, Enter confirma.
 
   Fica em %LOCALAPPDATA%\Duck (binarios em %LOCALAPPDATA%\Duck\bin, no PATH do usuario).
   Roda no Windows PowerShell 5.1 ou no PowerShell 7; o instalador precisa do 7 (pwsh).

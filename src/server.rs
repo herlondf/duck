@@ -2601,6 +2601,8 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
                         "agent": p.agent, "attention": p.attention, "parent": p.parent,
                         "floating": t.floating == Some(*id), "private": p.private,
                         "idle_secs": p.last_output.elapsed().as_secs(),
+                        // Comando rodando agora (shell integration): a atualizacao automatica espera.
+                        "running": p.marks.last().is_some_and(|k| k.out_start.is_some() && k.exit.is_none() && !k.command.is_empty()),
                         "loop": m.loops.get(id).map(|l| l.label()),
                     }))).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
