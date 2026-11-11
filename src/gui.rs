@@ -1666,7 +1666,11 @@ impl Gui {
                 items.push(Item::new(format!("  {line}"), "pasta", "workspace", vec![json!(name), json!(line)]));
             }
         }
-        self.overlay = Some(Overlay::list("Workspaces (Enter troca; pasta cria)", items));
+        // Abre com o workspace atual selecionado (e nao o primeiro da lista).
+        let cur = self.frame.workspaces.iter().position(|w| *w == self.frame.workspace).unwrap_or(0);
+        let mut o = Overlay::list("Workspaces (Enter troca; pasta cria)", items);
+        if let Some(i) = o.shown.iter().position(|&i| i == cur) { o.sel = i; }
+        self.overlay = Some(o);
     }
 
     fn open_agents(&mut self) {
