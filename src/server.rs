@@ -212,6 +212,9 @@ struct Pane {
     ports: std::collections::BTreeSet<u16>,
     /// Recados para o agente: entregues quando ele parar (done/idle).
     queue: Vec<String>,
+    /// Ultimo recado entregue: o proximo espera o agente pegar este (dois
+    /// colados no mesmo prompt viram um so, ou o segundo cai no meio do trabalho).
+    delivered_at: Option<Instant>,
     /// Gravacao asciinema (.cast v2) em andamento.
     rec: Option<(std::fs::File, Instant, String)>,
     /// O ConPTY repassa os OSC na hora mas repinta o texto depois: a posicao
@@ -276,6 +279,24 @@ impl Pane {
         }
     }
 
+    /// O historico encolheu (o `clear` manda ESC[3J): cada linha absoluta
+    /// subiu `by`. Desloca as marcas; as que sumiram com o historico saem
+    /// (senao o cartao, o selo e a barra de um comando velho caem por cima
+    /// do texto novo). O comando ainda rodando fica, sem posicao do prompt.
+    fn history_shrank(&mut self, by: usize) { shift_marks(&mut self.marks, by as i64); }
+    /// Pode receber recado agora: agente parado e o ultimo recado ja assentou.
+    fn ready_for_msg(&self) -> bool {
+        self.agent.as_ref().is_some_and(|a| a.state == "done" || a.state == "idle")
+            && self.delivered_at.is_none_or(|t| t.elapsed() >= MSG_SETTLE)
+    }
+    /// Passa a saida pelo parser vigiando o historico (ESC[3J o apaga).
+    fn advance(&mut self, data: &[u8]) {
+        let before = self.term.history_size();
+        self.parser.advance(&mut self.term, data);
+        let after = self.term.history_size();
+        if after < before { self.history_shrank(before - after); }
+    }
+
     fn write(&self, b: &[u8]) { let _ = self.io.send(Io::Data(b.to_vec())); }
     /// Fixa as marcas pendentes na posicao atual do cursor (fim do prompt):
     /// prompt e inicio do texto digitado na linha do cursor; o comando
@@ -304,6 +325,23 @@ impl Pane {
         let by_mem = (mb * 1_048_576.0 / (self.cols.max(1) as f64 * 32.0)) as usize;
         scrollback.min(by_mem.max(1000))
     }
+}
+
+/// Marcas depois de o historico perder `d` linhas do topo.
+fn shift_marks(marks: &mut Vec<Mark>, d: i64) {
+    let lost = i64::MIN / 2;
+    marks.retain_mut(|k| {
+        let open = k.out_start.is_some() && k.out_end.is_none();
+        if k.prompt <= lost { return open; }
+        k.prompt -= d;
+        k.input = k.input.map(|(a, c)| (a - d, c)).filter(|(a, _)| *a >= 0);
+        k.out_start = k.out_start.map(|a| (a - d).max(0));
+        k.out_end = k.out_end.map(|a| a - d);
+        if k.prompt >= 0 { return true; }
+        if k.out_end.is_some_and(|e| e < 0) || !open { return false; }
+        k.prompt = lost;
+        true
+    });
 }
 
 struct Tab {
@@ -606,7 +644,7 @@ fn attach(srv: &Arc<Server>, m: &mut Mux, id: Id, client: ptyhost::Client, pid: 
         term, parser, io: tx, pid, title: meta.title, cwd: meta.cwd, domain: meta.domain, cmd: meta.cmd,
         agent: meta.agent, attention: false, last_output: Instant::now(), cols, rows, parent: meta.parent,
         token: meta.token, private: meta.private, marks: Vec::new(),
-        ports: Default::default(), queue: Vec::new(), rec: None, marks_pending: false, reanchor: false, progress: None,
+        ports: Default::default(), queue: Vec::new(), delivered_at: None, rec: None, marks_pending: false, reanchor: false, progress: None,
         mute_replies_until: Instant::now(), bell_at: None, secrets_seen: Default::default(), secrets_new: Vec::new(), reveal_until: None,
     };
     let lines = p.history_lines(m.cfg.scrollback, m.cfg.scrollback_mb);
@@ -691,7 +729,7 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
     let mut done_cmd: Option<Value> = None;
     let mut had_prompt_marks = false;
     for (end, ev) in osc_events(data) {
-        p.parser.advance(&mut p.term, &data[pos..end]);
+        p.advance(&data[pos..end]);
         pos = end;
         match ev {
             Osc::Cwd(c) => p.cwd = c,
@@ -742,7 +780,7 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
             }
         }
     }
-    p.parser.advance(&mut p.term, &data[pos..]);
+    p.advance(&data[pos..]);
     if !replay { p.last_output = Instant::now(); }
     // Marcas novas (ou resize esperando o repaint): um frame depois do silencio
     // fixa as posicoes.
@@ -948,8 +986,10 @@ const PEER_MAX_TEXT: usize = 16_000;
 struct Conv { peer: String, remote_pane: Option<Id>, local_pane: Option<Id>, hops: u32 }
 
 /// Agente parado recebe ja; trabalhando, quando parar.
-fn queue_or_deliver(p: &mut Pane, text: String) {
-    if p.agent.as_ref().is_some_and(|a| a.state == "done" || a.state == "idle") { deliver(p, &text); } else { p.queue.push(text); }
+/// Entrega agora se o agente esta parado e nada espera na fila (a ordem vale);
+/// senao enfileira. true = entregou.
+fn queue_or_deliver(p: &mut Pane, text: String) -> bool {
+    if p.queue.is_empty() && p.ready_for_msg() { deliver(p, &text); true } else { p.queue.push(text); false }
 }
 
 /// Pane que o usuario esta olhando (janela focada primeiro).
@@ -1438,7 +1478,8 @@ fn list_agents(cands: &[(Id, Vec<String>)], ids: &[Id]) -> String {
     cands.iter().filter(|c| ids.contains(&c.0)).map(|(id, ns)| format!("{id} ({})", ns.iter().take(2).cloned().collect::<Vec<_>>().join(" / "))).collect::<Vec<_>>().join(", ")
 }
 
-fn deliver(p: &Pane, text: &str) {
+fn deliver(p: &mut Pane, text: &str) {
+    p.delivered_at = Some(Instant::now());
     let bracketed = p.term.mode().contains(TermMode::BRACKETED_PASTE);
     let clean_text: String = text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
     if bracketed { p.write(format!("\x1b[200~{}\x1b[201~", clean_text.replace('\n', "\r")).as_bytes()); }
@@ -1590,7 +1631,7 @@ fn loops_tick(srv: &Arc<Server>) {
                 let msg = format!("[Loop do Duck, volta {}/{}] A verificação `{}` falhou (exit {code}). Corrija a causa e rode a verificação você mesmo antes de parar.\n\nFim da saída:\n{}",
                     l.iter + 1, l.max, l.check, shown);
                 if let Some(p) = m.panes.get_mut(&id) {
-                    if p.agent.as_ref().is_some_and(|a| a.state == "done" || a.state == "idle") { deliver(p, &msg); } else { p.queue.push(msg); }
+                    queue_or_deliver(p, msg);
                 }
             }
             let l = m.loops[&id].clone();
@@ -1700,7 +1741,7 @@ fn set_state(m: &mut Mux, id: Id, state: &str, name: Option<&str>, source: &str)
     let call = (state == "blocked" || state == "done") && !seen;
     if call { p.attention = true; }
     // Recado na fila: entregue quando o agente para (sem interromper o trabalho).
-    if (state == "done" || state == "idle") && !p.queue.is_empty() {
+    if !p.queue.is_empty() && p.ready_for_msg() {
         let text = p.queue.remove(0);
         deliver(p, &text);
         p.attention = false;
@@ -1802,6 +1843,12 @@ fn sync_loop(srv: Arc<Server>) {
 
 // ------------------------------------------------------------------ agentes
 
+/// Depois de entregar um recado, quanto esperar antes do proximo.
+const MSG_SETTLE: Duration = Duration::from_secs(4);
+/// Sem saida ha esse tempo e com cara de parado: a fila anda mesmo que o
+/// estado diga outra coisa (Esc no meio do trabalho nao dispara o Stop).
+const MSG_QUIET: Duration = Duration::from_secs(5);
+
 const BLOCKED_HINTS: [&str; 6] = ["Do you want to", "Would you like to", "❯ 1. Yes", "(y/n)", "[Y/n]", "Allow "];
 
 fn agent_loop(srv: Arc<Server>) {
@@ -1902,10 +1949,39 @@ fn agent_loop(srv: Arc<Server>) {
             set_state(&mut m, id, &state, found.as_deref(), "auto");
             if before.as_deref() != Some(state.as_str()) { changed = true; }
         }
+        if drain_queues(&mut m) { changed = true; }
         drop(m);
         if changed { srv.notify(); }
         loops_tick(&srv);
     }
+}
+
+/// Recados presos: o estado so muda pelos hooks, e eles falham (Esc
+/// interrompe sem Stop; um hook que nao rodou). Se a fila tem recado e o
+/// agente esta visivelmente parado (titulo ✳ do Claude, tela quieta, nada
+/// pedindo resposta), entrega o proximo. true = entregou algum.
+fn drain_queues(m: &mut Mux) -> bool {
+    let mut any = false;
+    for p in m.panes.values_mut() {
+        if p.queue.is_empty() || p.agent.is_none() { continue; }
+        let settled = p.delivered_at.is_none_or(|t| t.elapsed() >= MSG_SETTLE);
+        let parked = p.ready_for_msg() || (settled && looks_parked(p));
+        if !parked { continue; }
+        let text = p.queue.remove(0);
+        deliver(p, &text);
+        p.attention = false;
+        any = true;
+    }
+    any
+}
+
+/// Parado pela tela, sem confiar no estado: titulo ✳ (sem spinner), sem
+/// saida ha alguns segundos e nenhuma pergunta na tela.
+fn looks_parked(p: &Pane) -> bool {
+    if !p.title.starts_with('✳') || p.last_output.elapsed() < MSG_QUIET { return false; }
+    let rows = p.term.screen_lines() as i32;
+    let screen = (rows.saturating_sub(12)..rows).map(|l| line_text(&p.term, l)).collect::<Vec<_>>().join("\n");
+    !BLOCKED_HINTS.iter().any(|h| screen.contains(h))
 }
 
 // ------------------------------------------------------------------ frames
@@ -2619,15 +2695,8 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let id = target(srv, m, a)?;
             let text = arg_str(a, "text").ok_or("falta text")?.to_string();
             let p = m.panes.get_mut(&id).unwrap();
-            let idle = p.agent.as_ref().is_some_and(|ag| ag.state == "done" || ag.state == "idle");
-            if idle {
-                // Ja parado: entrega agora.
-                deliver(p, &text);
-                proto::ok(json!({"delivered": true}))
-            } else {
-                p.queue.push(text);
-                proto::ok(json!({"queued": p.queue.len()}))
-            }
+            if queue_or_deliver(p, text) { proto::ok(json!({"delivered": true})) }
+            else { proto::ok(json!({"queued": p.queue.len()})) }
         }
         "record" => {
             let id = target(srv, m, a)?;
@@ -3107,7 +3176,7 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let mut l = LoopRun { pane: id, check: check.clone(), max, iter: 0, phase: "agent".into(), sent_at: 0, started: now, last_exit: None, last_out: String::new() };
             if !task.is_empty() {
                 let msg = format!("{task}\n\n[Loop do Duck] Quando você parar, o Duck roda `{check}`; se falhar, a saída volta para você (até {max} voltas). Rode a verificação antes de parar.");
-                if p.agent.as_ref().is_some_and(|a| a.state == "done" || a.state == "idle") { deliver(p, &msg); } else { p.queue.push(msg); }
+                queue_or_deliver(p, msg);
                 l.sent_at = now;
             }
             m.loops.insert(id, l);
@@ -4090,6 +4159,19 @@ mod tests {
         let again = restore_warning(&a, &[]);
         assert!(!again.contains("Para instalar"), "{again}");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn clear_scrollback_drops_old_marks() {
+        let mk = |prompt, out: Option<i64>, end: Option<i64>| Mark { prompt, out_start: out, out_end: end, exit: end.map(|_| 0), ..Default::default() };
+        // Dois comandos velhos no historico, um rodando que comecou nele, o prompt atual na tela.
+        let mut marks = vec![mk(10, Some(11), Some(20)), mk(20, Some(21), Some(95)), mk(95, Some(96), None), mk(130, None, None)];
+        // `clear`: o historico (100 linhas) some.
+        shift_marks(&mut marks, 100);
+        assert_eq!(marks.len(), 2, "{marks:?}");
+        assert_eq!(marks[0].prompt, i64::MIN / 2); // rodando: fica, sem prompt
+        assert_eq!(marks[0].out_start, Some(0));
+        assert_eq!(marks[1].prompt, 30);
     }
 
     #[test]

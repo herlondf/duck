@@ -483,6 +483,8 @@ pub struct Gui {
     cursor_anim: Option<([f32; 2], [f32; 2], Instant)>,
     cursor_shown: [f32; 2],
     last_key: Instant,
+    /// Tecla morta esperando a proxima (~ ´ ` ^ do teclado internacional).
+    dead: Option<char>,
     tab_hover: Option<(usize, Instant)>,
     tab_preview: Option<(usize, Vec<String>)>,
     tab_drag: Option<(usize, f32, bool)>,
@@ -602,7 +604,7 @@ impl Gui {
             branches: HashMap::new(),
             hits: vec![], tab_rects: vec![], tab_row: (0.0, 0.0), sidebar_collapsed: false, focus_mode: false, agent_panel: None,
             rect_anim: HashMap::new(), prev_rects: HashMap::new(), ghosts: vec![], anim_tab_key: String::new(),
-            ws_anim: None, cursor_anim: None, cursor_shown: [0.0, 0.0], last_key: Instant::now(), tab_hover: None, tab_preview: None,
+            ws_anim: None, cursor_anim: None, cursor_shown: [0.0, 0.0], last_key: Instant::now(), dead: None, tab_hover: None, tab_preview: None,
             tab_drag: None, badge_drag: None, badge_rects: vec![], badge_row: (0.0, 0.0), shortcuts: vec![], menus: vec![], ext_order: vec![], div_drag: None, title_click: Instant::now() - Duration::from_secs(5), resize_edge: None,
             collapsed: HashMap::new(), pinned: HashMap::new(), search_hits: None, composer: None, ac: None, ac_dismissed: String::new(),
             usage: HashMap::new(), exe_cache: HashMap::new(), git_cache: HashMap::new(), started: Instant::now(), toasted: HashMap::new(), last_loop_check: String::new(), splash: None, sys_panel: false, exts: Default::default(), ext_panel: None, ext_w: 400.0, ext_drag: false, ext_scroll: 0.0, ext_content: 0.0, ext_context: None,
@@ -2088,8 +2090,9 @@ impl Gui {
 
     // -------------------------------------------------------------- teclado
 
-    fn key(&mut self, ev: KeyEvent) {
+    fn key(&mut self, mut ev: KeyEvent) {
         if ev.state != ElementState::Pressed { return; }
+        if !self.dead_key(&mut ev) { return; }
         if self.splash.take().is_some() { return self.redraw(); }
         self.last_key = Instant::now();
         if self.composer.is_some() && self.overlay.is_none() { return self.composer_key(&ev); }
@@ -2800,6 +2803,30 @@ fn register_hotkey(spec: &str, proxy: EventLoopProxy<UserEv>) {
 }
 
 /// Tecla -> bytes para o shell.
+impl Gui {
+    /// Teclas mortas. Com combinacao (~ + a = ã, ~ + espaco = ~) o winit ja
+    /// manda o texto pronto; sem combinacao (~ + /) o compose e cancelado e
+    /// a tecla chega sem texto: o ~ sumia e so o / ia. Aqui o ~ volta na
+    /// frente, como em qualquer terminal. false = tecla consumida.
+    fn dead_key(&mut self, ev: &mut KeyEvent) -> bool {
+        if let Key::Dead(d) = &ev.logical_key {
+            // Segunda morta (~ + ~): o texto ja vem pronto.
+            if ev.text.is_some() { self.dead = None; return true; }
+            self.dead = *d;
+            return false;
+        }
+        // Shift/AltGr entre a morta e a letra nao cancelam.
+        if matches!(ev.logical_key, Key::Named(NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::AltGraph | NamedKey::Super | NamedKey::Meta | NamedKey::CapsLock)) { return true; }
+        let Some(d) = self.dead.take() else { return true };
+        if ev.text.is_none() {
+            if let Key::Character(c) = &ev.logical_key {
+                if !self.mods.control_key() && !self.mods.alt_key() { ev.text = Some(format!("{d}{c}").into()); }
+            }
+        }
+        true
+    }
+}
+
 fn encode_key(ev: &KeyEvent, mods: ModifiersState, app_cursor: bool) -> Option<String> {
     let ctrl = mods.control_key();
     let alt = mods.alt_key();

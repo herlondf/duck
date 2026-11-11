@@ -77,6 +77,10 @@ pub fn hook() -> i32 {
     let state = match name {
         "SessionStart" => "idle",
         "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => "working",
+        // "Claude is waiting for your input" (idle_prompt) tambem e Notification,
+        // mas ele esta parado, nao pedindo nada: como blocked, os recados da
+        // fila nunca eram entregues.
+        "Notification" if notification_idle(&ev) => "idle",
         "Notification" | "PermissionRequest" => "blocked",
         "Stop" => "done",
         "SessionEnd" => "none",
@@ -115,6 +119,14 @@ pub fn hook() -> i32 {
     }
     if let Ok(mut c) = Conn::connect() { let _ = c.call(req); }
     0
+}
+
+/// Notification de "parado esperando voce" (nao de permissao).
+fn notification_idle(ev: &Value) -> bool {
+    match ev["notification_type"].as_str() {
+        Some(t) => t == "idle_prompt",
+        None => ev["message"].as_str().is_some_and(|m| m.to_lowercase().contains("waiting for your input")),
+    }
 }
 
 /// Escreve a config de exemplo em ~/.duck.lua (sem sobrescrever).
@@ -341,6 +353,14 @@ fn install_hooks(path: &str, exe: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_idle_nao_e_bloqueio() {
+        assert!(notification_idle(&json!({"notification_type": "idle_prompt", "message": "x"})));
+        assert!(!notification_idle(&json!({"notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash"})));
+        assert!(notification_idle(&json!({"message": "Claude is waiting for your input"})));
+        assert!(!notification_idle(&json!({"message": "Claude needs your permission to use Bash"})));
+    }
 
     #[test]
     fn hooks_windows_e_linux() {
