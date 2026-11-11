@@ -2153,6 +2153,10 @@ impl Gui {
         // Compondo no IME: a tecla e dele (o texto vem no Commit).
         if !self.preedit.0.is_empty() { return; }
         if !self.dead_key(&mut ev) { return; }
+        // Super/Meta/Cmd + tecla e do sistema (KDE: Meta+4 ativa o 4o item da
+        // barra de tarefas), nunca texto: o "4" ia parar no shell ao trocar de
+        // janela. So passa se for um atalho do Duck.
+        if self.mods.super_key() && !super_bound(&self.keys, &key_name(&ev), self.mods) { return; }
         if self.splash.take().is_some() { return self.redraw(); }
         self.last_key = Instant::now();
         if self.composer.is_some() && self.overlay.is_none() { return self.composer_key(&ev); }
@@ -2988,6 +2992,11 @@ impl Gui {
         self.sel = None;
         self.send_keys(&t);
     }
+}
+
+/// Algum atalho do Duck usa essa tecla com esses modificadores (com Super).
+fn super_bound(keys: &[Binding], name: &str, mods: ModifiersState) -> bool {
+    keys.iter().any(|b| b.key == name && b.mods == mods)
 }
 
 fn encode_key(ev: &KeyEvent, mods: ModifiersState, app_cursor: bool) -> Option<String> {
