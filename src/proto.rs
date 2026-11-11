@@ -138,6 +138,15 @@ impl Conn {
         self.reader.get_mut().flush()
     }
 
+    /// Uma linha crua (o frame da GUI parseia direto do texto, sem Value).
+    pub fn recv_line(&mut self) -> std::io::Result<String> {
+        let mut line = String::new();
+        if self.reader.read_line(&mut line)? == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "server fechou"));
+        }
+        Ok(line)
+    }
+
     pub fn recv(&mut self) -> std::io::Result<Value> {
         let mut line = String::new();
         if self.reader.read_line(&mut line)? == 0 {

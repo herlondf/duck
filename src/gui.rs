@@ -88,6 +88,8 @@ struct PaneView {
     #[serde(default)] lines: Option<Vec<Vec<Run>>>,
     /// Frame por diferenca: so as linhas que mudaram.
     #[serde(default)] rows: Option<HashMap<String, Vec<Run>>>,
+    /// Quantas linhas a tela subiu antes de aplicar `rows` (saida rolando).
+    #[serde(default)] shift: usize,
     #[serde(default)] blocks: Vec<Block>,
     /// (fracao, 0 rodando / 1 ok / 2 falhou)
     #[serde(default)] ticks: Vec<(f64, u8)>,
@@ -160,6 +162,8 @@ impl PaneView {
         v
     }
     fn row_string(&self, row: usize) -> String { self.row_chars(row).into_iter().collect::<String>() }
+    /// Linha so com espacos (sem montar a linha: roda a cada desenho).
+    fn row_blank(&self, row: usize) -> bool { self.lines().get(row).is_none_or(|runs| runs.iter().all(|r| r.1.trim().is_empty())) }
     fn link_at(&self, row: usize, col: usize) -> Option<(String, String)> {
         let runs = self.lines().get(row)?;
         runs.iter().find(|r| (r.0 as usize..r.0 as usize + r.1.chars().count()).contains(&col))
@@ -875,10 +879,22 @@ impl Gui {
         let inbox = self.exts.inbox.clone();
         std::thread::spawn(move || loop {
             if let Ok(mut c) = Conn::connect_or_spawn() {
-                if c.send(&json!({"cmd": "subscribe", "client": client})).is_ok() {
+                // proto 2: a janela entende `shift` (server antigo ignora o campo).
+                if c.send(&json!({"cmd": "subscribe", "client": client, "proto": 2})).is_ok() {
                     // Server novo (reinicio/queda) nao sabe o tamanho da janela.
                     let _ = proxy.send_event(UserEv::Connected);
-                    while let Ok(v) = c.recv() {
+                    while let Ok(line) = c.recv_line() {
+                        // Frame (o server novo poe "t" na frente): direto do texto, sem passar por Value.
+                        if line.starts_with(r#"{"t":"frame""#) {
+                            if let Ok(f) = serde_json::from_str::<Frame>(&line) {
+                                let mut l = latest.lock().unwrap();
+                                let mut prev = l.0.take();
+                                l.0 = Some(merge_frame(prev.as_mut(), f));
+                            }
+                            if proxy.send_event(UserEv::Frame).is_err() { return; }
+                            continue;
+                        }
+                        let Ok(v) = serde_json::from_str::<Value>(&line) else { break };
                         if v.get("t").and_then(|t| t.as_str()) == Some("ext") {
                             let ext = v["ext"].as_str().unwrap_or("").to_string();
                             inbox.lock().unwrap().push((ext, v["msg"].clone()));
@@ -889,8 +905,8 @@ impl Gui {
                         match v.get("t").and_then(|t| t.as_str()) {
                             // Frames por diferenca se acumulam: aplica sobre o anterior ainda nao lido.
                             Some("frame") => if let Ok(f) = serde_json::from_value::<Frame>(v) {
-                                let prev = l.0.take();
-                                l.0 = Some(merge_frame(prev.as_ref(), f));
+                                let mut prev = l.0.take();
+                                l.0 = Some(merge_frame(prev.as_mut(), f));
                             },
                             Some("event") => l.1.push(v),
                             _ => {}
@@ -2308,7 +2324,9 @@ impl Gui {
             (l.0.take(), std::mem::take(&mut l.1))
         };
         if let Some(f) = f {
-            let f = merge_frame(Some(&self.frame), f);
+            // As linhas da tela atual passam para o frame novo (sem copia);
+            // self.frame recebe o novo logo abaixo.
+            let f = merge_frame(Some(&mut self.frame), f);
             if f.clipboard.0 > self.clip_seq {
                 if self.clip_seq != 0 && !f.clipboard.1.is_empty() {
                     let _ = clip_set(&f.clipboard.1);
@@ -2556,27 +2574,34 @@ fn save_palette_rank(rank: &HashMap<String, (u64, u32)>) {
     if let Ok(s) = serde_json::to_vec(&m) { let _ = std::fs::write(palette_rank_path(), s); }
 }
 
-/// Aplica as linhas alteradas (`rows`) sobre o frame anterior do mesmo pane.
-fn merge_frame(prev: Option<&Frame>, mut f: Frame) -> Frame {
+/// Aplica as linhas alteradas (`rows`, depois de subir `shift`) sobre o
+/// frame anterior do mesmo pane. As linhas do anterior sao movidas, nao copiadas.
+fn merge_frame(prev: Option<&mut Frame>, mut f: Frame) -> Frame {
     // Sem base ainda (a janela ja consumiu o anterior): deixa `rows` pendente
     // para a janela aplicar sobre a tela que ela tem.
     let Some(pf) = prev else { return f };
     for p in &mut f.panes {
         if p.lines.is_some() { continue; }
-        let old = pf.panes.iter().find(|q| q.id == p.id && q.w == p.w && q.h == p.h);
-        // Anterior tambem so com diferencas: soma as duas (a nova vence).
-        if let Some(o) = old.filter(|o| o.lines.is_none()) {
-            let mut rows = o.rows.clone().unwrap_or_default();
+        let mut old = pf.panes.iter_mut().find(|q| q.id == p.id && q.w == p.w && q.h == p.h);
+        // Anterior tambem so com diferencas: soma as duas (a nova vence). O
+        // deslocamento soma e as linhas do anterior sobem junto com a tela.
+        if let Some(o) = old.as_mut().filter(|o| o.lines.is_none()) {
+            let k = p.shift;
+            let mut rows: HashMap<String, Vec<Run>> = o.rows.take().unwrap_or_default().into_iter()
+                .filter_map(|(i, r)| { let i = i.parse::<usize>().ok()?; (i >= k).then(|| ((i - k).to_string(), r)) }).collect();
             rows.extend(p.rows.take().unwrap_or_default());
             p.rows = Some(rows);
+            p.shift += o.shift;
             continue;
         }
-        let mut lines = old.map(|q| q.lines().to_vec()).unwrap_or_default();
+        let mut lines = old.and_then(|q| q.lines.take()).unwrap_or_default();
+        lines.drain(..p.shift.min(lines.len()));
         lines.resize(p.h as usize, Vec::new());
         for (k, runs) in p.rows.take().unwrap_or_default() {
             if let Ok(i) = k.parse::<usize>() { if i < lines.len() { lines[i] = runs; } }
         }
         p.lines = Some(lines);
+        p.shift = 0;
     }
     f
 }
@@ -3493,7 +3518,8 @@ mod tests {
         let mut rows = HashMap::new();
         rows.insert("1".to_string(), vec![Run(0, "b".into(), -1, -2, 0, None)]);
         let next = Frame { panes: vec![PaneView { id: 1, w: 5, h: 2, lines: None, rows: Some(rows), ..Default::default() }], ..Default::default() };
-        let m = merge_frame(Some(&prev), next);
+        let mut prev = prev;
+        let m = merge_frame(Some(&mut prev), next);
         assert_eq!(m.panes[0].lines()[0][0].1, "a");
         assert_eq!(m.panes[0].lines()[1][0].1, "b");
     }
@@ -3508,12 +3534,66 @@ mod tests {
         let d1 = merge_frame(None, d1);
         assert!(d1.panes[0].lines.is_none());
         let d2 = Frame { panes: vec![PaneView { id: 1, w: 5, h: 2, rows: Some(r2), ..Default::default() }], ..Default::default() };
-        let both = merge_frame(Some(&d1), d2);
+        let mut d1 = d1;
+        let both = merge_frame(Some(&mut d1), d2);
         assert_eq!(both.panes[0].rows.as_ref().unwrap().len(), 2);
         let base = Frame { panes: vec![PaneView { id: 1, w: 5, h: 2, lines: Some(vec![vec![Run(0, "a".into(), -1, -2, 0, None)], vec![Run(0, "b".into(), -1, -2, 0, None)]]), ..Default::default() }], ..Default::default() };
-        let full = merge_frame(Some(&base), both);
+        let mut base = base;
+        let full = merge_frame(Some(&mut base), both);
         assert_eq!(full.panes[0].lines()[0][0].1, "x");
         assert_eq!(full.panes[0].lines()[1][0].1, "y");
+    }
+
+    fn one(t: &str) -> Vec<Run> { vec![Run(0, t.into(), -1, -2, 0, None)] }
+    fn texts(f: &Frame) -> Vec<String> { f.panes[0].lines().iter().map(|r| r.first().map(|x| x.1.clone()).unwrap_or_default()).collect() }
+
+    #[test]
+    fn merge_shift_and_pending_diffs() {
+        let pane = |lines: Option<Vec<Vec<Run>>>, rows: &[(usize, &str)], shift: usize| Frame { panes: vec![PaneView {
+            id: 1, w: 5, h: 4, lines, shift, rows: (!rows.is_empty() || shift > 0).then(|| rows.iter().map(|(i, t)| (i.to_string(), one(t))).collect()),
+            ..Default::default() }], ..Default::default() };
+        // Tela a b c d; sobe 1 e chega e.
+        let mut base = pane(Some(vec![one("a"), one("b"), one("c"), one("d")]), &[], 0);
+        let m = merge_frame(Some(&mut base), pane(None, &[(3, "e")], 1));
+        assert_eq!(texts(&m), ["b", "c", "d", "e"]);
+        // Dois diffs pendentes (sobe 1 + e, sobe 2 + f g) compostos antes de ter base.
+        let mut d1 = pane(None, &[(3, "e")], 1);
+        let both = merge_frame(Some(&mut d1), pane(None, &[(2, "f"), (3, "g")], 2));
+        assert_eq!(both.panes[0].shift, 3);
+        let mut base = pane(Some(vec![one("a"), one("b"), one("c"), one("d")]), &[], 0);
+        let full = merge_frame(Some(&mut base), both);
+        assert_eq!(texts(&full), ["d", "e", "f", "g"]);
+        // Frame do server pelo JSON (com "t" na frente) parseia direto.
+        let f: Frame = serde_json::from_str(r#"{"t":"frame","panes":[{"id":1,"x":0,"y":0,"w":5,"h":4,"title":"","cwd":"","attention":false,"scroll":0,"history":0,"app_cursor":false,"alt_screen":false,"cursor":null,"shift":2,"rows":{"3":[[0,"z",-1,-2,0]]}}],"workspace":"w","workspaces":["w"],"tabs":[],"active_pane":1,"cols":5,"rows":4,"agents":{},"clipboard":[0,""]}"#).unwrap();
+        let mut base = pane(Some(vec![one("a"), one("b"), one("c"), one("d")]), &[], 0);
+        assert_eq!(texts(&merge_frame(Some(&mut base), f)), ["c", "d", "", "z"]);
+    }
+
+    /// `cargo test --profile quick bench_gui_parse -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_gui_parse() {
+        use crate::server::testkit::*;
+        let srv = server((240, 66));
+        let ids = add_panes(&srv, 4);
+        let data = sample_output(4 << 20);
+        let mut sent = Sent::new();
+        let mut frames = vec![client_frame(&srv, "g", &mut sent).0];
+        for id in &ids { feed_all(&srv, *id, &data[..256 << 10], 4096); }
+        frames.push(client_frame(&srv, "g", &mut Sent::new()).0);
+        for c in data[256 << 10..].chunks(2 << 10).take(400) { feed_all(&srv, ids[0], c, 2048); frames.push(client_frame(&srv, "g", &mut sent).0); }
+        let lines: Vec<String> = frames.iter().map(|b| String::from_utf8(b.clone()).unwrap()).collect();
+        let bytes: usize = lines.iter().map(|l| l.len()).sum();
+        let t = Instant::now();
+        for l in &lines { let v: Value = serde_json::from_str(l).unwrap(); let _f: Frame = serde_json::from_value(v).unwrap(); }
+        let via_value = t.elapsed();
+        let t = Instant::now();
+        let mut cur: Option<Frame> = None;
+        for l in &lines { let f: Frame = serde_json::from_str(l).unwrap(); cur = Some(merge_frame(cur.as_mut(), f)); }
+        let direct = t.elapsed();
+        assert!(cur.is_some());
+        println!("gui: {} frames, {} bytes/frame; Value+from_value {:.1} us/frame, from_str+merge {:.1} us/frame",
+            lines.len(), bytes / lines.len(), via_value.as_micros() as f64 / lines.len() as f64, direct.as_micros() as f64 / lines.len() as f64);
     }
 
     #[test]

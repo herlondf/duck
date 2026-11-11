@@ -3,14 +3,16 @@
 //! os shells continuam; o proximo server reconecta e refaz abas e splits a
 //! partir de live.json.
 //!
-//! Estado unico em `Mux` atras de um Mutex. Threads:
+//! Estado em `Mux` atras de um Mutex; o terminal de cada pane (`Vt`) tem lock
+//! proprio (ordem: Mux -> Vt -> filas; detalhes em `Vt`). Threads:
 //!   - accept: uma por conexao (request/response em JSON por linha);
 //!   - por pane: leitora (host -> parser VT) e escritora (fila -> host);
 //!   - eventos do terminal (titulo, bell, clipboard, respostas a queries);
 //!   - agentes (a cada 2s), autosave/checkpoint, live.json, flush do
-//!     synchronized output.
+//!     synchronized output, acoes atrasadas (`later`).
 //! Clientes com `subscribe` recebem frames: a 1a vez a tela inteira, depois
-//! so as linhas que mudaram.
+//! so as linhas que mudaram (e quanto a tela rolou, `shift`). As linhas ficam
+//! montadas por pane (`RowCache`), entao 3 janelas custam quase o mesmo que 1.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -198,9 +200,47 @@ struct Mark {
 
 enum Io { Data(Vec<u8>), Resize(u16, u16), Kill }
 
-struct Pane {
+/// Terminal do pane (grade + parser VT) com lock proprio: a saida de um pane
+/// e parseada sem segurar o Mux, e o frame de um pane nao espera o parse de
+/// outro. Ordem dos locks: Mux -> Vt -> timers. Nunca pegar o Mux segurando
+/// um Vt, nem dois Vt ao mesmo tempo (o mutex nao e reentrante: quem segura o
+/// guard nao chama funcao que pega o Vt de novo).
+struct Vt {
     term: Term<Listener>,
     parser: ansi::Processor,
+    /// Sobe a cada acesso mutavel (saida, resize, rolagem): o cache de linhas
+    /// do frame e o da tela do agente valem enquanto ele nao muda.
+    gen: u64,
+}
+
+impl Vt {
+    /// Passa a saida pelo parser; devolve quantas linhas o historico perdeu (ESC[3J).
+    fn advance(&mut self, data: &[u8]) -> usize {
+        let before = self.term.history_size();
+        self.parser.advance(&mut self.term, data);
+        before.saturating_sub(self.term.history_size())
+    }
+}
+
+/// Guard do Vt: leitura nao mexe no `gen`; qualquer `&mut` sobe ele.
+struct VtGuard<'a>(MutexGuard<'a, Vt>);
+impl std::ops::Deref for VtGuard<'_> {
+    type Target = Vt;
+    fn deref(&self) -> &Vt { &self.0 }
+}
+impl std::ops::DerefMut for VtGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Vt { self.0.gen = self.0.gen.wrapping_add(1); &mut self.0 }
+}
+fn lock_vt(v: &Mutex<Vt>) -> VtGuard<'_> { VtGuard(v.lock().unwrap_or_else(|e| e.into_inner())) }
+
+fn abs_cursor(t: &Term<Listener>) -> i64 { t.history_size() as i64 + t.grid().cursor.point.line.0 as i64 }
+
+struct Pane {
+    vt: Arc<Mutex<Vt>>,
+    /// Linhas ja montadas (texto + cores) da ultima vez: o frame so remonta o que mudou.
+    cache: RowCache,
+    /// Dica de pergunta na tela do agente (12 ultimas linhas), pelo `gen` do Vt.
+    tail: Option<(u64, Option<&'static str>)>,
     io: Sender<Io>,
     /// pid do ptyhost: raiz da arvore de processos do pane.
     pid: Option<u32>,
@@ -253,11 +293,11 @@ impl Pane {
     /// Depois de um resize: acha cada comando no texto (de baixo para cima) e
     /// recalcula prompt, inicio e fim da saida. Bloco cujo comando nao aparece
     /// mais (saiu do historico) perde a posicao.
-    fn reanchor_marks(&mut self) {
-        let h = self.term.history_size() as i64;
-        let top = self.term.topmost_line().0;
+    fn reanchor_marks(&mut self, t: &Term<Listener>) {
+        let h = t.history_size() as i64;
+        let top = t.topmost_line().0;
         let cols = self.cols.max(1) as usize;
-        let mut from = self.term.bottommost_line().0;
+        let mut from = t.bottommost_line().0;
         let n = self.marks.len();
         for i in (0..n).rev() {
             let cmd = self.marks[i].command.clone();
@@ -266,13 +306,13 @@ impl Pane {
             let mut found = None;
             let mut l = from;
             while l >= top {
-                if line_text(&self.term, l).contains(&needle) { found = Some(l); break; }
+                if line_text(t, l).contains(&needle) { found = Some(l); break; }
                 l -= 1;
             }
             let k = &mut self.marks[i];
             match found {
                 Some(l) => {
-                    let line = line_text(&self.term, l);
+                    let line = line_text(t, l);
                     let col = line.find(&needle).map(|b| line[..b].chars().count()).unwrap_or(0);
                     let abs = h + l as i64;
                     let rows = (col + cmd.chars().count()).div_ceil(cols).max(1) as i64;
@@ -303,11 +343,10 @@ impl Pane {
     }
     /// Passa a saida pelo parser vigiando o historico (ESC[3J o apaga).
     fn advance(&mut self, data: &[u8]) {
-        let before = self.term.history_size();
-        self.parser.advance(&mut self.term, data);
-        let after = self.term.history_size();
-        if after < before { self.history_shrank(before - after); }
+        let lost = self.vt().advance(data);
+        if lost > 0 { self.history_shrank(lost); }
     }
+    fn vt(&self) -> VtGuard<'_> { lock_vt(&self.vt) }
 
     fn write(&self, b: &[u8]) { let _ = self.io.send(Io::Data(b.to_vec())); }
     /// Fixa as marcas pendentes na posicao atual do cursor (fim do prompt):
@@ -316,9 +355,12 @@ impl Pane {
     fn resolve_marks(&mut self) {
         if !self.marks_pending || self.last_output.elapsed() < Duration::from_millis(40) { return; }
         self.marks_pending = false;
-        if std::mem::take(&mut self.reanchor) { self.reanchor_marks(); }
-        let abs = self.abs_cursor();
-        let col = self.term.grid().cursor.point.column.0;
+        let vt = self.vt.clone();
+        let g = lock_vt(&vt);
+        if std::mem::take(&mut self.reanchor) { self.reanchor_marks(&g.term); }
+        let abs = abs_cursor(&g.term);
+        let col = g.term.grid().cursor.point.column.0;
+        drop(g);
         let n = self.marks.len();
         if let Some(k) = self.marks.last_mut() {
             if k.out_start.is_none() {
@@ -331,7 +373,7 @@ impl Pane {
             if prev.out_end.is_some() { prev.out_end = Some(abs.max(prev.out_start.unwrap_or(abs))); }
         }
     }
-    fn abs_cursor(&self) -> i64 { self.term.history_size() as i64 + self.term.grid().cursor.point.line.0 as i64 }
+    fn abs_cursor(&self) -> i64 { abs_cursor(&self.vt().term) }
     fn history_lines(&self, scrollback: usize, mb: f64) -> usize {
         // Teto em bytes alem de linhas: ~32 bytes por celula.
         let by_mem = (mb * 1_048_576.0 / (self.cols.max(1) as f64 * 32.0)) as usize;
@@ -622,9 +664,9 @@ struct PaneMeta {
     size: (u16, u16),
 }
 
-/// Liga um host (novo ou recuperado) ao mux: Term, fila de escrita e leitora.
+/// Term + estado do pane, sem o host (o attach liga as threads; os testes usam direto).
 #[allow(clippy::too_many_arguments)]
-fn attach(srv: &Arc<Server>, m: &mut Mux, id: Id, client: ptyhost::Client, pid: Option<u32>, meta: PaneMeta, text: Option<&str>, cols: u16, rows: u16) {
+fn new_pane(srv: &Arc<Server>, m: &Mux, id: Id, io: Sender<Io>, pid: Option<u32>, meta: PaneMeta, text: Option<&str>, cols: u16, rows: u16) -> Pane {
     let listener = Listener { pane: id, tx: srv.tx.clone() };
     let tcfg = TermConfig { scrolling_history: m.cfg.scrollback, osc52: Osc52::OnlyCopy, ..TermConfig::default() };
     let mut term = Term::new(tcfg, &Dims { cols: cols as usize, lines: rows as usize }, listener);
@@ -634,6 +676,21 @@ fn attach(srv: &Arc<Server>, m: &mut Mux, id: Id, client: ptyhost::Client, pid: 
         parser.advance(&mut term, t.replace('\n', "\r\n").as_bytes());
         parser.advance(&mut term, b"\r\n\x1b[2m--- restaurado ---\x1b[0m\r\n");
     }
+    let p = Pane {
+        vt: Arc::new(Mutex::new(Vt { term, parser, gen: 0 })), cache: RowCache::default(), tail: None, io, pid, title: meta.title, cwd: meta.cwd, domain: meta.domain, cmd: meta.cmd,
+        agent: meta.agent, attention: false, last_output: Instant::now(), cols, rows, parent: meta.parent,
+        token: meta.token, private: meta.private, marks: Vec::new(),
+        ports: Default::default(), queue: Vec::new(), delivered_at: None, rec: None, marks_pending: false, reanchor: false, progress: None,
+        mute_replies_until: Instant::now(), bell_at: None, secrets_seen: Default::default(), secrets_new: Vec::new(), reveal_until: None,
+    };
+    let lines = p.history_lines(m.cfg.scrollback, m.cfg.scrollback_mb);
+    p.vt().term.set_options(TermConfig { scrolling_history: lines, osc52: Osc52::OnlyCopy, ..TermConfig::default() });
+    p
+}
+
+/// Liga um host (novo ou recuperado) ao mux: Term, fila de escrita e leitora.
+#[allow(clippy::too_many_arguments)]
+fn attach(srv: &Arc<Server>, m: &mut Mux, id: Id, client: ptyhost::Client, pid: Option<u32>, meta: PaneMeta, text: Option<&str>, cols: u16, rows: u16) {
     let (tx, rx) = channel::<Io>();
     let mut input = client.input;
     // Escritora propria: um shell que nao le a entrada (paste gigante) nao
@@ -652,15 +709,7 @@ fn attach(srv: &Arc<Server>, m: &mut Mux, id: Id, client: ptyhost::Client, pid: 
             if r.is_err() { return; }
         }
     });
-    let mut p = Pane {
-        term, parser, io: tx, pid, title: meta.title, cwd: meta.cwd, domain: meta.domain, cmd: meta.cmd,
-        agent: meta.agent, attention: false, last_output: Instant::now(), cols, rows, parent: meta.parent,
-        token: meta.token, private: meta.private, marks: Vec::new(),
-        ports: Default::default(), queue: Vec::new(), delivered_at: None, rec: None, marks_pending: false, reanchor: false, progress: None,
-        mute_replies_until: Instant::now(), bell_at: None, secrets_seen: Default::default(), secrets_new: Vec::new(), reveal_until: None,
-    };
-    let lines = p.history_lines(m.cfg.scrollback, m.cfg.scrollback_mb);
-    p.term.set_options(TermConfig { scrolling_history: lines, osc52: Osc52::OnlyCopy, ..TermConfig::default() });
+    let p = new_pane(srv, m, id, tx, pid, meta, text, cols, rows);
     m.panes.insert(id, p);
 
     let s = srv.clone();
@@ -699,7 +748,7 @@ fn respawn_in_place(srv: &Arc<Server>, m: &mut Mux, old: Id) -> Result<Id, Strin
     let o = SpawnOpts {
         cwd: Some(p.cwd.clone()).filter(|c| !c.is_empty()), cmd: Some(p.cmd.clone()).filter(|c| !c.is_empty()),
         domain: Some(p.domain.clone()), parent: p.parent,
-        text: Some(format!("{}\n\x1b[33m--- conexao caiu; reconectando ---\x1b[0m", pane_text(&p.term, Some(30)))),
+        text: Some(format!("{}\n\x1b[33m--- conexao caiu; reconectando ---\x1b[0m", pane_text(&p.vt().term, Some(30)))),
     };
     std::thread::sleep(Duration::from_secs(2));
     let new = spawn_pane(srv, m, o)?;
@@ -715,8 +764,62 @@ fn respawn_in_place(srv: &Arc<Server>, m: &mut Mux, old: Id) -> Result<Id, Strin
 
 /// Saida do shell -> parser, intercalando os OSC que o alacritty ignora
 /// (7 = pasta, 9/777 = notificacao, 133 = blocos de comando) na posicao certa.
+/// Saida comum (sem OSC de interesse nem marcas pendentes) e parseada so com
+/// o lock do pane: o Mux fica livre para os frames e os outros panes.
 fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
+    let ports: Vec<u16> = if replay { Vec::new() } else { scan_ports(data) };
+    let events = osc_events(data);
     let mut m = srv.lock();
+    let Some(p) = m.panes.get_mut(&id) else { return false };
+    for port in ports { if p.ports.len() < 12 { p.ports.insert(port); } }
+    if !events.is_empty() || (!replay && p.marks_pending) { return feed_marks(srv, m, id, data, replay, events); }
+    if replay { p.mute_replies_until = Instant::now() + Duration::from_millis(800); }
+    record(p, data);
+    let vt = p.vt.clone();
+    drop(m);
+    let (lost, deadline) = {
+        let mut g = lock_vt(&vt);
+        let lost = g.advance(data);
+        (lost, g.parser.sync_timeout().sync_timeout())
+    };
+    if let Some(d) = deadline { sync_at(srv, d); }
+    let mut m = srv.lock();
+    if let Some(p) = m.panes.get_mut(&id) {
+        if lost > 0 { p.history_shrank(lost); }
+        if !replay { p.last_output = Instant::now(); }
+    }
+    true
+}
+
+/// Portas locais vistas na saida (localhost:3000).
+fn scan_ports(data: &[u8]) -> Vec<u16> {
+    static PORT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // Sem ':' nao tem porta: pula o regex (e a copia lossy) na maioria dos pedacos.
+    if !data.contains(&b':') { return Vec::new(); }
+    let re = PORT.get_or_init(|| regex::Regex::new(r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):(\d{2,5})\b").unwrap());
+    re.captures_iter(&String::from_utf8_lossy(data)).filter_map(|c| c[1].parse::<u16>().ok()).collect()
+}
+
+/// Gravacao asciinema em andamento: a saida vai para o .cast.
+fn record(p: &mut Pane, data: &[u8]) {
+    if let Some((f, t0, _)) = p.rec.as_mut() {
+        let text = String::from_utf8_lossy(data);
+        let line = json!([t0.elapsed().as_secs_f64(), "o", config::screen_secrets().replace_all(&text, "***")]);
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Fim de quadro do synchronized output (DEC 2026): o flusher solta a tela se
+/// o fim nao vier ate la.
+fn sync_at(srv: &Server, deadline: Instant) {
+    let (lock, cv) = &srv.sync;
+    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_none_or(|d| deadline < d) { *g = Some(deadline); cv.notify_one(); }
+}
+
+/// Feed com OSC de interesse ou marcas pendentes: tudo com o Mux (as marcas
+/// pegam a posicao do cursor no meio do pedaco).
+fn feed_marks(srv: &Arc<Server>, mut m: MutexGuard<'_, Mux>, id: Id, data: &[u8], replay: bool, events: Vec<(usize, Osc)>) -> bool {
     let notify_secs = m.cfg.notify_command_secs;
     let seen = is_seen(&m, id);
     let Some(p) = m.panes.get_mut(&id) else { return false };
@@ -724,24 +827,13 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
     // Chegou saida nova (ex.: o eco do que o usuario digita) depois do prompt
     // ter sossegado: fixa as marcas pendentes antes de o cursor andar.
     if !replay { p.resolve_marks(); }
-    if let Some((f, t0, _)) = p.rec.as_mut() {
-        let text = String::from_utf8_lossy(data);
-        let line = json!([t0.elapsed().as_secs_f64(), "o", config::screen_secrets().replace_all(&text, "***")]);
-        let _ = writeln!(f, "{line}");
-    }
-    if !replay {
-        static PORT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let re = PORT.get_or_init(|| regex::Regex::new(r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):(\d{2,5})\b").unwrap());
-        for c in re.captures_iter(&String::from_utf8_lossy(data)) {
-            if let Ok(port) = c[1].parse::<u16>() { if p.ports.len() < 12 { p.ports.insert(port); } }
-        }
-    }
+    record(p, data);
     let mut pos = 0;
     let mut finished: Option<u64> = None;
     let mut done_cmd: Option<Value> = None;
     let mut had_prompt_marks = false;
     let mut agent_osc: Vec<AgentOsc> = Vec::new();
-    for (end, ev) in osc_events(data) {
+    for (end, ev) in events {
         p.advance(&data[pos..end]);
         pos = end;
         match ev {
@@ -754,7 +846,7 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
                 had_prompt_marks = true;
                 // Prompt novo = nenhum app no controle. Um TUI que saiu sem
                 // desligar o mouse (ex.: claude) faria o clique virar texto no shell.
-                p.parser.advance(&mut p.term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+                p.advance(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
                 let abs = p.abs_cursor();
                 if p.marks.last().is_none_or(|k| k.prompt != abs) {
                     p.marks.push(Mark { prompt: abs, ..Default::default() });
@@ -763,18 +855,17 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
             }
             Osc::InputStart => {
                 had_prompt_marks = true;
-                let abs = p.abs_cursor();
-                let col = p.term.grid().cursor.point.column.0;
+                let (abs, col) = { let g = p.vt(); (abs_cursor(&g.term), g.term.grid().cursor.point.column.0) };
                 if let Some(k) = p.marks.last_mut() { if k.out_start.is_none() { k.input = Some((abs, col)); } }
             }
             Osc::CmdStart => {
                 if p.marks_pending { p.last_output = Instant::now() - Duration::from_millis(100); p.resolve_marks(); }
                 // pwsh marca ainda na linha digitada; bash/zsh ja na linha
                 // seguinte (coluna 0): a saida comeca ali mesmo.
-                let abs = p.abs_cursor();
-                let at_line_start = p.term.grid().cursor.point.column.0 == 0;
+                let (abs, at_line_start) = { let g = p.vt(); (abs_cursor(&g.term), g.term.grid().cursor.point.column.0 == 0) };
                 let out_start = if at_line_start { abs } else { abs + 1 };
-                let command = p.marks.last().and_then(|k| k.input).map(|(ia, col)| typed_text(p, ia, col, out_start)).unwrap_or_default();
+                let input = p.marks.last().and_then(|k| k.input);
+                let command = input.map(|(ia, col)| typed_text(&p.vt().term, ia, col, out_start)).unwrap_or_default();
                 if let Some(k) = p.marks.last_mut() { k.out_start = Some(out_start); k.started = Some(Instant::now()); k.command = command; }
             }
             Osc::CmdEnd(code) => {
@@ -802,15 +893,12 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
     if (had_prompt_marks || p.marks_pending) && !replay {
         p.marks_pending = true;
         let s2 = srv.clone();
-        std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(60)); s2.notify(); });
+        later(Duration::from_millis(60), move || s2.notify());
     }
     // Synchronized output (DEC 2026): o parser segura a tela ate o fim do
     // quadro; se o fim nao vier, o flusher solta no timeout.
-    if let Some(deadline) = p.parser.sync_timeout().sync_timeout() {
-        let (lock, cv) = &srv.sync;
-        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if g.is_none_or(|d| deadline < d) { *g = Some(deadline); cv.notify_one(); }
-    }
+    let deadline = p.vt().parser.sync_timeout().sync_timeout();
+    if let Some(d) = deadline { sync_at(srv, d); }
     if let Some(h) = done_cmd {
         let line = scrub(&m, h.to_string());
         let path = proto::data_dir().join("history.jsonl");
@@ -832,6 +920,37 @@ fn feed(srv: &Arc<Server>, id: Id, data: &[u8], replay: bool) -> bool {
         if let Some(e) = m.events.last_mut() { e.1["duration_ms"] = json!(ms); }
     }
     true
+}
+
+/// Fila de acoes atrasadas numa thread so (antes, uma thread por pedaco de
+/// saida so para dormir). Vazia, a thread dorme no condvar: nada de polling.
+type Job = Box<dyn FnOnce() + Send>;
+static LATER: Mutex<Vec<(Instant, Job)>> = Mutex::new(Vec::new());
+static LATER_CV: Condvar = Condvar::new();
+
+fn later(d: Duration, f: impl FnOnce() + Send + 'static) {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| { std::thread::spawn(later_loop); });
+    LATER.lock().unwrap_or_else(|e| e.into_inner()).push((Instant::now() + d, Box::new(f)));
+    LATER_CV.notify_one();
+}
+
+fn later_loop() {
+    let mut g = LATER.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let now = Instant::now();
+        if let Some(i) = g.iter().position(|(t, _)| *t <= now) {
+            let (_, f) = g.swap_remove(i);
+            drop(g);
+            f();
+            g = LATER.lock().unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
+        g = match g.iter().map(|(t, _)| *t).min() {
+            None => LATER_CV.wait(g).unwrap_or_else(|e| e.into_inner()),
+            Some(t) => LATER_CV.wait_timeout(g, t - now).unwrap_or_else(|e| e.into_inner()).0,
+        };
+    }
 }
 
 enum Osc { Cwd(String), Notify, Progress(u8, u8), Prompt, InputStart, CmdStart, CmdEnd(i32), Agent(AgentOsc) }
@@ -991,24 +1110,24 @@ fn pane_text(term: &Term<Listener>, last: Option<usize>) -> String {
 }
 
 /// Linhas absolutas [a, b) como texto.
-fn abs_text(p: &Pane, a: i64, b: i64) -> String {
-    let h = p.term.history_size() as i64;
-    let top = p.term.topmost_line().0 as i64;
-    let bottom = p.term.bottommost_line().0 as i64;
+fn abs_text(t: &Term<Listener>, a: i64, b: i64) -> String {
+    let h = t.history_size() as i64;
+    let top = t.topmost_line().0 as i64;
+    let bottom = t.bottommost_line().0 as i64;
     let mut v: Vec<String> = (a..b).map(|abs| abs - h).filter(|l| *l >= top && *l <= bottom)
-        .map(|l| line_text(&p.term, l as i32)).collect();
+        .map(|l| line_text(t, l as i32)).collect();
     while v.last().is_some_and(|l| l.is_empty()) { v.pop(); }
     v.join("\n")
 }
 
 /// Texto digitado: da coluna do 133;B ate antes da saida (linhas absolutas).
-fn typed_text(p: &Pane, input_abs: i64, col: usize, out_start: i64) -> String {
-    let h = p.term.history_size() as i64;
+fn typed_text(t: &Term<Listener>, input_abs: i64, col: usize, out_start: i64) -> String {
+    let h = t.history_size() as i64;
     let mut parts = Vec::new();
     for abs in input_abs..out_start.max(input_abs + 1) {
         let l = abs - h;
-        if l < p.term.topmost_line().0 as i64 || l > p.term.bottommost_line().0 as i64 { continue; }
-        let t = line_text(&p.term, l as i32);
+        if l < t.topmost_line().0 as i64 || l > t.bottommost_line().0 as i64 { continue; }
+        let t = line_text(t, l as i32);
         let t = if abs == input_abs { t.chars().skip(col).collect::<String>() } else { t };
         parts.push(t.trim().to_string());
     }
@@ -1525,12 +1644,13 @@ fn list_agents(cands: &[(Id, Vec<String>)], ids: &[Id]) -> String {
 
 fn deliver(p: &mut Pane, text: &str) {
     p.delivered_at = Some(Instant::now());
-    let bracketed = p.term.mode().contains(TermMode::BRACKETED_PASTE);
+    let bracketed = p.vt().term.mode().contains(TermMode::BRACKETED_PASTE);
     let clean_text: String = text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
     if bracketed { p.write(format!("\x1b[200~{}\x1b[201~", clean_text.replace('\n', "\r")).as_bytes()); }
     else { p.write(clean_text.replace('\n', " ").as_bytes()); }
+    // O Enter vai depois: colado junto, o app trata como parte do texto.
     let io = p.io.clone();
-    std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(350)); let _ = io.send(Io::Data(b"\r".to_vec())); });
+    later(Duration::from_millis(350), move || { let _ = io.send(Io::Data(b"\r".to_vec())); });
 }
 
 fn scrub(m: &Mux, text: String) -> String {
@@ -1893,8 +2013,10 @@ fn sync_loop(srv: Arc<Server>) {
         let now = Instant::now();
         let mut next: Option<Instant> = None;
         for p in m.panes.values_mut() {
-            match p.parser.sync_timeout().sync_timeout() {
-                Some(d) if d <= now => p.parser.stop_sync(&mut p.term),
+            let mut g = p.vt();
+            let st = g.parser.sync_timeout().sync_timeout();
+            match st {
+                Some(d) if d <= now => { let v = &mut *g; v.parser.stop_sync(&mut v.term) }
                 Some(d) => next = Some(next.map_or(d, |n| n.min(d))),
                 None => {}
             }
@@ -1990,14 +2112,15 @@ fn agent_loop(srv: Arc<Server>) {
                 continue;
             }
             if hook_fresh { continue; }
-            let screen = screen_tail(p);
+            let hint = screen_hint(m.panes.get_mut(&id).unwrap());
+            let p = &m.panes[&id];
             // Claude Code: o titulo diz o estado (spinner = trabalhando, ✳ = parado).
             // A saida nao serve: parado, ele ainda redesenha a linha de status.
             let idle_title = p.title.starts_with('✳');
             let was_working = p.agent.as_ref().filter(|a| a.state == "working");
             // So "terminou" (com aviso) se trabalhou de verdade, nao por um repaint.
             let long_work = was_working.is_some_and(|a| now_secs().saturating_sub(a.since) >= 8);
-            let state = if blocked_hint(&screen).is_some() {
+            let state = if hint.is_some() {
                 "blocked"
             } else if spinner || (!idle_title && p.last_output.elapsed() < Duration::from_millis(1500)) {
                 "working"
@@ -2038,15 +2161,26 @@ fn drain_queues(m: &mut Mux) -> bool {
 
 /// Parado pela tela, sem confiar no estado: titulo ✳ (sem spinner), sem
 /// saida ha alguns segundos e nenhuma pergunta na tela.
-fn looks_parked(p: &Pane) -> bool {
+fn looks_parked(p: &mut Pane) -> bool {
     if !p.title.starts_with('✳') || p.last_output.elapsed() < MSG_QUIET { return false; }
-    blocked_hint(&screen_tail(p)).is_none()
+    screen_hint(p).is_none()
 }
 
 /// As 12 ultimas linhas da tela (onde aparecem as perguntas do agente).
-fn screen_tail(p: &Pane) -> String {
-    let rows = p.term.screen_lines() as i32;
-    (rows.saturating_sub(12)..rows).map(|l| line_text(&p.term, l)).collect::<Vec<_>>().join("\n")
+fn screen_tail(t: &Term<Listener>) -> String {
+    let rows = t.screen_lines() as i32;
+    (rows.saturating_sub(12)..rows).map(|l| line_text(t, l)).collect::<Vec<_>>().join("\n")
+}
+
+/// Pergunta na tela do agente; so rele a tela se ela mudou desde a ultima vez.
+fn screen_hint(p: &mut Pane) -> Option<&'static str> {
+    let vt = p.vt();
+    if let Some((gen, hint)) = p.tail { if gen == vt.gen { return hint; } }
+    let hint = blocked_hint(&screen_tail(&vt.term));
+    let gen = vt.gen;
+    drop(vt);
+    p.tail = Some((gen, hint));
+    hint
 }
 
 fn blocked_hint(screen: &str) -> Option<&'static str> { BLOCKED_HINTS.iter().copied().find(|h| screen.contains(h)) }
@@ -2068,7 +2202,7 @@ fn why(p: &Pane, id: Id) -> Value {
     let now = now_secs();
     let ago = |s: u64| fmt_ago(now.saturating_sub(s));
     let a = p.agent.as_ref();
-    let hint = blocked_hint(&screen_tail(p));
+    let hint = blocked_hint(&screen_tail(&p.vt().term));
     let (glyph, glyph_says) = title_glyph(&p.title);
     let hook_age = a.and_then(|a| a.hook_at).map(|t| t.elapsed().as_secs());
     let hook_fresh = hook_age.is_some_and(|s| s < 600);
@@ -2160,75 +2294,53 @@ fn tab_state(m: &Mux, t: &Tab) -> (String, bool) {
     (best, att)
 }
 
-type RunT = (usize, usize, String, i64, i64, u16, Option<String>);
+/// Trecho de uma linha: coluna, texto, fg, bg, flags, link OSC 8.
+#[derive(Debug, Clone, PartialEq)]
+struct Run(usize, String, i64, i64, u16, Option<String>);
 
-/// Troca por bolinhas os caracteres de token numa linha (runs da tela) e
-/// devolve o texto dos tokens achados.
-fn mask_row(runs: &mut [Value], re: &regex::Regex) -> Vec<String> {
-    // Texto da linha com a coluna de cada char.
-    let mut text = String::new();
-    let mut cols: Vec<usize> = Vec::new();
-    let mut last_end = 0usize;
-    for r in runs.iter() {
-        let (Some(col), Some(t)) = (r[0].as_u64(), r[1].as_str()) else { continue };
-        let step = if r[4].as_u64().unwrap_or(0) & 32 != 0 { 2 } else { 1 };
-        let col = col as usize;
-        // Buraco entre runs (espacos que nao vieram): vira espaco.
-        for gap in last_end..col { text.push(' '); cols.push(gap); }
-        for (i, ch) in t.chars().enumerate() { text.push(ch); cols.push(col + i * step); }
-        last_end = col + t.chars().count() * step;
+/// Linha pronta para o fio: hash das celulas (o que o cliente ja tem) e os
+/// runs ja em JSON (`[[col,"texto",fg,bg,flags],...]`).
+#[derive(Clone)]
+struct Row { hash: u64, json: Arc<str> }
+
+/// Linhas montadas da ultima vez e com que estado do terminal: (gen do Vt,
+/// largura, altura, mascara de segredos). Mesma chave = mesma tela.
+#[derive(Default)]
+struct RowCache { key: Option<(u64, u16, u16, bool)>, rows: Arc<Vec<Row>> }
+
+/// Hash das celulas da linha, direto da grade (sem montar texto). Passo
+/// bijetivo por palavra: linhas que diferem numa celula nunca colidem.
+fn row_hash(row: &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::Cell>, cols: usize, masked: bool) -> u64 {
+    let mut h: u64 = 0x243F_6A88_85A3_08D3 ^ cols as u64 ^ ((masked as u64) << 63);
+    let mut mix = |v: u64| h = (h.rotate_left(5) ^ v).wrapping_mul(0x517C_C1B7_2722_0A95);
+    for c in 0..cols {
+        let cell = &row[Column(c)];
+        mix(cell.c as u64 | (cell.flags.bits() as u64) << 32);
+        mix(enc(cell.fg) as u64);
+        mix(enc(cell.bg) as u64);
+        if let Some(z) = cell.zerowidth() { for ch in z { mix(*ch as u64 | 1 << 40); } }
+        if let Some(l) = cell.hyperlink() {
+            for b in l.uri().bytes().chain([0]).chain(l.id().bytes()) { mix(b as u64 | 1 << 41); }
+        }
     }
-    let mut hidden = std::collections::HashSet::new();
-    let mut found = Vec::new();
-    for m in re.find_iter(&text) {
-        let a = text[..m.start()].chars().count();
-        let n = m.as_str().chars().count();
-        for c in &cols[a..a + n] { hidden.insert(*c); }
-        found.push(m.as_str().to_string());
-    }
-    if hidden.is_empty() { return found; }
-    for r in runs.iter_mut() {
-        let (Some(col), Some(t)) = (r[0].as_u64(), r[1].as_str()) else { continue };
-        let step = if r[4].as_u64().unwrap_or(0) & 32 != 0 { 2 } else { 1 };
-        let masked: String = t.chars().enumerate().map(|(i, ch)| if hidden.contains(&(col as usize + i * step)) { '•' } else { ch }).collect();
-        r[1] = json!(masked);
-    }
-    found
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^ (h >> 33)
 }
 
-fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64, bool)) -> Value {
-    p.resolve_marks();
-    if p.cols != r.w || p.rows != r.h {
-        // Pane recuperado de um server anterior (cols = 0): o pty ja tem este
-        // tamanho, e o mesmo tamanho nao avisa ninguem. Uma linha a menos e
-        // de volta manda o SIGWINCH (no Windows, o ConPTY repinta a tela).
-        if p.cols == 0 { let _ = p.io.send(Io::Resize(r.w, r.h.saturating_sub(1).max(1))); }
-        p.cols = r.w;
-        p.rows = r.h;
-        p.term.resize(Dims { cols: r.w as usize, lines: r.h as usize });
-        let _ = p.io.send(Io::Resize(r.w, r.h));
-        if !p.marks.is_empty() { p.reanchor = true; p.marks_pending = true; p.last_output = Instant::now(); }
-        let lines = p.history_lines(cap.0, cap.1);
-        p.term.set_options(TermConfig { scrolling_history: lines, osc52: Osc52::OnlyCopy, ..TermConfig::default() });
-    }
-    let history = p.term.history_size() as i64;
-    let content = p.term.renderable_content();
-    let offset = content.display_offset as i32;
-    let mode = content.mode;
-    let cursor = content.cursor;
-    let mut lines: Vec<Vec<Value>> = vec![Vec::new(); r.h as usize];
-    // run = [coluna, texto, fg, bg, flags, link?]
-    let mut run: Option<RunT> = None;
-    let flush = |run: &mut Option<RunT>, lines: &mut Vec<Vec<Value>>| {
-        if let Some((row, col, text, fg, bg, fl, link)) = run.take() {
-            if row < lines.len() && !(text.trim().is_empty() && bg == BG && fl & 4 == 0) {
-                lines[row].push(match link { Some(u) => json!([col, text, fg, bg, fl, u]), None => json!([col, text, fg, bg, fl]) });
-            }
+/// Runs da linha: celulas vizinhas com o mesmo estilo viram um trecho;
+/// espaco sem fundo nem sublinhado nao vai.
+fn row_runs(row: &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::Cell>, cols: usize) -> Vec<Run> {
+    let mut out = Vec::new();
+    // (run, chars no texto)
+    let mut run: Option<(Run, usize)> = None;
+    let flush = |run: &mut Option<(Run, usize)>, out: &mut Vec<Run>| {
+        if let Some((r, _)) = run.take() {
+            if !(r.1.trim().is_empty() && r.3 == BG && r.4 & 4 == 0) { out.push(r); }
         }
     };
-    for cell in content.display_iter {
-        let row = (cell.point.line.0 + offset) as usize;
-        let col = cell.point.column.0;
+    for col in 0..cols {
+        let cell = &row[Column(col)];
         let f = cell.flags;
         if f.contains(Flags::WIDE_CHAR_SPACER) || f.contains(Flags::LEADING_WIDE_CHAR_SPACER) { continue; }
         let (mut fg, mut bg) = (enc(cell.fg), enc(cell.bg));
@@ -2243,26 +2355,134 @@ fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64, bo
         if f.contains(Flags::WIDE_CHAR) { fl |= 32; }
         // OSC 8: link que o app pos no texto (o destino pode diferir do texto).
         let link = cell.hyperlink().map(|h| clean(h.uri(), 2048));
-        let same = run.as_ref().is_some_and(|r| r.0 == row && r.3 == fg && r.4 == bg && r.5 == fl && fl & 32 == 0
-            && r.6 == link && r.1 + r.2.chars().count() == col);
-        if !same { flush(&mut run, &mut lines); run = Some((row, col, String::new(), fg, bg, fl, link)); }
-        let r = run.as_mut().unwrap();
-        r.2.push(cell.c);
-        if let Some(z) = cell.zerowidth() { r.2.extend(z.iter()); }
+        let same = run.as_ref().is_some_and(|(r, n)| r.2 == fg && r.3 == bg && r.4 == fl && fl & 32 == 0 && r.5 == link && r.0 + n == col);
+        if !same { flush(&mut run, &mut out); run = Some((Run(col, String::new(), fg, bg, fl, link), 0)); }
+        let (r, n) = run.as_mut().unwrap();
+        r.1.push(cell.c);
+        *n += 1;
+        if let Some(z) = cell.zerowidth() { r.1.extend(z.iter()); *n += z.len(); }
     }
-    flush(&mut run, &mut lines);
-    // Tokens na tela viram bolinhas (o app continua vendo o texto real).
-    if cap.2 && p.reveal_until.is_none_or(|t| t < Instant::now()) {
-        let re = config::screen_secrets();
-        for row in lines.iter_mut() {
-            for tok in mask_row(row, re) {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                tok.hash(&mut h);
-                if p.secrets_seen.insert(h.finish()) && p.secrets_seen.len() < 500 { p.secrets_new.push(tok.chars().take(4).collect()); }
-            }
+    flush(&mut run, &mut out);
+    out
+}
+
+fn runs_json(runs: &[Run]) -> Arc<str> {
+    let mut b: Vec<u8> = Vec::with_capacity(runs.iter().map(|r| r.1.len() + 24).sum::<usize>() + 2);
+    b.push(b'[');
+    for (i, r) in runs.iter().enumerate() {
+        if i > 0 { b.push(b','); }
+        let _ = write!(b, "[{},", r.0);
+        let _ = serde_json::to_writer(&mut b, &r.1);
+        let _ = write!(b, ",{},{},{}", r.2, r.3, r.4);
+        if let Some(u) = &r.5 { b.push(b','); let _ = serde_json::to_writer(&mut b, u); }
+        b.push(b']');
+    }
+    b.push(b']');
+    String::from_utf8(b).unwrap_or_default().into()
+}
+
+/// Linhas visiveis do pane: as que nao mudaram (mesmo hash) saem do cache sem
+/// montar nada; mudou o Vt, recalcula so os hashes.
+fn pane_rows(p: &mut Pane, h: u16, masked: bool) -> Arc<Vec<Row>> {
+    let vt = p.vt.clone();
+    let vt = lock_vt(&vt);
+    let t = &vt.term;
+    let cols = t.columns();
+    let key = (vt.gen, cols as u16, h, masked);
+    if p.cache.key == Some(key) { return p.cache.rows.clone(); }
+    let old: HashMap<u64, &Row> = p.cache.rows.iter().map(|r| (r.hash, r)).collect();
+    let offset = t.grid().display_offset() as i32;
+    let screen = t.screen_lines();
+    let re = config::screen_secrets();
+    let mut rows = Vec::with_capacity(h as usize);
+    let mut found = Vec::new();
+    for i in 0..h as usize {
+        if i >= screen { rows.push(Row { hash: 0, json: "[]".into() }); continue; }
+        let row = &t.grid()[Line(i as i32 - offset)];
+        let hash = row_hash(row, cols, masked);
+        if let Some(r) = old.get(&hash) { rows.push((*r).clone()); continue; }
+        let mut runs = row_runs(row, cols);
+        // Tokens na tela viram bolinhas (o app continua vendo o texto real).
+        if masked { found.extend(mask_row(&mut runs, re)); }
+        rows.push(Row { hash, json: runs_json(&runs) });
+    }
+    drop(old);
+    drop(vt);
+    for tok in found {
+        use std::hash::{Hash, Hasher};
+        let mut hs = std::collections::hash_map::DefaultHasher::new();
+        tok.hash(&mut hs);
+        if p.secrets_seen.insert(hs.finish()) && p.secrets_seen.len() < 500 { p.secrets_new.push(tok.chars().take(4).collect()); }
+    }
+    let rows = Arc::new(rows);
+    p.cache = RowCache { key: Some(key), rows: rows.clone() };
+    rows
+}
+
+/// Troca por bolinhas os caracteres de token numa linha (runs da tela) e
+/// devolve o texto dos tokens achados.
+fn mask_row(runs: &mut [Run], re: &regex::Regex) -> Vec<String> {
+    // Texto da linha com a coluna de cada char.
+    let mut text = String::new();
+    let mut cols: Vec<usize> = Vec::new();
+    let mut last_end = 0usize;
+    for r in runs.iter() {
+        let step = if r.4 & 32 != 0 { 2 } else { 1 };
+        let col = r.0;
+        // Buraco entre runs (espacos que nao vieram): vira espaco.
+        for gap in last_end..col { text.push(' '); cols.push(gap); }
+        for (i, ch) in r.1.chars().enumerate() { text.push(ch); cols.push(col + i * step); }
+        last_end = col + r.1.chars().count() * step;
+    }
+    let mut hidden = std::collections::HashSet::new();
+    let mut found = Vec::new();
+    for m in re.find_iter(&text) {
+        let a = text[..m.start()].chars().count();
+        let n = m.as_str().chars().count();
+        for c in &cols[a..a + n] { hidden.insert(*c); }
+        found.push(m.as_str().to_string());
+    }
+    if hidden.is_empty() { return found; }
+    for r in runs.iter_mut() {
+        let step = if r.4 & 32 != 0 { 2 } else { 1 };
+        let col = r.0;
+        r.1 = r.1.chars().enumerate().map(|(i, ch)| if hidden.contains(&(col + i * step)) { '•' } else { ch }).collect();
+    }
+    found
+}
+
+/// Pane no frame: metadados (JSON) e as linhas visiveis (compartilhadas
+/// entre os clientes; cada um manda so o que ainda nao tem).
+struct PaneOut { id: Id, w: u16, h: u16, meta: Value, rows: Arc<Vec<Row>> }
+
+/// Frame montado com o lock; o `encode` de cada cliente roda fora dele.
+struct FrameOut { head: Value, panes: Vec<PaneOut> }
+
+fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64, bool)) -> PaneOut {
+    p.resolve_marks();
+    if p.cols != r.w || p.rows != r.h {
+        // Pane recuperado de um server anterior (cols = 0): o pty ja tem este
+        // tamanho, e o mesmo tamanho nao avisa ninguem. Uma linha a menos e
+        // de volta manda o SIGWINCH (no Windows, o ConPTY repinta a tela).
+        if p.cols == 0 { let _ = p.io.send(Io::Resize(r.w, r.h.saturating_sub(1).max(1))); }
+        p.cols = r.w;
+        p.rows = r.h;
+        let lines = p.history_lines(cap.0, cap.1);
+        {
+            let mut vt = p.vt();
+            vt.term.resize(Dims { cols: r.w as usize, lines: r.h as usize });
+            vt.term.set_options(TermConfig { scrolling_history: lines, osc52: Osc52::OnlyCopy, ..TermConfig::default() });
         }
+        let _ = p.io.send(Io::Resize(r.w, r.h));
+        if !p.marks.is_empty() { p.reanchor = true; p.marks_pending = true; p.last_output = Instant::now(); }
     }
+    let masked = cap.2 && p.reveal_until.is_none_or(|t| t < Instant::now());
+    let rows = pane_rows(p, r.h, masked);
+    let (history, offset, mode, cursor) = {
+        let vt = p.vt();
+        let content = vt.term.renderable_content();
+        (vt.term.history_size() as i64, content.display_offset as i32, content.mode, content.cursor)
+    };
     let show_cursor = mode.contains(TermMode::SHOW_CURSOR) && offset == 0 && cursor.shape != CursorShape::Hidden;
     let cur = if show_cursor {
         let shape = match cursor.shape { CursorShape::Beam => "beam", CursorShape::Underline => "underline", _ => "block" };
@@ -2297,7 +2517,7 @@ fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64, bo
     let profile = p.agent.as_ref().and_then(|a| a.config_dir.as_deref()).map(profile_name).unwrap_or_default();
     let running = p.marks.last().filter(|k| k.out_start.is_some() && k.exit.is_none() && !k.command.is_empty())
         .and_then(|k| Some(json!([k.command, k.started?.elapsed().as_secs()]))).unwrap_or(Value::Null);
-    json!({
+    let meta = json!({
         "id": id, "x": r.x, "y": r.y, "w": r.w, "h": r.h, "floating": floating,
         "title": p.title, "cwd": p.cwd, "domain": p.domain, "private": p.private,
         "state": p.agent.as_ref().map(|a| a.state.clone()).unwrap_or_default(),
@@ -2310,7 +2530,7 @@ fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64, bo
         // App pediu o mouse (vim, htop, TUIs): a GUI repassa cliques em SGR.
         "mouse": mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE),
         "mouse_motion": mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION),
-        "cursor": cur, "lines": lines, "blocks": blocks, "ticks": ticks,
+        "cursor": cur, "blocks": blocks, "ticks": ticks,
         "sticky": sticky, "input": input, "ports": p.ports, "recording": p.rec.is_some(),
         "queued": p.queue.len(),
         "todo": p.agent.as_ref().and_then(|a| Some([a.todo_done?, a.todo_total?])),
@@ -2318,7 +2538,8 @@ fn pane_json(p: &mut Pane, id: Id, r: Rect, floating: bool, cap: (usize, f64, bo
         "tokens": p.agent.as_ref().and_then(|a| a.context_tokens),
         "session": p.agent.as_ref().and_then(|a| a.session.clone()),
         "config_dir": p.agent.as_ref().and_then(|a| a.config_dir.clone()),
-    })
+    });
+    PaneOut { id, w: r.w, h: r.h, meta, rows }
 }
 
 /// ".claude-trabalho" -> "trabalho"; ".claude" -> "pessoal".
@@ -2328,7 +2549,7 @@ fn profile_name(dir: &str) -> String {
     if p.is_empty() { "pessoal".into() } else { p.to_string() }
 }
 
-fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> {
+fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<FrameOut, String> {
     let wi = client_ws(m, srv, client)?;
     if clear_seen(m) { srv.notify(); }
     let (cols, rows) = m.size;
@@ -2392,9 +2613,9 @@ fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> 
     for (id, r, fl) in list {
         let Some(p) = m.panes.get_mut(&id) else { continue };
         let mut v = pane_json(p, id, r, fl, cap);
-        v["header"] = json!(header && !fl && r.y > 0);
-        if pip.is_some_and(|(x, _)| x == id) { v["pip"] = json!(true); }
-        if p.reveal_until.is_some_and(|t| t > Instant::now()) { v["revealed"] = json!(true); }
+        v.meta["header"] = json!(header && !fl && r.y > 0);
+        if pip.is_some_and(|(x, _)| x == id) { v.meta["pip"] = json!(true); }
+        if p.reveal_until.is_some_and(|t| t > Instant::now()) { v.meta["revealed"] = json!(true); }
         panes.push(v);
     }
     // Token novo na tela: aviso (uma vez por token).
@@ -2407,16 +2628,89 @@ fn frame(srv: &Arc<Server>, m: &mut Mux, client: &str) -> Result<Value, String> 
         crate::gui::toast_card(&title, &body, &[("Abrir".into(), format!("duck://focus/{id}"))], Some("blocked"));
     }
     let approvals: Vec<&Approval> = m.approvals.iter().filter(|a| a.decided.is_none()).collect();
-    Ok(json!({
-        "t": "frame", "workspace": ws_name, "workspaces": workspaces, "ws_states": ws_states, "tabs": tabs,
-        "active_pane": active, "cols": cols, "rows": rows, "panes": panes,
+    let head = json!({
+        "workspace": ws_name, "workspaces": workspaces, "ws_states": ws_states, "tabs": tabs,
+        "active_pane": active, "cols": cols, "rows": rows,
         "agents": counts, "clipboard": [m.clipboard.0, m.clipboard.1],
         "closed": m.closed.len(),
         "approvals": approvals, "resurrect": m.resurrect, "recovered": m.recovered, "inbox_unread": m.inbox.unread(),
         "tokens": m.panes.values().filter_map(|p| p.agent.as_ref()?.session_tokens).sum::<u64>(),
         "ports": m.panes.values().flat_map(|p| p.ports.iter().copied()).collect::<std::collections::BTreeSet<u16>>(),
         "version": env!("CARGO_PKG_VERSION"),
-    }))
+    });
+    Ok(FrameOut { head, panes })
+}
+
+/// O que o cliente ja tem de cada pane: tamanho e hash de cada linha.
+type Sent = HashMap<Id, (u16, u16, Vec<u64>)>;
+
+/// Frame em JSON para um cliente. Pane novo (ou de outro tamanho) vai com a
+/// tela inteira (`lines`); senao so as linhas que mudaram (`rows`) e, para
+/// cliente que entende (`shift`), quantas linhas a tela subiu: a saida
+/// rolando nao reenvia a tela toda. `"t"` vai primeiro: a GUI parseia direto.
+fn encode(f: &FrameOut, sent: &mut Sent, shift_ok: bool) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(16 << 10);
+    out.extend_from_slice(br#"{"t":"frame","panes":["#);
+    for (n, p) in f.panes.iter().enumerate() {
+        if n > 0 { out.push(b','); }
+        let meta = serde_json::to_vec(&p.meta).unwrap_or_else(|_| b"{}".to_vec());
+        out.extend_from_slice(&meta[..meta.len() - 1]);
+        if meta.len() > 2 { out.push(b','); }
+        let cur: Vec<u64> = p.rows.iter().map(|r| r.hash).collect();
+        match sent.get(&p.id).filter(|(w, h, prev)| *w == p.w && *h == p.h && prev.len() == cur.len()) {
+            Some((_, _, prev)) => {
+                let (shift, send) = plan_rows(prev, &cur, shift_ok);
+                if shift > 0 { let _ = write!(out, r#""shift":{shift},"#); }
+                out.extend_from_slice(br#""rows":{"#);
+                for (k, i) in send.iter().enumerate() {
+                    if k > 0 { out.push(b','); }
+                    let _ = write!(out, r#""{i}":"#);
+                    out.extend_from_slice(p.rows[*i].json.as_bytes());
+                }
+                out.push(b'}');
+            }
+            None => {
+                out.extend_from_slice(br#""lines":["#);
+                for (k, r) in p.rows.iter().enumerate() {
+                    if k > 0 { out.push(b','); }
+                    out.extend_from_slice(r.json.as_bytes());
+                }
+                out.push(b']');
+            }
+        }
+        out.push(b'}');
+        sent.insert(p.id, (p.w, p.h, cur));
+    }
+    sent.retain(|id, _| f.panes.iter().any(|p| p.id == *id));
+    out.extend_from_slice(b"]");
+    let head = serde_json::to_vec(&f.head).unwrap_or_else(|_| b"{}".to_vec());
+    if head.len() > 2 { out.push(b','); out.extend_from_slice(&head[1..]); } else { out.push(b'}'); }
+    out
+}
+
+/// Linhas a mandar para quem tem `prev` e precisa de `cur`: (quantas linhas
+/// subir antes, indices a reenviar). Sobe so se economiza linhas; tudo o que
+/// nao bate depois de subir vai, entao qualquer deslocamento escolhido da a
+/// tela certa.
+fn plan_rows(prev: &[u64], cur: &[u64], shift_ok: bool) -> (usize, Vec<usize>) {
+    let h = cur.len().min(prev.len());
+    let score = |k: usize| (0..h - k).filter(|&i| cur[i] == prev[i + k]).count();
+    let mut best = (0, score(0));
+    if shift_ok && best.1 < h {
+        let mut tried = vec![false; h];
+        // Candidatos: onde as primeiras linhas de agora estavam antes.
+        for i in 0..h.min(6) {
+            for j in i + 1..h {
+                let k = j - i;
+                if prev[j] != cur[i] || tried[k] { continue; }
+                tried[k] = true;
+                let sc = score(k);
+                if sc > best.1 { best = (k, sc); }
+            }
+        }
+    }
+    let k = best.0;
+    (k, (0..cur.len()).filter(|&i| i + k >= h || cur[i] != prev[i + k]).collect())
 }
 
 // ------------------------------------------------------------------ comandos
@@ -2611,7 +2905,8 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
         }
         "frame" => {
             let client = arg_str(a, "client").unwrap_or("cli").to_string();
-            frame(srv, m, &client)?
+            let f = frame(srv, m, &client)?;
+            serde_json::from_slice(&encode(&f, &mut Sent::new(), false)).map_err(|e| e.to_string())?
         }
         "resize" => {
             let c = a.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
@@ -2693,7 +2988,7 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let mut text = arg_str(a, "text").unwrap_or("").to_string();
             if a.get("enter").and_then(|v| v.as_bool()).unwrap_or(false) { text.push('\r'); }
             let p = m.panes.get_mut(&id).unwrap();
-            if p.term.grid().display_offset() != 0 { p.term.scroll_display(Scroll::Bottom); }
+            { let mut vt = p.vt(); if vt.term.grid().display_offset() != 0 { vt.term.scroll_display(Scroll::Bottom); } }
             p.write(text.as_bytes());
             proto::ok(json!({}))
         }
@@ -2703,9 +2998,9 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let text: String = arg_str(a, "text").unwrap_or("").replace("\r\n", "\n")
                 .chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect::<String>().replace('\n', "\r");
             let p = m.panes.get_mut(&id).unwrap();
-            let bracketed = p.term.mode().contains(TermMode::BRACKETED_PASTE);
+            let bracketed = p.vt().term.mode().contains(TermMode::BRACKETED_PASTE);
             let data = if bracketed { format!("\x1b[200~{text}\x1b[201~") } else { text };
-            p.term.scroll_display(Scroll::Bottom);
+            p.vt().term.scroll_display(Scroll::Bottom);
             p.write(data.as_bytes());
             proto::ok(json!({}))
         }
@@ -2714,7 +3009,7 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let n = a.get("lines").and_then(|v| v.as_u64()).map(|v| v as usize);
             let p = &m.panes[&id];
             let n = if a.get("all").and_then(|v| v.as_bool()).unwrap_or(false) { None } else { Some(n.unwrap_or(p.rows as usize)) };
-            let text = pane_text(&p.term, n);
+            let text = pane_text(&p.vt().term, n);
             // Quem le pela API (agente, script num pane) recebe sem segredos.
             let text = if caller.0.is_some() { scrub(m, text) } else { text };
             proto::ok(json!({"pane": id, "text": text}))
@@ -2725,7 +3020,7 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let p = &m.panes[&id];
             let k = p.marks.iter().rev().find(|k| k.out_start.is_some() && k.out_end.is_some())
                 .ok_or("nenhum comando terminado neste pane (a shell integration esta ligada?)")?;
-            let text = abs_text(p, k.out_start.unwrap(), k.out_end.unwrap());
+            let text = abs_text(&p.vt().term, k.out_start.unwrap(), k.out_end.unwrap());
             let text = if caller.0.is_some() { scrub(m, text) } else { text };
             proto::ok(json!({"pane": id, "text": text, "exit": k.exit, "ms": k.dur_ms}))
         }
@@ -2736,7 +3031,8 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             p.resolve_marks();
             let list: Vec<Value> = p.marks.iter().map(|k| json!({"cmd": k.command, "exit": k.exit, "ms": k.dur_ms,
                 "prompt": k.prompt, "input": k.input, "out_start": k.out_start, "out_end": k.out_end})).collect();
-            proto::ok(json!({"pane": id, "history": p.term.history_size(), "offset": p.term.grid().display_offset(), "blocks": list}))
+            let vt = p.vt();
+            proto::ok(json!({"pane": id, "history": vt.term.history_size(), "offset": vt.term.grid().display_offset(), "blocks": list}))
         }
         "last-failure" => {
             let id = target(srv, m, a)?;
@@ -2744,7 +3040,7 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let p = &m.panes[&id];
             let k = p.marks.iter().rev().find(|k| k.exit.is_some_and(|e| e != 0) && k.out_start.is_some())
                 .ok_or("nenhum comando falhou neste pane (a shell integration esta ligada?)")?;
-            let text = abs_text(p, k.out_start.unwrap(), k.out_end.unwrap_or(k.out_start.unwrap() + 200));
+            let text = abs_text(&p.vt().term, k.out_start.unwrap(), k.out_end.unwrap_or(k.out_start.unwrap() + 200));
             proto::ok(json!({"pane": id, "command": scrub(m, k.command.clone()), "exit": k.exit, "output": scrub(m, text), "cwd": p.cwd, "domain": p.domain}))
         }
         "history" => {
@@ -2909,19 +3205,20 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let id = target(srv, m, a)?;
             let p = m.panes.get_mut(&id).unwrap();
             p.resolve_marks();
-            let h = p.term.history_size() as i64;
-            let top = h - p.term.grid().display_offset() as i64;
+            let mut vt = p.vt();
+            let h = vt.term.history_size() as i64;
+            let top = h - vt.term.grid().display_offset() as i64;
             let up = arg_str(a, "dir") != Some("down");
             let k = if up { p.marks.iter().rev().find(|k| k.prompt < top).cloned() } else { p.marks.iter().find(|k| k.prompt > top).cloned() };
             match k {
                 Some(k) => {
                     let want = (h - k.prompt).clamp(0, h);
-                    let cur = p.term.grid().display_offset() as i64;
-                    p.term.scroll_display(Scroll::Delta((want - cur) as i32));
+                    let cur = vt.term.grid().display_offset() as i64;
+                    vt.term.scroll_display(Scroll::Delta((want - cur) as i32));
                     proto::ok(json!({"found": true}))
                 }
                 None => {
-                    if !up { p.term.scroll_display(Scroll::Bottom); }
+                    if !up { vt.term.scroll_display(Scroll::Bottom); }
                     proto::ok(json!({"found": false}))
                 }
             }
@@ -2929,10 +3226,10 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
         "grep" => {
             let id = target(srv, m, a)?;
             let re = regex::RegexBuilder::new(arg_str(a, "regex").unwrap_or("")).case_insensitive(true).build().map_err(|e| e.to_string())?;
-            let p = &m.panes[&id];
+            let vt = m.panes[&id].vt();
             let mut hits = Vec::new();
-            for l in (p.term.topmost_line().0..=p.term.bottommost_line().0).rev() {
-                let t = line_text(&p.term, l);
+            for l in (vt.term.topmost_line().0..=vt.term.bottommost_line().0).rev() {
+                let t = line_text(&vt.term, l);
                 if re.is_match(&t) { hits.push(json!({"line": l, "text": t})); if hits.len() >= 300 { break; } }
             }
             hits.reverse();
@@ -2941,11 +3238,11 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
         "goto-line" => {
             let id = target(srv, m, a)?;
             let l = a.get("line").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let p = m.panes.get_mut(&id).unwrap();
-            let screen = p.term.screen_lines() as i32;
+            let mut vt = m.panes[&id].vt();
+            let screen = vt.term.screen_lines() as i32;
             let want = if l >= 0 { 0 } else { (-l + screen / 2).max(0) };
-            let cur = p.term.grid().display_offset() as i32;
-            p.term.scroll_display(Scroll::Delta(want - cur));
+            let cur = vt.term.grid().display_offset() as i32;
+            vt.term.scroll_display(Scroll::Delta(want - cur));
             proto::ok(json!({}))
         }
         "close" => {
@@ -3148,8 +3445,9 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let p = &m.panes[&id];
             let abs = a.get("abs").and_then(|v| v.as_i64()).ok_or("falta abs")?;
             let k = p.marks.iter().find(|k| k.prompt == abs).ok_or("bloco nao encontrado")?;
-            let end = k.out_end.unwrap_or(p.term.history_size() as i64 + p.term.bottommost_line().0 as i64 + 1);
-            let text = k.out_start.map(|s| abs_text(p, s, end)).unwrap_or_default();
+            let vt = p.vt();
+            let end = k.out_end.unwrap_or(vt.term.history_size() as i64 + vt.term.bottommost_line().0 as i64 + 1);
+            let text = k.out_start.map(|s| abs_text(&vt.term, s, end)).unwrap_or_default();
             proto::ok(json!({"pane": id, "cmd": k.command, "text": text, "exit": k.exit, "ms": k.dur_ms}))
         }
         "search-all" => {
@@ -3158,15 +3456,15 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             let q = arg_str(a, "query").unwrap_or("");
             let pat = if q.len() > 2 && q.starts_with('/') && q.ends_with('/') { q[1..q.len() - 1].to_string() } else { regex::escape(q) };
             let re = regex::RegexBuilder::new(&pat).case_insensitive(true).build().map_err(|e| e.to_string())?;
-            let p = &m.panes[&id];
+            let vt = m.panes[&id].vt();
             let mut lines = Vec::new();
             if !q.is_empty() {
-                for l in p.term.topmost_line().0..=p.term.bottommost_line().0 {
-                    if re.is_match(&line_text(&p.term, l)) { lines.push(l); if lines.len() >= 5000 { break; } }
+                for l in vt.term.topmost_line().0..=vt.term.bottommost_line().0 {
+                    if re.is_match(&line_text(&vt.term, l)) { lines.push(l); if lines.len() >= 5000 { break; } }
                 }
             }
-            let history = p.term.history_size() as i64;
-            proto::ok(json!({"lines": lines, "history": history, "total": history + p.term.screen_lines() as i64}))
+            let history = vt.term.history_size() as i64;
+            proto::ok(json!({"lines": lines, "history": history, "total": history + vt.term.screen_lines() as i64}))
         }
         "rename-tab" | "tab-color" => {
             let client = arg_str(a, "client").unwrap_or("cli").to_string();
@@ -3274,8 +3572,9 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
                 Some("page_down") => Scroll::PageDown,
                 _ => Scroll::Delta(a.get("delta").and_then(|v| v.as_i64()).unwrap_or(0) as i32),
             };
-            p.term.scroll_display(s);
-            proto::ok(json!({"offset": p.term.grid().display_offset()}))
+            let mut vt = p.vt();
+            vt.term.scroll_display(s);
+            proto::ok(json!({"offset": vt.term.grid().display_offset()}))
         }
         "search" => {
             let id = target(srv, m, a)?;
@@ -3284,22 +3583,22 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
             // "/regex/" busca por regex; senao texto simples sem caixa.
             let pat = if q.len() > 2 && q.starts_with('/') && q.ends_with('/') { q[1..q.len() - 1].to_string() } else { regex::escape(q) };
             let re = regex::RegexBuilder::new(&pat).case_insensitive(true).build().map_err(|e| e.to_string())?;
-            let p = m.panes.get_mut(&id).unwrap();
-            let offset = p.term.grid().display_offset() as i32;
-            let start = a.get("from").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(-offset + p.term.screen_lines() as i32 - 1);
-            let top = p.term.topmost_line().0;
+            let mut vt = m.panes[&id].vt();
+            let offset = vt.term.grid().display_offset() as i32;
+            let start = a.get("from").and_then(|v| v.as_i64()).map(|v| v as i32).unwrap_or(-offset + vt.term.screen_lines() as i32 - 1);
+            let top = vt.term.topmost_line().0;
             let mut found = None;
             let mut l = start;
             while l >= top {
-                if re.is_match(&line_text(&p.term, l)) { found = Some(l); break; }
+                if re.is_match(&line_text(&vt.term, l)) { found = Some(l); break; }
                 l -= 1;
             }
             match found {
                 Some(l) => {
-                    let screen = p.term.screen_lines() as i32;
+                    let screen = vt.term.screen_lines() as i32;
                     let want = if l >= 0 && l < screen { 0 } else { (-l + screen / 2).max(0) };
-                    let cur = p.term.grid().display_offset() as i32;
-                    p.term.scroll_display(Scroll::Delta(want - cur));
+                    let cur = vt.term.grid().display_offset() as i32;
+                    vt.term.scroll_display(Scroll::Delta(want - cur));
                     proto::ok(json!({"found": true, "line": l}))
                 }
                 None => proto::ok(json!({"found": false})),
@@ -3688,7 +3987,7 @@ fn save_node(m: &Mux, n: &Node) -> Saved {
             Saved::Leaf {
                 cwd: p.cwd.clone(), domain: p.domain.clone(), cmd: p.cmd.clone(),
                 // Privado nao vai para o disco; o resto passa pelo filtro de segredos.
-                text: if p.private { String::new() } else { scrub(m, pane_text(&p.term, Some(200))) },
+                text: if p.private { String::new() } else { scrub(m, pane_text(&p.vt().term, Some(200))) },
                 // Sem sessao tambem: na restauracao o pane explica por que
                 // nao retomou (hooks do Duck faltando no perfil do Claude).
                 agent: p.agent.clone(),
@@ -3807,7 +4106,7 @@ fn restore_node(srv: &Arc<Server>, m: &mut Mux, s: &Saved, pending: &mut Vec<(Id
                     // Tinha agente, mas sem sessao para retomar: diz por que no pane.
                     None => if let Some(p) = m.panes.get_mut(&id) {
                         let msg = restore_warning(a, &dcmd);
-                        p.parser.advance(&mut p.term, msg.replace('\n', "\r\n").as_bytes());
+                        p.advance(msg.replace('\n', "\r\n").as_bytes());
                     }
                 }
             }
@@ -3952,7 +4251,7 @@ fn live_snapshot(m: &Mux) -> Live {
         }).collect(),
         panes: m.panes.iter().map(|(id, p)| (*id, PaneMeta {
             title: p.title.clone(), cwd: p.cwd.clone(), domain: p.domain.clone(), cmd: p.cmd.clone(),
-            agent: p.agent.clone(), token: p.token.clone(), parent: p.parent, private: p.private, size: (if p.cols == 0 { p.term.columns() as u16 } else { p.cols }, p.rows),
+            agent: p.agent.clone(), token: p.token.clone(), parent: p.parent, private: p.private, size: (if p.cols == 0 { p.vt().term.columns() as u16 } else { p.cols }, p.rows),
         })).collect(),
     }
 }
@@ -4057,7 +4356,9 @@ fn serve_conn(srv: Arc<Server>, conn: Stream, token: String) {
         if req.get("cmd").and_then(|c| c.as_str()) == Some("subscribe") {
             if caller.0.is_some() { return; } // so o dono assina a tela
             let client = req.get("client").and_then(|c| c.as_str()).unwrap_or("gui").to_string();
-            return subscribe(srv, reader.into_inner(), client);
+            // proto >= 2: a GUI aplica `shift` (GUI antiga recebe so `lines`/`rows`).
+            let shift_ok = req.get("proto").and_then(|v| v.as_u64()).unwrap_or(1) >= 2;
+            return subscribe(srv, reader.into_inner(), client, shift_ok);
         }
         let resp = match std::panic::catch_unwind(AssertUnwindSafe(|| handle(&srv, &req, caller))) {
             Ok(r) => r.unwrap_or_else(|e| json!({"error": e})),
@@ -4077,7 +4378,7 @@ fn serve_conn(srv: Arc<Server>, conn: Stream, token: String) {
 /// Empurra um frame por mudanca. Depois do primeiro, cada pane leva so as
 /// linhas que mudaram (`rows`), o que corta o trafego e o parse da GUI quando
 /// so o prompt pisca.
-fn subscribe(srv: Arc<Server>, mut conn: Stream, client: String) {
+fn subscribe(srv: Arc<Server>, mut conn: Stream, client: String, shift_ok: bool) {
     let mut last_gen = u64::MAX;
     // A janela nova recebe primeiro o estado das extensoes (visoes, badges).
     let (mut last_event, mut last_ext, mut pending) = {
@@ -4085,7 +4386,7 @@ fn subscribe(srv: Arc<Server>, mut conn: Stream, client: String) {
         m.subs += 1;
         (m.event_seq, m.ext.seq, m.ext.snapshot())
     };
-    let mut sent: HashMap<u64, (u16, u16, Vec<u64>)> = HashMap::new();
+    let mut sent = Sent::new();
     let mut pause = Duration::from_millis(8);
     loop {
         {
@@ -4121,10 +4422,7 @@ fn subscribe(srv: Arc<Server>, mut conn: Stream, client: String) {
             out.push(b'\n');
         }
         match f {
-            Ok(mut f) => {
-                diff_frame(&mut f, &mut sent);
-                out.extend(serde_json::to_vec(&f).unwrap());
-            }
+            Ok(f) => out.extend(encode(&f, &mut sent, shift_ok)),
             Err(e) => out.extend(serde_json::to_vec(&json!({"t": "error", "error": e})).unwrap()),
         }
         out.push(b'\n');
@@ -4202,39 +4500,6 @@ fn ext_toast(ext: &str, m: &Value) {
     let urls: Vec<(String, String)> = m["actions"].as_array().into_iter().flatten()
         .map(|a| (a["title"].as_str().unwrap_or("").to_string(), format!("duck://ext/{ext}/{}/{}", enc(a["id"].as_str().unwrap_or("")), enc(&item)))).collect();
     crate::gui::toast_card(&s("title"), &s("body"), &urls, m["color"].as_str());
-}
-
-fn hash_v(v: &Value) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    v.to_string().hash(&mut h);
-    h.finish()
-}
-
-/// Troca `lines` por `rows` = {indice: runs} com so as linhas alteradas desde
-/// o ultimo frame enviado a este cliente (mesmo pane, mesmo tamanho).
-fn diff_frame(f: &mut Value, sent: &mut HashMap<u64, (u16, u16, Vec<u64>)>) {
-    let Some(panes) = f.get_mut("panes").and_then(|p| p.as_array_mut()) else { return };
-    let mut seen = Vec::new();
-    for p in panes {
-        let id = p["id"].as_u64().unwrap_or(0);
-        let (w, h) = (p["w"].as_u64().unwrap_or(0) as u16, p["h"].as_u64().unwrap_or(0) as u16);
-        seen.push(id);
-        let Some(lines) = p.get("lines").and_then(|l| l.as_array()).cloned() else { continue };
-        let hashes: Vec<u64> = lines.iter().map(hash_v).collect();
-        if let Some((pw, ph, prev)) = sent.get(&id) {
-            if *pw == w && *ph == h {
-                let mut rows = serde_json::Map::new();
-                for (i, hv) in hashes.iter().enumerate() {
-                    if prev.get(i) != Some(hv) { rows.insert(i.to_string(), lines[i].clone()); }
-                }
-                p.as_object_mut().unwrap().remove("lines");
-                p["rows"] = Value::Object(rows);
-            }
-        }
-        sent.insert(id, (w, h, hashes));
-    }
-    sent.retain(|id, _| seen.contains(id));
 }
 
 pub fn run() {
@@ -4337,6 +4602,85 @@ pub fn run() {
     for conn in listener.incoming().flatten() {
         let (s, t) = (srv.clone(), token.clone());
         std::thread::spawn(move || serve_conn(s, conn, t));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testkit {
+    //! Server de mentira para testes e benchmark: panes sem host, o mesmo
+    //! caminho de feed e de frame do server de verdade.
+    use super::*;
+
+    pub(crate) fn mux(cfg: Config, size: (u16, u16)) -> Mux {
+        Mux {
+            panes: HashMap::new(), workspaces: vec![], next: 1, size, clients: HashMap::new(), cfg,
+            clipboard: (0, String::new()), events: vec![], event_seq: 0, inbox: Inbox::default(), convs: HashMap::new(), peers: Default::default(), loops: HashMap::new(), approvals: vec![], approval_seq: 0,
+            secrets: vec![], recovered: 0, resurrect: false, light: false, history: vec![], budget_warned: false, ext: Default::default(), subs: 0, closed: Vec::new(), pip: None, changes: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn cfg() -> Config {
+        let lua = mlua::Lua::new();
+        config::parse(&lua.create_table().unwrap())
+    }
+
+    pub(crate) fn server(size: (u16, u16)) -> Arc<Server> {
+        let (tx, _rx) = channel();
+        Arc::new(Server { mux: Mutex::new(mux(cfg(), size)), gen: Mutex::new(0), cv: Condvar::new(), tx, sync: (Mutex::new(None), Condvar::new()) })
+    }
+
+    /// `n` panes numa aba so (splits alternados), no workspace "default".
+    pub(crate) fn add_panes(srv: &Arc<Server>, n: usize) -> Vec<Id> {
+        let mut m = srv.lock();
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            let id = m.next;
+            m.next += 1;
+            let (tx, _rx) = channel::<Io>();
+            let p = new_pane(srv, &m, id, tx, None, PaneMeta::default(), None, 80, 24);
+            m.panes.insert(id, p);
+            ids.push(id);
+        }
+        let mut root = Node::Leaf(ids[0]);
+        for (i, id) in ids.iter().enumerate().skip(1) { root.split_leaf(ids[(i - 1) / 2 * 2], *id, i % 2 == 1); }
+        let mut tab = Tab::new(ids[0], "");
+        tab.root = root;
+        m.workspaces.push(Workspace { name: "default".into(), tabs: vec![tab], active: 0 });
+        ids
+    }
+
+    /// Saida tipica: seq, log colorido, erro do rustc, linha longa (quebra), 256/truecolor.
+    pub(crate) fn sample_output(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n + 1024);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut i = 0u64;
+        while out.len() < n {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let l = match x % 8 {
+                0..=2 => format!("{i}\r\n"),
+                3 | 4 => format!("\x1b[2m2026-11-10T12:{:02}:{:02}\x1b[0m \x1b[32mINFO\x1b[0m \x1b[36mduck::server\x1b[0m: frame built in {} us for pane {}\r\n", i % 60, x % 60, x % 9000, i % 7),
+                5 => format!("\x1b[1;31merror[E0308]\x1b[0m: \x1b[1mmismatched types\x1b[0m\r\n   \x1b[1;34m-->\x1b[0m src/server.rs:{}:{}\r\n", x % 4000, i % 80),
+                6 => { let w = ["lorem", "ipsum", "dolor", "sit", "amet", "consectetur", "adipiscing", "elit"]; let k = 30 + (x % 40) as usize;
+                       let mut s: String = (0..k).map(|j| w[(j + i as usize) % 8]).collect::<Vec<_>>().join(" "); s.push_str("\r\n"); s }
+                _ => format!("\x1b[38;5;{}m██\x1b[0m \x1b[48;2;10;20;{}m truecolor {} \x1b[0m \x1b[4munder\x1b[24m \x1b[7minv\x1b[27m ok\r\n", x % 256, x % 200, i),
+            };
+            out.extend_from_slice(l.as_bytes());
+            i += 1;
+        }
+        out
+    }
+
+    pub(crate) fn feed_all(srv: &Arc<Server>, id: Id, data: &[u8], chunk: usize) {
+        for c in data.chunks(chunk) { feed(srv, id, c, false); }
+    }
+
+    /// Um frame para o cliente pelo mesmo caminho do subscribe; (bytes, tempo com o lock).
+    pub(crate) type Sent = super::Sent;
+    pub(crate) fn client_frame(srv: &Arc<Server>, client: &str, sent: &mut Sent) -> (Vec<u8>, Duration) {
+        let t0 = Instant::now();
+        let f = { let mut m = srv.lock(); frame(srv, &mut m, client) };
+        let locked = t0.elapsed();
+        (encode(&f.unwrap(), sent, true), locked)
     }
 }
 
@@ -4534,35 +4878,289 @@ mod tests {
     #[test]
     fn mask_hides_tokens_across_runs() {
         // Token quebrado em dois runs (cores diferentes) e um texto comum.
-        let mut row = vec![
-            json!([0, "export T=ghp_abcdefghij", -1, -2, 0]),
-            json!([23, "klmnopqrstuvwxyz0123456789", 5, -2, 1]),
-            json!([50, " fim", -1, -2, 0]),
-        ];
+        let run = |c: usize, t: &str, fg: i64, fl: u16| Run(c, t.into(), fg, -2, fl, None);
+        let mut row = vec![run(0, "export T=ghp_abcdefghij", -1, 0), run(23, "klmnopqrstuvwxyz0123456789", 5, 1), run(50, " fim", -1, 0)];
         let found = mask_row(&mut row, crate::config::screen_secrets());
         assert_eq!(found.len(), 1);
-        assert_eq!(row[0][1], "export T=••••••••••••••");
-        assert!(row[1][1].as_str().unwrap().chars().all(|c| c == '•'));
-        assert_eq!(row[2][1], " fim");
-        let mut plain = vec![json!([0, "git log --oneline 2cfc632", -1, -2, 0])];
+        assert_eq!(row[0].1, "export T=••••••••••••••");
+        assert!(row[1].1.chars().all(|c| c == '•'));
+        assert_eq!(row[2].1, " fim");
+        let mut plain = vec![run(0, "git log --oneline 2cfc632", -1, 0)];
         assert!(mask_row(&mut plain, crate::config::screen_secrets()).is_empty());
         // PAT novo do Azure DevOps (84 com AZDO) e chave AWS.
         let pat = format!("{}AZDO{}", "A1b2".repeat(13), "x9Y8".repeat(7));
-        let mut az = vec![json!([0, format!("pat {pat}"), -1, -2, 0]), json!([100, "AKIAABCDEFGHIJKLMNOP", -1, -2, 0])];
+        let mut az = vec![run(0, &format!("pat {pat}"), -1, 0), run(100, "AKIAABCDEFGHIJKLMNOP", -1, 0)];
         assert_eq!(mask_row(&mut az, crate::config::screen_secrets()).len(), 2);
     }
 
+    /// A tela do cliente depois de aplicar o frame como a GUI aplica
+    /// (`lines` inteiro, ou `shift` + `rows` sobre o que ele ja tinha).
+    fn apply(view: &mut HashMap<u64, Vec<Value>>, bytes: &[u8]) -> Value {
+        let f: Value = serde_json::from_slice(bytes).expect("frame e JSON valido");
+        for p in f["panes"].as_array().unwrap() {
+            let id = p["id"].as_u64().unwrap();
+            let h = p["h"].as_u64().unwrap() as usize;
+            if let Some(l) = p.get("lines") { view.insert(id, l.as_array().unwrap().clone()); continue; }
+            let v = view.get_mut(&id).expect("rows sem base");
+            let k = p["shift"].as_u64().unwrap_or(0) as usize;
+            v.drain(..k.min(v.len()));
+            v.resize(h, json!([]));
+            for (i, r) in p["rows"].as_object().unwrap() { v[i.parse::<usize>().unwrap()] = r.clone(); }
+        }
+        f
+    }
+
+    /// Tela inteira de agora (cliente novo).
+    fn truth(srv: &Arc<Server>) -> HashMap<u64, Vec<Value>> {
+        let mut v = HashMap::new();
+        apply(&mut v, &testkit::client_frame(srv, "verdade", &mut Sent::new()).0);
+        v
+    }
+
+    fn row_text(r: &Value) -> String { r.as_array().unwrap().iter().map(|x| x[1].as_str().unwrap().to_string()).collect() }
+
     #[test]
     fn frame_diff_sends_only_changed_rows() {
-        let mut sent = HashMap::new();
-        let mut f1 = json!({"panes": [{"id": 1, "w": 10, "h": 2, "lines": [[[0, "a"]], [[0, "b"]]]}]});
-        diff_frame(&mut f1, &mut sent);
+        let srv = testkit::server((20, 5));
+        let id = testkit::add_panes(&srv, 1)[0];
+        let mut sent = Sent::new();
+        let f1 = apply(&mut HashMap::new(), &testkit::client_frame(&srv, "a", &mut sent).0);
         assert!(f1["panes"][0].get("lines").is_some()); // primeiro: tela inteira
-        let mut f2 = json!({"panes": [{"id": 1, "w": 10, "h": 2, "lines": [[[0, "a"]], [[0, "c"]]]}]});
-        diff_frame(&mut f2, &mut sent);
+        assert_eq!(f1["t"], "frame");
+        assert_eq!(f1["workspace"], "default");
+        feed(&srv, id, b"\x1b[3;1Hoi", false);
+        let f2: Value = serde_json::from_slice(&testkit::client_frame(&srv, "a", &mut sent).0).unwrap();
         assert!(f2["panes"][0].get("lines").is_none());
-        assert_eq!(f2["panes"][0]["rows"].as_object().unwrap().len(), 1);
-        assert_eq!(f2["panes"][0]["rows"]["1"], json!([[0, "c"]]));
+        let rows = f2["panes"][0]["rows"].as_object().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_text(&rows["2"]).trim_end(), "oi");
+        // Nada mudou: nenhuma linha.
+        let f3: Value = serde_json::from_slice(&testkit::client_frame(&srv, "a", &mut sent).0).unwrap();
+        assert!(f3["panes"][0]["rows"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn plan_rows_shift() {
+        // Subiu 2 linhas e entrou 2 novas: so as 2 novas vao.
+        assert_eq!(plan_rows(&[1, 2, 3, 4, 5], &[3, 4, 5, 6, 7], true), (2, vec![3, 4]));
+        assert_eq!(plan_rows(&[1, 2, 3, 4, 5], &[3, 4, 5, 6, 7], false).0, 0);
+        // Sem deslocamento que ajude: so o que mudou.
+        assert_eq!(plan_rows(&[1, 2, 3], &[1, 9, 3], true), (0, vec![1]));
+        // Linhas em branco repetidas (mesmo hash) nao enganam: o resto vai.
+        let (k, send) = plan_rows(&[0, 0, 0, 1], &[0, 1, 0, 0], true);
+        let prev = [0, 0, 0, 1];
+        let cur = [0, 1, 0, 0];
+        for i in 0..4 { if !send.contains(&i) { assert_eq!(cur[i], prev[i + k]); } }
+    }
+
+    /// Nenhuma linha velha na tela do cliente: rolagem, clear, tela
+    /// alternativa, resize, scrollback e dois clientes em ritmos diferentes,
+    /// com e sem `shift`.
+    #[test]
+    fn frame_rows_never_stale() {
+        let srv = testkit::server((60, 16));
+        let ids = testkit::add_panes(&srv, 2);
+        let mut a = (Sent::new(), HashMap::new());
+        let mut b = (Sent::new(), HashMap::new());
+        let mut old = (Sent::new(), HashMap::new()); // GUI antiga: sem shift
+        let data = testkit::sample_output(64 << 10);
+        let steps: Vec<Box<dyn Fn(&Arc<Server>)>> = vec![
+            Box::new(|s| { feed(s, ids[0], b"linha 1\r\nlinha 2\r\n", false); }),
+            Box::new(|s| { feed(s, ids[0], &data[..4000], false); }),
+            Box::new(|s| { feed(s, ids[1], &data[4000..9000], false); }),
+            Box::new(|s| { feed(s, ids[0], b"\x1b[2J\x1b[H", false); }),
+            Box::new(|s| { feed(s, ids[0], b"depois do clear\r\n", false); }),
+            Box::new(|s| { feed(s, ids[0], &data[9000..20000], false); }),
+            Box::new(|s| { feed(s, ids[0], b"\x1b[3J", false); }),
+            Box::new(|s| { feed(s, ids[1], b"\x1b[?1049h\x1b[Htela alt\r\n\x1b[5;5H\x1b[31mvermelho", false); }),
+            Box::new(|s| { feed(s, ids[1], b"\x1b[?1049l", false); }),
+            Box::new(|s| { s.lock().size = (50, 12); }),
+            Box::new(|s| { feed(s, ids[0], &data[20000..30000], false); }),
+            Box::new(|s| { handle(s, &json!({"cmd": "scroll", "pane": ids[0], "delta": 7}), Caller(None)).unwrap(); }),
+            Box::new(|s| { feed(s, ids[0], &data[30000..36000], false); }),
+            Box::new(|s| { handle(s, &json!({"cmd": "scroll", "pane": ids[0], "to": "bottom"}), Caller(None)).unwrap(); }),
+            Box::new(|s| { feed(s, ids[0], b"\x1b[1;1H\x1b[2Kprimeira\x1b[10;1Hdez\x1b[K", false); }),
+            Box::new(|s| { s.lock().size = (60, 16); }),
+            Box::new(|s| { feed(s, ids[1], &data[36000..64000], false); }),
+        ];
+        for (n, step) in steps.iter().enumerate() {
+            step(&srv);
+            let t = truth(&srv);
+            let (bytes, _) = testkit::client_frame(&srv, "a", &mut a.0);
+            apply(&mut a.1, &bytes);
+            assert_eq!(a.1, t, "cliente a, passo {n}");
+            // O segundo cliente pula frames (os passos se acumulam no dele).
+            if n % 3 == 2 {
+                apply(&mut b.1, &testkit::client_frame(&srv, "b", &mut b.0).0);
+                assert_eq!(b.1, t, "cliente b, passo {n}");
+            }
+            let f = { let mut m = srv.lock(); frame(&srv, &mut m, "old").unwrap() };
+            let bytes = encode(&f, &mut old.0, false);
+            assert!(!String::from_utf8_lossy(&bytes).contains("\"shift\""));
+            apply(&mut old.1, &bytes);
+            assert_eq!(old.1, t, "cliente sem shift, passo {n}");
+        }
+        // Rolando saida: o cliente com shift recebe so as linhas novas.
+        feed(&srv, ids[0], b"\r\nmais uma\r\n", false);
+        let (bytes, _) = testkit::client_frame(&srv, "a", &mut a.0);
+        let f = apply(&mut a.1, &bytes);
+        assert_eq!(a.1, truth(&srv));
+        let p = f["panes"].as_array().unwrap().iter().find(|p| p["id"] == ids[0]).unwrap();
+        assert!(p["shift"].as_u64().unwrap_or(0) >= 1, "{p}");
+        assert!(p["rows"].as_object().unwrap().len() <= 3, "{}", p["rows"]);
+    }
+
+    #[test]
+    fn vt_gen_follows_mutation() {
+        let srv = testkit::server((20, 5));
+        let id = testkit::add_panes(&srv, 1)[0];
+        let vt = srv.lock().panes[&id].vt.clone();
+        let g0 = lock_vt(&vt).gen;
+        { let g = lock_vt(&vt); let _ = g.term.history_size(); }
+        assert_eq!(lock_vt(&vt).gen, g0); // so leitura
+        feed(&srv, id, b"x", false);
+        assert_ne!(lock_vt(&vt).gen, g0);
+    }
+
+    #[test]
+    fn screen_hint_cached_until_output() {
+        let srv = testkit::server((40, 14));
+        let id = testkit::add_panes(&srv, 1)[0];
+        let mut m = srv.lock();
+        let p = m.panes.get_mut(&id).unwrap();
+        assert_eq!(screen_hint(p), None);
+        drop(m);
+        feed(&srv, id, format!("{}Do you want to proceed?\r\n", "\r\n".repeat(30)).as_bytes(), false);
+        let mut m = srv.lock();
+        let p = m.panes.get_mut(&id).unwrap();
+        assert_eq!(screen_hint(p), Some("Do you want to"));
+        let gen = p.tail.unwrap().0;
+        assert_eq!(screen_hint(p), Some("Do you want to"));
+        assert_eq!(p.tail.unwrap().0, gen);
+    }
+
+    #[test]
+    fn later_runs_in_order() {
+        let (tx, rx) = channel();
+        for (ms, n) in [(40u64, 2), (10, 1), (70, 3)] {
+            let tx = tx.clone();
+            later(Duration::from_millis(ms), move || { let _ = tx.send(n); });
+        }
+        let got: Vec<i32> = (0..3).map(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap()).collect();
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    /// Benchmark: `cargo test --profile quick bench_pipeline -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_pipeline() {
+        use testkit::*;
+        let mb = |b: usize, d: Duration| b as f64 / 1_048_576.0 / d.as_secs_f64();
+        let data = sample_output(16 << 20);
+        let nl = data.iter().filter(|&&b| b == b'\n').count();
+        // 1) feed: um pane 120x40, pedacos de 16 KB.
+        let srv = server((120, 40));
+        let ids = add_panes(&srv, 1);
+        { let mut s = HashMap::new(); client_frame(&srv, "a", &mut s); }
+        let t = Instant::now();
+        feed_all(&srv, ids[0], &data, 16 << 10);
+        let d = t.elapsed();
+        println!("feed: {:.1} MB/s, {:.0} linhas/s", mb(data.len(), d), nl as f64 / d.as_secs_f64());
+        // 2) frames: 4 panes em 240x66, 8 KB de saida num pane entre frames.
+        for clients in [1usize, 3] {
+            let srv = server((240, 66));
+            let ids = add_panes(&srv, 4);
+            let mut sent: Vec<_> = (0..clients).map(|_| HashMap::new()).collect();
+            for (c, s) in sent.iter_mut().enumerate() { client_frame(&srv, &format!("c{c}"), s); }
+            for id in &ids { feed_all(&srv, *id, &data[..256 << 10], 4096); }
+            for (c, s) in sent.iter_mut().enumerate() { client_frame(&srv, &format!("c{c}"), s); }
+            let (mut n, mut bytes, mut locked) = (0usize, 0usize, Duration::ZERO);
+            let t = Instant::now();
+            for chunk in data[..4 << 20].chunks(8 << 10) {
+                feed(&srv, ids[0], chunk, false);
+                for (c, s) in sent.iter_mut().enumerate() {
+                    let (b, l) = client_frame(&srv, &format!("c{c}"), s);
+                    n += 1; bytes += b.len(); locked += l;
+                }
+            }
+            let d = t.elapsed();
+            println!("stream {clients} cliente(s): {:.1} us/frame (lock {:.1} us), {} bytes/frame, {:.1} MB/s de saida",
+                d.as_micros() as f64 / n as f64, locked.as_micros() as f64 / n as f64, bytes / n, mb(4 << 20, d));
+            // Sem mudanca nenhuma (bell, foco, estado de agente).
+            let t = Instant::now();
+            let (mut bytes, mut n) = (0, 0);
+            for _ in 0..500 { for (c, s) in sent.iter_mut().enumerate() { bytes += client_frame(&srv, &format!("c{c}"), s).0.len(); n += 1; } }
+            println!("ocioso {clients} cliente(s): {:.1} us/frame, {} bytes/frame", t.elapsed().as_micros() as f64 / n as f64, bytes / n);
+        }
+        // Saida pingando (agente, log): ~3 linhas por frame. Com e sem `shift` (GUI antiga).
+        let srv = server((240, 66));
+        let ids = add_panes(&srv, 4);
+        for id in &ids { feed_all(&srv, *id, &data[..256 << 10], 4096); }
+        let (mut a, mut b) = (Sent::new(), Sent::new());
+        let enc_old = |s: &mut Sent| { let f = { let mut m = srv.lock(); frame(&srv, &mut m, "old").unwrap() }; encode(&f, s, false).len() };
+        client_frame(&srv, "new", &mut a);
+        enc_old(&mut b);
+        let (mut na, mut nb) = (0, 0);
+        for c in data[1 << 20..].chunks(160).take(500) {
+            feed(&srv, ids[0], c, false);
+            na += client_frame(&srv, "new", &mut a).0.len();
+            nb += enc_old(&mut b);
+        }
+        println!("pingando: {} bytes/frame com shift, {} sem", na / 500, nb / 500);
+        // 3) concorrencia: 4 panes despejando saida, 3 janelas, um comando leve a cada 5ms.
+        let srv = server((240, 66));
+        let ids = add_panes(&srv, 4);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let data = Arc::new(data);
+        let mut hs = Vec::new();
+        for id in ids.clone() {
+            let (srv, stop, fed, data) = (srv.clone(), stop.clone(), fed.clone(), data.clone());
+            hs.push(std::thread::spawn(move || {
+                let mut off = (id as usize * 997) % data.len();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let end = (off + 16384).min(data.len());
+                    feed(&srv, id, &data[off..end], false);
+                    fed.fetch_add(end - off, std::sync::atomic::Ordering::Relaxed);
+                    off = if end == data.len() { 0 } else { end };
+                    std::thread::yield_now();
+                }
+                Vec::new()
+            }));
+        }
+        for c in 0..3 {
+            let (srv, stop) = (srv.clone(), stop.clone());
+            hs.push(std::thread::spawn(move || {
+                let mut s = HashMap::new();
+                let mut lat = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let t = Instant::now();
+                    client_frame(&srv, &format!("c{c}"), &mut s);
+                    lat.push(t.elapsed());
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                lat
+            }));
+        }
+        let cmd = { let (srv, stop) = (srv.clone(), stop.clone()); std::thread::spawn(move || {
+            let mut lat = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = Instant::now();
+                let n = srv.lock().panes.len();
+                assert!(n > 0);
+                lat.push(t.elapsed());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            lat
+        }) };
+        std::thread::sleep(Duration::from_secs(3));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut frames: Vec<Duration> = hs.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let mut cmds = cmd.join().unwrap();
+        frames.sort(); cmds.sort();
+        let pct = |v: &[Duration], q: f64| v.get(((v.len() as f64 * q) as usize).min(v.len().saturating_sub(1))).map(|d| d.as_micros()).unwrap_or(0);
+        println!("concorrente: saida {:.1} MB/s, {} frames em 3s, frame p50 {} us p99 {} us, comando p50 {} us p99 {} us",
+            fed.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_048_576.0 / 3.0, frames.len(), pct(&frames, 0.5), pct(&frames, 0.99), pct(&cmds, 0.5), pct(&cmds, 0.99));
     }
 
     #[test]

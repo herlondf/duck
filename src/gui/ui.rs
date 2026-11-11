@@ -478,7 +478,7 @@ impl Gui {
 
             // Blocos de comando como cartoes (antes do texto).
             let cursor_row = p.cursor.as_ref().map(|c| c.1 as i64);
-            let last_row = (0..p.h as usize).rev().find(|r| !p.row_string(*r).trim().is_empty()).map(|r| r as i64).unwrap_or(0);
+            let last_row = (0..p.h as usize).rev().find(|r| !p.row_blank(*r)).map(|r| r as i64).unwrap_or(0);
             let block_span = |i: usize| -> Option<(i64, i64)> {
                 let b = &p.blocks[i];
                 if b.cmd.is_empty() && b.exit.is_none() && b.out.is_none() { return None; }
@@ -578,7 +578,7 @@ impl Gui {
             let last_done = p.blocks.iter().rev().find(|b| b.exit.is_some()).map(|b| b.abs);
             for (i, b) in p.blocks.iter().enumerate() {
                 let span = block_span(i);
-                if b.row >= 0 && !p.row_string(b.row as usize).trim().is_empty() {
+                if b.row >= 0 && !p.row_blank(b.row as usize) {
                     let y = py + b.row as f32 * ch;
                     let c = match b.exit { Some(0) => theme.done, Some(_) => theme.blocked, None => theme.muted };
                     over.quads.push(Quad { x: px - 4.0, y: y + 1.0, w: 2.0, h: ch - 2.0, color: lin(c, 0.9) });
