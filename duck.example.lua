@@ -111,6 +111,20 @@ return {
     { name = 'Claude (aceita edicoes)', cmd = 'claude --permission-mode acceptEdits' },
     { name = 'Codex', cmd = 'codex' },
   },
+  -- Tradutor: Ctrl+Shift+Enter no pane do agente traduz o que voce escreve
+  -- (Enter traduz, Enter de novo envia; Alt+Enter envia o original) e a
+  -- selecao na tela abre um balao com a traducao (+ glossario). Roda na CLI do
+  -- agente do pane; `cmd` troca o comando ({model} vira o modelo; prompt no stdin).
+  translate = {
+    enabled = false,
+    from = 'pt-BR', to = 'en',          -- sua lingua e a que vai para o agente
+    engines = {
+      claude = { model = 'haiku' },      -- claude -p --model {model}
+      gemini = { model = 'gemini-2.5-flash' },
+      codex  = { model = 'gpt-5-mini' },  -- codex exec -m {model} -
+    },
+    default = 'claude',                 -- panes sem agente reconhecido
+  },
   -- Popups: comando num flutuante que some quando o comando sai (paleta "Popup: ...").
   popups = {
     { name = 'lazygit', cmd = 'lazygit' },

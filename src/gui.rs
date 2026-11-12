@@ -30,6 +30,7 @@ mod ext;
 mod best;
 mod graph;
 mod peers;
+mod tr;
 mod update;
 mod ui;
 use agents::AgentPanel;
@@ -391,6 +392,8 @@ const DANGEROUS: &str = r"(?i)(\bsudo\b|\brm\s+-[a-z]*[rf]|\b(curl|wget|iwr|irm|
 #[derive(Debug)]
 pub enum UserEv {
     Frame, Reload, Tick, Quick, Connected, Ext, Access(accesskit_winit::Event),
+    /// Resposta do tradutor (thread da CLI).
+    Translated(crate::translate::Done),
     /// Botao de um aviso do desktop (url duck://).
     #[cfg(target_os = "linux")]
     Notify(String),
@@ -581,6 +584,8 @@ pub struct Gui {
     /// ultima area mandada para a janela de candidatos.
     preedit: (String, Option<usize>),
     ime_area: Option<[i32; 4]>,
+    /// Tradutor: cache, balao da selecao e clique segurado (src/gui/tr.rs).
+    tr: tr::Tr,
 }
 
 /// Menu por assunto: a paleta so com os comandos cujo rotulo (ou dica) comeca
@@ -597,7 +602,7 @@ fn default_menus() -> Vec<Menu> {
         m("janela", "Janela: abas, panes e workspaces", &["Dividir", "Fechar", "Zoom", "Pane", "Nova aba", "Novo pane", "Renomear", "Cor da aba", "Mover", "Redimensionar",
             "Reabrir", "Aba anterior", "Fixar", "PiP", "Trocar o pane",
             "Broadcast", "Trocar de workspace", "Criar/ir", "Salvar workspace", "Restaurar workspace", "Apagar estado", "Modo foco", "Barra lateral", "Layout:", "Inicio:"]),
-        m("config", "Configuração", &["Configuracoes", "Galeria de temas", "Tema a partir", "Fonte", "Densidade", "Segredos:", "Recarregar config", "Reiniciar server", "Encerrar server", "Desanexar"]),
+        m("config", "Configuração", &["Configuracoes", "Galeria de temas", "Tema a partir", "Fonte", "Densidade", "Segredos:", "Tradutor:", "Glossário", "Recarregar config", "Reiniciar server", "Encerrar server", "Desanexar"]),
     ]
 }
 
@@ -646,7 +651,7 @@ impl Gui {
             tab_cur: 0, tab_prev: 0, palette_rank: load_palette_rank(), scroll_base: HashMap::new(), pane_drag: None,
             peer_status: HashMap::new(), peer_found: None, peer_info: HashMap::new(), peer_state: Value::Null, update_ver: None, updating: false, update_retry: false,
             access: None, access_on: false, access_prev: HashMap::new(), access_focus: accesskit::NodeId(0),
-            preedit: (String::new(), None), ime_area: None,
+            preedit: (String::new(), None), ime_area: None, tr: Default::default(),
         };
         g.load_config();
         g.update_watch();
@@ -1553,6 +1558,8 @@ impl Gui {
             b("Loop: parar o loop do agente", "loop_stop", vec![]),
             b("Agentes: linha do tempo da sessao", "agent_timeline", vec![]),
             b("Editor de comando (varias linhas, Ctrl+Z)", "composer", vec![]),
+            b(if self.cfg.translate.enabled { "Tradutor: desligar (pt-BR → en no editor, termos da tela)" } else { "Tradutor: ligar (pt-BR → en no editor, termos da tela)" }, "translate_toggle", vec![]),
+            b("Glossário: termos salvos pelo tradutor", "glossary", vec![]),
             b("Galeria de temas (previa ao vivo)", "theme_gallery", vec![]),
             b("Tema a partir do papel de parede", "wallpaper_theme", vec![]),
             b("Extensões: ativar, configurar, contas e tokens", "extensions", vec![]),
@@ -1637,6 +1644,7 @@ impl Gui {
         ] {
             items.push(Item::new(label, "", "setting", vec![json!(k), json!(v)]));
         }
+        items.push(Item::new(if self.cfg.translate.enabled { "Tradutor: desligar" } else { "Tradutor: ligar" }, "pt-BR → en no editor, termos da tela", "translate_toggle", vec![]));
         items.push(Item::new("Imagem de fundo...", "caminho png/jpg", "setting_prompt", vec![json!("background.image"), json!(""), json!("text")]));
         self.settings_more(&mut items);
         let path = config::config_path().display().to_string();
@@ -2110,6 +2118,7 @@ impl Gui {
             let _ = clip_set(&t);
             self.ext_clipboard(&t);
             self.flash("Copiado");
+            self.tr_lookup_selection();
         }
     }
 
@@ -2163,6 +2172,7 @@ impl Gui {
         if self.mods.super_key() && !super_bound(&self.keys, &key_name(&ev), self.mods) { return; }
         if self.splash.take().is_some() { return self.redraw(); }
         self.last_key = Instant::now();
+        if self.overlay.is_none() && self.composer.is_none() && self.tr_key(&ev) { return; }
         if self.composer.is_some() && self.overlay.is_none() { return self.composer_key(&ev); }
         if self.grid.is_some() && self.overlay.is_none() { return self.grid_key(&ev); }
         if self.graph.is_some() && self.overlay.is_none() { return self.graph_key(&ev); }
@@ -3379,6 +3389,7 @@ impl Gui {
             UserEv::Quick => self.toggle_quick(el),
             UserEv::Connected => { self.send_size(); self.cmd(json!({"cmd": "window-focus", "focused": self.focused})); }
             UserEv::Ext => self.ext_poll(),
+            UserEv::Translated(d) => self.tr_done(d),
             UserEv::Access(e) => self.access_event(e.window_event),
             #[cfg(target_os = "linux")]
             UserEv::Notify(u) => self.notify_action(&u),

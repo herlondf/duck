@@ -227,6 +227,33 @@ printf '\e]7501;state=blocked;msg=run migrations?\a'  # msg= is shown in the pan
 Like the Claude Code hooks, it beats the heuristic (for 10 minutes after the
 last report); `state=none` drops the agent from the pane.
 
+### Translator
+
+For people who write better in Portuguese: `translate = { enabled = true }`
+(or **Ctrl+Shift+4 > Tradutor: ligar**). In an agent pane, `Ctrl+Shift+Enter`
+opens the composer in translate mode: the first `Enter` translates (pt-BR →
+en) and shows the English below with up to 3 notes on word choices; the second
+`Enter` sends the English; `Alt+Enter` sends the original; editing the text
+translates again; `/commands` and `!shell` go as is. Selecting text on screen
+(dragging works even inside Claude Code; `Shift+drag` gives the mouse to the
+app) opens a balloon with the translation; up to 4 words come with part of
+speech and meaning in context, and **+ glossário** saves the term (**Glossário**
+in the palette lists them).
+
+Translation runs through the pane agent's own CLI and account: `claude -p
+--model haiku`, `gemini -m gemini-2.5-flash` and `codex exec -m gpt-5-mini -`
+(prompt on stdin; the gemini and codex ones are untested here, `cmd`
+overrides); panes without an agent use `default`. Private panes are never
+translated and secrets become `***` before leaving.
+
+```lua
+translate = {
+  enabled = true, from = 'pt-BR', to = 'en',
+  engines = { claude = { model = 'haiku' }, codex = { model = 'gpt-5-mini', cmd = { 'codex', 'exec', '-m', '{model}', '-' } } },
+  default = 'claude',
+},
+```
+
 ## Extensions
 
 Extensions are separate programs (official SDK in TypeScript) that send data to

@@ -33,6 +33,7 @@ pub mod secret;
 pub mod server;
 pub mod setup;
 pub mod toast;
+pub mod translate;
 pub mod update;
 
 /// Executavel da janela (duckw.exe ao lado deste), se existir.

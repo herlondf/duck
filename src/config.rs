@@ -293,6 +293,8 @@ pub struct Config {
     pub pane_header: String,
     /// Opcoes extras ao retomar sessoes do agente no restore (ex.: "--dangerously-skip-permissions").
     pub resume_args: String,
+    /// Tradutor (config `translate`): pt-BR -> en no editor e termos da tela.
+    pub translate: crate::translate::Translate,
 }
 
 /// Visual da janela: o que faz o Duck nao parecer um WezTerm.
@@ -590,6 +592,7 @@ pub fn parse(t: &Table) -> Config {
         ui: parse_ui(t.get::<Table>("ui").ok()),
         resume_args: s(t, "resume_args", ""),
         pane_header: t.get::<Table>("ui").ok().map(|u| s(&u, "pane_header", "multi")).unwrap_or_else(|| "multi".into()),
+        translate: crate::translate::parse(t.get::<Table>("translate").ok()),
     }
 }
 

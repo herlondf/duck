@@ -23,6 +23,8 @@ pub(super) struct Composer {
     pub undo: Vec<(Vec<char>, usize)>, pub redo: Vec<(Vec<char>, usize)>,
     /// Onde o texto foi desenhado (x, y, largura, altura): clique posiciona o cursor.
     pub geom: [f32; 4],
+    /// Modo tradutor (pane com agente e `translate.enabled`): Enter traduz, de novo envia.
+    pub tr: Option<crate::translate::ComposeState>,
 }
 
 pub(super) struct Ac { pub typed: String, pub items: Vec<AcItem>, pub sel: Option<usize> }
@@ -396,6 +398,7 @@ impl Gui {
         let ime_on = self.cfg.ime;
         let mut ime_spot: Option<[f32; 4]> = None;
         let typing_elsewhere = self.overlay.is_some() || self.composer.is_some() || self.grid.is_some() || self.graph.is_some();
+        let tr_header: Option<String> = self.composer.as_ref().filter(|c| c.tr.is_some()).map(|c| self.tr_header(c.pane));
         let r = self.r.as_mut().unwrap();
         let maximized = r.window.is_maximized();
         let (cw, ch) = (r.cell_w, r.cell_h);
@@ -1371,14 +1374,38 @@ impl Gui {
                 let (px, py, pw, ph) = (ox + p.x as f32 * cw, oy + p.y as f32 * ch, p.w as f32 * cw, p.h as f32 * ch);
                 let lines: Vec<String> = c.text.iter().collect::<String>().split('\n').map(String::from).collect();
                 let n = lines.len().clamp(1, 10);
-                let bh = n as f32 * ch + 44.0;
-                let (bx, by, bw) = (px + 6.0, py + ph - bh - 6.0, pw - 12.0);
+                let bw = pw - 12.0;
+                // Modo tradutor: cabecalho e, abaixo do texto, a traducao e as notas.
+                let tr_body = c.tr.as_ref().map(|st| super::tr::composer_lines(st, ((bw - 28.0) / cw).max(10.0) as usize));
+                let tr_head = if tr_body.is_some() { tr_header.clone() } else { None };
+                let head_h = if tr_head.is_some() { ch * 0.8 + 6.0 } else { 0.0 };
+                let body_lh = ch * 0.95;
+                let body_h = tr_body.as_ref().filter(|b| !b.is_empty()).map(|b| b.len() as f32 * body_lh + 10.0).unwrap_or(0.0);
+                let bh = n as f32 * ch + 44.0 + head_h + body_h;
+                let (bx, by) = (px + 6.0, (py + ph - bh - 6.0).max(4.0));
                 modal.shapes.push(Shape::shadow(bx, by + 4.0, bw, bh, [0.0, 0.0, 0.0, 0.5], 10.0, 14.0));
                 modal.shapes.push(Shape::rect(bx, by, bw, bh, lin(theme.tab_bar, 1.0), 10.0));
                 modal.shapes.push(Shape::ring(bx, by, bw, bh, lin(theme.accent, 0.9), 10.0, 1.5));
                 let tx = bx + 14.0;
-                let ty = by + 10.0;
+                let ty = by + 10.0 + head_h;
                 c.geom = [tx, ty, bw - 28.0, n as f32 * ch];
+                if let Some(hd) = &tr_head {
+                    modal.texts.push(TextItem { bold: true, clip_right: Some(bx + bw - 10.0), ..uit(tx, by + 8.0, hd, theme.accent, 0.8) });
+                }
+                if let Some(body) = tr_body.as_ref().filter(|b| !b.is_empty()) {
+                    let y0 = ty + n as f32 * ch + 6.0;
+                    modal.shapes.push(Shape::rect(tx, y0 - 3.0, bw - 28.0, 1.0, lin(theme.border, 1.0), 0.0));
+                    for (k, (l, kind)) in body.iter().enumerate() {
+                        let y = y0 + 4.0 + k as f32 * body_lh;
+                        let it = match kind {
+                            0 => txt(tx, y, l, theme.done),
+                            1 => uit(tx, y, l, theme.muted, 0.8),
+                            2 => uit(tx, y, l, theme.accent, 0.85),
+                            _ => uit(tx, y, l, theme.blocked, 0.85),
+                        };
+                        modal.texts.push(TextItem { clip_right: Some(bx + bw - 10.0), ..it });
+                    }
+                }
                 // posicao do cursor e da selecao em (linha, coluna)
                 let pos = |i: usize| -> (usize, usize) {
                     let before: String = c.text[..i.min(c.text.len())].iter().collect();
@@ -1405,9 +1432,17 @@ impl Gui {
                     ime_spot = Some([ix, iy, cw, ch]);
                     draw_preedit(&mut modal, &preedit, ix, iy, cw, ch, lin(theme.tab_bar, 1.0), &theme);
                 }
-                modal.texts.push(uit(tx, by + bh - ch - 6.0, "Enter envia · Shift+Enter quebra linha · Ctrl+Z desfaz · Esc fecha", theme.muted, 0.75));
+                let foot = match &c.tr {
+                    Some(crate::translate::ComposeState::Ready { .. }) => "Enter envia o ingles · Alt+Enter envia o original · editar traduz de novo · Esc fecha",
+                    Some(_) => "Enter traduz · Alt+Enter envia sem traduzir · Shift+Enter quebra linha · Esc fecha",
+                    None => "Enter envia · Shift+Enter quebra linha · Ctrl+Z desfaz · Esc fecha",
+                };
+                modal.texts.push(uit(tx, by + bh - ch - 6.0, foot, theme.muted, 0.75));
             }
         }
+
+        // ---- balao do tradutor (selecao)
+        super::tr::draw_balloon(&mut self.tr, &self.frame.panes, r, &mut modal, &mut self.hits, &theme, (ox, oy), (w, h), mouse);
 
         // ---- mensagem curta (erro de config, "copiado"...)
         if let Some((msg, at)) = &self.message {
@@ -1534,6 +1569,9 @@ impl Gui {
         let (x, y) = self.mouse;
         let pressed = state == ElementState::Pressed;
         if pressed && self.splash.take().is_some() { return self.redraw(); }
+        // Balao do tradutor: clique dentro e dele; fora fecha e segue.
+        if pressed && self.tr_click(x, y) { return; }
+        if !pressed && button == MouseButton::Left && self.tr_release() { return self.redraw(); }
         if pressed && button == MouseButton::Left {
             if let (Some(dir), Some(r)) = (self.resize_edge, &self.r) { let _ = r.window.drag_resize_window(dir); return; }
             // Painel dos agentes: clique nele traz o teclado; fora dele, devolve ao terminal.
@@ -1675,6 +1713,8 @@ impl Gui {
             }
         }
         let Some((pane, cell)) = self.cell_at(x, y) else { return };
+        // Tradutor: arrastar num app com mouse vira selecao do Duck.
+        if pressed && self.tr_press(pane, cell, button) { return; }
         if self.pane(pane).is_some_and(|p| p.mouse) && !self.mods.shift_key() {
             let b = match button { MouseButton::Left => 0, MouseButton::Middle => 1, MouseButton::Right => 2, _ => return };
             let end = if pressed { 'M' } else { 'm' };
@@ -1835,6 +1875,7 @@ impl Gui {
         }
         self.redraw();
         if !self.dragging { return; }
+        if self.tr_motion(x, y) { return; }
         if let Some((pane, cell)) = self.cell_at(x, y) {
             if self.pane(pane).is_some_and(|p| p.mouse && p.mouse_motion) && !self.mods.shift_key() {
                 self.cmd(json!({"cmd": "send", "pane": pane, "text": format!("\x1b[<32;{};{}M", cell.col + 1, cell.row + 1)}));
@@ -1944,7 +1985,8 @@ impl Gui {
                 if !typed.is_empty() { self.send_keys(&"\x7f".repeat(typed.chars().count())); }
                 let text: Vec<char> = typed.chars().collect();
                 let cur = text.len();
-                self.composer = Some(Composer { pane: ap, text, cur, anchor: None, undo: vec![], redo: vec![], geom: [0.0; 4] });
+                let tr = self.tr_composer(ap);
+                self.composer = Some(Composer { pane: ap, text, cur, anchor: None, undo: vec![], redo: vec![], geom: [0.0; 4], tr });
                 self.ac = None;
             }
             "home" => self.open_home(),
@@ -2548,12 +2590,11 @@ impl Gui {
         match &ev.logical_key {
             Key::Named(NamedKey::Escape) => { self.composer = None; return self.redraw(); }
             Key::Named(NamedKey::Enter) if !shift => {
+                // Tradutor: Enter traduz/envia o ingles; Alt+Enter envia o original.
+                if !self.mods.alt_key() && self.composer.as_ref().is_some_and(|c| c.tr.is_some()) { return self.composer_tr_enter(); }
                 let Some(c) = self.composer.take() else { return };
                 let text: String = c.text.iter().collect();
-                if !text.trim().is_empty() {
-                    self.cmd(json!({"cmd": "paste", "pane": c.pane, "text": text}));
-                    self.cmd(json!({"cmd": "send", "pane": c.pane, "text": "\r"}));
-                }
+                self.composer_send(c.pane, &text);
                 return self.redraw();
             }
             _ => {}
@@ -2625,6 +2666,9 @@ impl Gui {
                 }
             },
         }
+        // Editou depois de traduzir: a traducao nao vale mais.
+        let now: String = c.text.iter().collect();
+        if let Some(st) = c.tr.as_mut() { st.sync(&now); }
         self.redraw();
     }
 

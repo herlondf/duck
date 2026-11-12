@@ -225,6 +225,32 @@ printf '\e]7501;state=blocked;msg=rodar as migrations?\a' # msg= aparece no pain
 Como os hooks do Claude Code, ele vale mais que a heurística (por 10 minutos
 depois do último aviso); `state=none` tira o agente do pane.
 
+### Tradutor
+
+Para quem escreve melhor em português: `translate = { enabled = true }` (ou
+**Ctrl+Shift+4 > Tradutor: ligar**). No pane de um agente, `Ctrl+Shift+Enter`
+abre o editor em modo tradutor: o 1º `Enter` traduz (pt-BR → en) e mostra o
+inglês embaixo com até 3 notas sobre as escolhas de palavras; o 2º `Enter`
+envia o inglês; `Alt+Enter` envia o original; editar o texto traduz de novo;
+`/comando` e `!shell` vão como estão. Selecionar texto na tela (arrastar
+funciona até no Claude Code; `Shift+arrastar` dá o mouse ao app) abre um balão
+com a tradução; até 4 palavras vêm com classe e sentido no contexto, e
+**+ glossário** guarda o termo (**Glossário** na paleta lista os salvos).
+
+A tradução roda na CLI do agente do pane, com a conta dele: `claude -p --model
+haiku`, `gemini -m gemini-2.5-flash` e `codex exec -m gpt-5-mini -` (prompt no
+stdin; o do gemini e do codex não foram testados aqui, `cmd` troca); pane sem
+agente usa o `default`. Pane privado nunca é traduzido e segredos viram `***`
+antes de sair.
+
+```lua
+translate = {
+  enabled = true, from = 'pt-BR', to = 'en',
+  engines = { claude = { model = 'haiku' }, codex = { model = 'gpt-5-mini', cmd = { 'codex', 'exec', '-m', '{model}', '-' } } },
+  default = 'claude',
+},
+```
+
 ## Extensões
 
 Extensões são programas à parte (SDK oficial em TypeScript) que mandam dados
