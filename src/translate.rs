@@ -232,24 +232,9 @@ impl ComposeState {
 
 // ---------------------------------------------------------------- mouse
 
-/// Para onde vai o clique num pane.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Press { App, Hold, Duck }
-
-/// Com o tradutor ligado, o arrastar com o esquerdo num app com mouse vira
-/// selecao do Duck (o clique parado segue para o app); Shift inverte.
-pub fn press_route(translate: bool, app_mouse: bool, shift: bool, left: bool) -> Press {
-    match (app_mouse, translate && left, shift) {
-        (false, ..) => Press::Duck,
-        (true, true, true) => Press::App,
-        (true, true, false) => Press::Hold,
-        (true, false, true) => Press::Duck,
-        (true, false, false) => Press::App,
-    }
-}
-
-/// Clique segurado: mexeu para outra celula = comeca selecao.
-pub fn hold_is_drag(press: (i32, i32), now: (i32, i32)) -> bool { press != now }
+/// Com o tradutor ligado, so o Alt+arrastar com o esquerdo traduz (em
+/// qualquer pane); o resto do mouse segue como sempre.
+pub fn translate_drag(translate: bool, alt: bool, left: bool) -> bool { translate && alt && left }
 
 // ---------------------------------------------------------------- glossario
 
@@ -423,18 +408,10 @@ mod tests {
 
     #[test]
     fn drag_versus_click() {
-        // tradutor desligado: igual a hoje
-        assert_eq!(press_route(false, true, false, true), Press::App);
-        assert_eq!(press_route(false, true, true, true), Press::Duck);
-        assert_eq!(press_route(false, false, false, true), Press::Duck);
-        // ligado: esquerdo segura; Shift manda ao app
-        assert_eq!(press_route(true, true, false, true), Press::Hold);
-        assert_eq!(press_route(true, true, true, true), Press::App);
-        assert_eq!(press_route(true, true, false, false), Press::App);
-        assert_eq!(press_route(true, false, false, true), Press::Duck);
-        assert!(!hold_is_drag((3, 4), (3, 4)));
-        assert!(hold_is_drag((3, 4), (4, 4)));
-        assert!(hold_is_drag((3, 4), (3, 5)));
+        assert!(translate_drag(true, true, true));
+        assert!(!translate_drag(true, false, true)); // arrastar comum: so copia
+        assert!(!translate_drag(false, true, true)); // tradutor desligado
+        assert!(!translate_drag(true, true, false));
     }
 
     #[test]

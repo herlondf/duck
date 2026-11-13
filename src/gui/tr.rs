@@ -6,7 +6,7 @@
 use super::*;
 use super::ui::{inside, uit, Hit};
 use crate::render::Shape;
-use crate::translate::{self as tl, ComposeState, Enter, Press};
+use crate::translate::{self as tl, ComposeState, Enter};
 
 #[derive(Default)]
 pub(super) struct Tr {
@@ -21,11 +21,7 @@ pub(super) struct Tr {
 #[derive(Default, Clone, Copy)]
 enum Mouse {
     #[default] Off,
-    /// Segurado: soltar no lugar manda o clique ao app; mexer vira selecao.
-    Hold { pane: u64, cell: Cell },
-    /// Shift+arrastar: tudo para o app.
-    App { pane: u64, cell: Cell },
-    /// Virou selecao do Duck.
+    /// Alt+arrastar: selecao do Duck que traduz ao soltar.
     Duck,
 }
 
@@ -279,57 +275,32 @@ impl Gui {
         true
     }
 
-    fn mouse_seq(&mut self, pane: u64, b: u8, cell: Cell, end: char) {
-        self.cmd(json!({"cmd": "send", "pane": pane, "text": format!("\x1b[<{};{};{}{}", b, cell.col + 1, cell.row + 1, end)}));
-    }
-
-    /// Apertou num pane; true = o tradutor cuida (segura o clique ou manda ao app).
+    /// Apertou num pane; true = Alt+arrastar do tradutor (vira selecao do Duck).
     pub(super) fn tr_press(&mut self, pane: u64, cell: Cell, button: MouseButton) -> bool {
         self.tr.mouse = Mouse::Off;
-        let app_mouse = self.pane(pane).is_some_and(|p| p.mouse);
-        if !self.tr_on() || !app_mouse || button != MouseButton::Left { return false; }
+        if !tl::translate_drag(self.tr_on(), self.mods.alt_key(), button == MouseButton::Left) { return false; }
         if pane != self.frame.active_pane { self.cmd(json!({"cmd": "focus", "pane": pane})); }
+        self.sel = Some(Selection { pane, a: cell, b: cell });
+        self.tr.balloon = None;
+        self.tr.mouse = Mouse::Duck;
         self.dragging = true;
-        match tl::press_route(true, true, self.mods.shift_key(), true) {
-            Press::Hold => self.tr.mouse = Mouse::Hold { pane, cell },
-            Press::App => { self.mouse_seq(pane, 0, cell, 'M'); self.tr.mouse = Mouse::App { pane, cell }; }
-            Press::Duck => { self.dragging = false; return false; }
-        }
         true
     }
 
     /// Mexeu com o botao apertado; true = tratado.
     pub(super) fn tr_motion(&mut self, x: f32, y: f32) -> bool {
         if matches!(self.tr.mouse, Mouse::Off) { return false; }
-        let Some((pane, cell)) = self.cell_at(x, y) else { return true };
-        match self.tr.mouse {
-            Mouse::Off => return false,
-            Mouse::Hold { pane: hp, cell: hc } => {
-                if pane != hp || tl::hold_is_drag((hc.col, hc.row), (cell.col, cell.row)) {
-                    self.sel = Some(Selection { pane: hp, a: hc, b: if pane == hp { cell } else { hc } });
-                    self.tr.balloon = None;
-                    self.tr.mouse = Mouse::Duck;
-                }
-            }
-            Mouse::App { pane: ap, cell: last } => if pane == ap && cell != last {
-                if self.pane(ap).is_some_and(|p| p.mouse_motion) { self.mouse_seq(ap, 32, cell, 'M'); }
-                self.tr.mouse = Mouse::App { pane: ap, cell };
-            },
-            Mouse::Duck => if let Some(s) = self.sel.as_mut() { if s.pane == pane { s.b = cell; } },
+        if let Some((pane, cell)) = self.cell_at(x, y) {
+            if let Some(s) = self.sel.as_mut() { if s.pane == pane { s.b = cell; } }
         }
         true
     }
 
-    /// Soltou o esquerdo; true = tratado.
+    /// Soltou o esquerdo; true = tratado. Copia e abre o balao da traducao.
     pub(super) fn tr_release(&mut self) -> bool {
-        match std::mem::take(&mut self.tr.mouse) {
-            Mouse::Off => return false,
-            // Clique parado: o app recebe o apertar e o soltar juntos.
-            Mouse::Hold { pane, cell } => { self.mouse_seq(pane, 0, cell, 'M'); self.mouse_seq(pane, 0, cell, 'm'); }
-            Mouse::App { pane, cell } => self.mouse_seq(pane, 0, cell, 'm'),
-            Mouse::Duck => if self.sel.as_ref().is_some_and(|s| s.a != s.b) { self.copy_selection(); } else { self.sel = None; },
-        }
+        if matches!(std::mem::take(&mut self.tr.mouse), Mouse::Off) { return false; }
         self.dragging = false;
+        if self.sel.as_ref().is_some_and(|s| s.a != s.b) { self.copy_selection(); self.tr_lookup_selection(); } else { self.sel = None; }
         true
     }
 

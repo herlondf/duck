@@ -232,9 +232,9 @@ Para quem escreve melhor em português: `translate = { enabled = true }` (ou
 abre o editor em modo tradutor: o 1º `Enter` traduz (pt-BR → en) e mostra o
 inglês embaixo com até 3 notas sobre as escolhas de palavras; o 2º `Enter`
 envia o inglês; `Alt+Enter` envia o original; editar o texto traduz de novo;
-`/comando` e `!shell` vão como estão. Selecionar texto na tela (arrastar
-funciona até no Claude Code; `Shift+arrastar` dá o mouse ao app) abre um balão
-com a tradução; até 4 palavras vêm com classe e sentido no contexto, e
+`/comando` e `!shell` vão como estão. `Alt+arrastar` sobre um texto da tela
+(em qualquer pane, até no Claude Code) copia e abre um balão com a tradução; o
+arrastar comum só copia, como sempre; até 4 palavras vêm com classe e sentido no contexto, e
 **+ glossário** guarda o termo (**Glossário** na paleta lista os salvos).
 
 A tradução roda na CLI do agente do pane, com a conta dele: `claude -p --model

@@ -234,9 +234,9 @@ For people who write better in Portuguese: `translate = { enabled = true }`
 opens the composer in translate mode: the first `Enter` translates (pt-BR →
 en) and shows the English below with up to 3 notes on word choices; the second
 `Enter` sends the English; `Alt+Enter` sends the original; editing the text
-translates again; `/commands` and `!shell` go as is. Selecting text on screen
-(dragging works even inside Claude Code; `Shift+drag` gives the mouse to the
-app) opens a balloon with the translation; up to 4 words come with part of
+translates again; `/commands` and `!shell` go as is. `Alt+drag` over text on
+screen (in any pane, even inside Claude Code) copies it and opens a balloon with
+the translation; a plain drag only copies, as always; up to 4 words come with part of
 speech and meaning in context, and **+ glossário** saves the term (**Glossário**
 in the palette lists them).
 

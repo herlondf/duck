@@ -2118,7 +2118,6 @@ impl Gui {
             let _ = clip_set(&t);
             self.ext_clipboard(&t);
             self.flash("Copiado");
-            self.tr_lookup_selection();
         }
     }
 

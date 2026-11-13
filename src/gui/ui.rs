@@ -1713,7 +1713,7 @@ impl Gui {
             }
         }
         let Some((pane, cell)) = self.cell_at(x, y) else { return };
-        // Tradutor: arrastar num app com mouse vira selecao do Duck.
+        // Tradutor: Alt+arrastar seleciona, copia e traduz (em qualquer pane).
         if pressed && self.tr_press(pane, cell, button) { return; }
         if self.pane(pane).is_some_and(|p| p.mouse) && !self.mods.shift_key() {
             let b = match button { MouseButton::Left => 0, MouseButton::Middle => 1, MouseButton::Right => 2, _ => return };
