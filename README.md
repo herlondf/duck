@@ -254,6 +254,30 @@ translate = {
 },
 ```
 
+### Phone
+
+The Duck app (Android/iOS, `duck-app` repository) is a remote control for your
+agents: it shows screens and states, approves, queues messages, starts and
+interrupts agents and, when allowed, types into the shell. There is no cloud
+backend: the phone talks straight to Duck, end-to-end encrypted like between
+computers (local network, Tailscale or the relay).
+
+- **Ctrl+Shift+4 > Celulares > Parear celular** shows a QR code (valid for 10
+  min, once); the app scans it and connects, and Duck shows a notice with the
+  confirmation number, which must match the one on the phone. From the CLI,
+  `duck mobile pair` prints the QR code in the terminal.
+- Permissions per phone: `view`, `approve` and `message` are on by default;
+  `control` (start/stop agents, send files) and `keyboard` (type into any
+  pane) are turned on in the panel or with `duck mobile scopes pixel +control`.
+  **Revogar** (or `duck mobile revoke pixel`) deletes the key and drops the
+  connection.
+- Private panes never show up on the phone, and secrets on screen become `***`.
+  Every phone request goes to `audit.log` as `mobile:<name>`.
+- Notifications while the app is closed: the relay sends a content-free push
+  (FCM) when an agent asks for approval or finishes; enable it with `duck relay
+  --fcm-credentials service-account.json`. The full contract is in
+  [docs/MOBILE.md](docs/MOBILE.md) (Portuguese).
+
 ## Extensions
 
 Extensions are separate programs (official SDK in TypeScript) that send data to
