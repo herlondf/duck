@@ -29,6 +29,7 @@ pub const MAX_MSG: usize = 96 << 20;
 fn params() -> snow::params::NoiseParams { PATTERN.parse().expect("padrao Noise") }
 
 /// Chaves deste computador (privada, publica). Cria na primeira vez.
+#[cfg(not(test))]
 pub fn keypair() -> (Vec<u8>, Vec<u8>) {
     if let Some(s) = crate::secret::get("peer/static") {
         if let Some((a, b)) = s.trim().split_once(':') {
@@ -38,6 +39,13 @@ pub fn keypair() -> (Vec<u8>, Vec<u8>) {
     let kp = snow::Builder::new(params()).generate_keypair().expect("gerar chaves");
     let _ = crate::secret::set("peer/static", &format!("{}:{}", hex(&kp.private), hex(&kp.public)));
     (kp.private, kp.public)
+}
+
+/// Testes: chave do processo, sem tocar no cofre do usuario.
+#[cfg(test)]
+pub fn keypair() -> (Vec<u8>, Vec<u8>) {
+    static K: std::sync::LazyLock<(Vec<u8>, Vec<u8>)> = std::sync::LazyLock::new(|| { let k = snow::Builder::new(params()).generate_keypair().unwrap(); (k.private, k.public) });
+    K.clone()
 }
 
 /// Chave publica deste computador em hexa (identidade, pode circular).
@@ -95,6 +103,9 @@ impl Chan {
     /// Lado de quem conecta: manda o MAGIC e faz o handshake.
     pub fn connect(s: TcpStream) -> Result<Chan, String> { Self::connect_key(s, &keypair().0) }
 
+    /// Conecta com outra chave (testes: o celular de mentira).
+    pub fn connect_with(s: TcpStream, private: &[u8]) -> Result<Chan, String> { Self::connect_key(s, private) }
+
     fn connect_key(mut s: TcpStream, private: &[u8]) -> Result<Chan, String> {
         let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
         let mut hs = snow::Builder::new(params()).local_private_key(private).and_then(|b| b.build_initiator()).map_err(|e| e.to_string())?;
@@ -144,6 +155,25 @@ impl Chan {
     pub fn confirm(&self) -> String { confirm_from_hash(&self.hash) }
 
     pub fn set_timeout(&self, d: Duration) { let _ = self.s.set_read_timeout(Some(d)); }
+
+    /// Escrita que trava mais que `d` (o outro parou de ler) vira erro.
+    pub fn set_write_timeout(&self, d: Duration) { let _ = self.s.set_write_timeout(Some(d)); }
+
+    /// Espera ate `d` por bytes do outro sem consumir nada (sessao longa: a
+    /// mesma thread le pedidos e manda eventos). Ok(false) = nada ainda;
+    /// Err = conexao fechada. Depois, a leitura volta a esperar `after`.
+    pub fn readable(&self, d: Duration, after: Duration) -> Result<bool, String> {
+        let _ = self.s.set_read_timeout(Some(d.max(Duration::from_millis(1))));
+        let mut b = [0u8; 1];
+        let r = match self.s.peek(&mut b) {
+            Ok(0) => Err("o outro fechou a conexao".into()),
+            Ok(_) => Ok(true),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = self.s.set_read_timeout(Some(after));
+        r
+    }
 
     pub fn send(&mut self, data: &[u8]) -> Result<(), String> {
         if data.len() > MAX_MSG { return Err(format!("mensagem grande demais ({} MB, maximo {} MB)", data.len() >> 20, MAX_MSG >> 20)); }

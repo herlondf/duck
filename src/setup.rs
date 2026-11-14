@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 pub fn usage_dir() -> PathBuf { crate::config::home().join("AppData").join("Local").join("Temp").join("claude-usage") }
 
 /// "five_hour" -> "5h", "seven_day" -> "7d" (os nomes ja mudaram entre versoes).
-fn window_label(k: &str) -> String {
+pub fn window_label(k: &str) -> String {
     let l = k.to_lowercase();
     if l.contains("five_hour") || l.contains("5h") || l.contains("5_h") { "5h".into() }
     else if l.contains("seven_day") || l.contains("7d") || l.contains("7_d") || l.contains("week") { "7d".into() }

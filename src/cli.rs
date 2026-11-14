@@ -1357,6 +1357,39 @@ fn wait_accept(addr: &str, key: &str, secs: u64) -> Result<String, String> {
 }
 
 /// `duck peer ...`: o mesmo que o painel Computadores (Ctrl+Shift+P).
+/// `duck mobile pair|list|revoke <nome>|scopes <nome> +control -keyboard`.
+pub fn mobile(args: &[String]) -> i32 {
+    let a = |i: usize| args.get(i).map(String::as_str);
+    let server = |req: Value| -> Result<Value, String> { Conn::connect_or_spawn().map_err(|e| e.to_string())?.call(req) };
+    let ago = |t: u64| { let s = crate::mobile::now().saturating_sub(t); if t == 0 { "nunca".to_string() } else if s < 120 { "agora".into() } else if s < 7200 { format!("ha {} min", s / 60) } else if s < 172_800 { format!("ha {} h", s / 3600) } else { format!("ha {} dias", s / 86400) } };
+    let r = match (a(0), a(1)) {
+        (Some("pair"), _) => server(json!({"cmd": "mobile-pair"})).and_then(|v| {
+            let url = v["url"].as_str().unwrap_or("");
+            println!("{}", crate::mobile::qr_text(url)?);
+            println!("No app Duck: Parear > ler o QR. Vale {} min, uma vez.", v["minutes"]);
+            eprintln!("{url}");
+            Ok(())
+        }),
+        (Some("list"), _) | (None, _) => server(json!({"cmd": "mobile-list"})).map(|v| {
+            let list = v["devices"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() { println!("nenhum celular pareado (duck mobile pair)"); }
+            for d in list {
+                let scopes: Vec<&str> = d["scopes"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect();
+                println!("{}{}  {}  ultima conexao: {}{}", d["name"].as_str().unwrap_or("?"), if d["online"] == true { " (conectado)" } else { "" },
+                    scopes.join(","), ago(d["last_seen"].as_u64().unwrap_or(0)), if d["push"] == true { "  push" } else { "" });
+            }
+        }),
+        (Some("revoke"), Some(name)) => server(json!({"cmd": "mobile-revoke", "name": name})).map(|v| println!("{name} revogado ({} sessao(oes) derrubada(s))", v["sessions_closed"])),
+        (Some("scopes"), Some(name)) if args.len() > 2 => server(json!({"cmd": "mobile-scopes", "name": name, "changes": &args[2..]}))
+            .map(|v| println!("{name}: {}", v["scopes"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(","))),
+        _ => {
+            eprintln!("uso: duck mobile pair | list | revoke <nome> | scopes <nome> +control -keyboard\n  permissoes: {}", crate::mobile::SCOPES.join(", "));
+            return 2;
+        }
+    };
+    match r { Ok(()) => 0, Err(e) => { eprintln!("duck mobile: {e}"); 1 } }
+}
+
 pub fn peer(args: &[String]) -> i32 {
     let cfg = crate::config::load_config().0;
     let me = cfg.peer_name.clone();

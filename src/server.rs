@@ -35,6 +35,9 @@ use crate::config::{self, Config};
 use crate::proto;
 use crate::ptyhost;
 
+mod cmds;
+mod mobile;
+
 pub type Id = u64;
 
 fn now_secs() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
@@ -1209,6 +1212,8 @@ fn peer_conn(srv: &Arc<Server>, mut s: std::net::TcpStream, via_relay: bool) {
     };
     c.set_timeout(Duration::from_secs(120));
     let req = match c.recv_json() { Ok(v) => v, Err(e) => { proto::log(&format!("peers: {e}")); return; } };
+    // Celular (docs/MOBILE.md): mensagens com `op`, sessao longa.
+    if req.get("op").is_some() { return mobile::conn(srv, c, req); }
     let key = c.remote().to_string();
     let confirm = c.confirm();
     let out = secure_req(srv, &req, &ip, &key, &confirm, via_relay).unwrap_or_else(|e| json!({"ok": false, "error": e}));
@@ -1939,6 +1944,7 @@ fn ask(m: &mut Mux, kind: &str, pane: Id, text: String, payload: String) -> u64 
     let id = m.approval_seq;
     m.approvals.push(Approval { id, kind: kind.into(), text, pane, payload, decided: None });
     emit(m, "approval", pane);
+    if let Some(e) = m.events.last_mut() { e.1["approval"] = json!(id); }
     id
 }
 
@@ -2822,13 +2828,7 @@ fn needs_approval(m: &Mux, caller: Caller, cmd: &str, a: &Value) -> Option<Strin
 
 fn audit(m: &Mux, caller: Caller, a: &Value) {
     if !m.cfg.audit { return; }
-    let cmd = arg_str(a, "cmd").unwrap_or("");
-    if READ_CMDS.contains(&cmd) || ["subscribe", "resize", "window-focus", "theme-mode", "ext-send"].contains(&cmd) { return; }
-    // A GUI digitando nao e auditoria; agentes e scripts sao.
-    if arg_str(a, "client").is_some_and(|c| c.starts_with("gui-")) { return; }
-    let mut a = a.clone();
-    if let Some(t) = a.get_mut("text") { *t = json!(clean(t.as_str().unwrap_or(""), 200)); }
-    let line = json!({"ts": now_secs(), "caller_pane": caller.0, "req": a});
+    let Some(line) = audit_line(caller, a) else { return };
     let p = proto::data_dir().join("audit.log");
     if std::fs::metadata(&p).map(|x| x.len() > 4 << 20).unwrap_or(false) {
         let _ = std::fs::rename(&p, proto::data_dir().join("audit.log.1"));
@@ -2836,6 +2836,24 @@ fn audit(m: &Mux, caller: Caller, a: &Value) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// Linha do audit.log (None: nao audita).
+fn audit_line(caller: Caller, a: &Value) -> Option<Value> {
+    let cmd = arg_str(a, "cmd").unwrap_or("");
+    // Do celular vai tudo, leitura inclusive (caller = "mobile:<nome>").
+    let via = arg_str(a, "via").filter(|v| v.starts_with("mobile:")).map(String::from);
+    if via.is_none() && (READ_CMDS.contains(&cmd) || ["subscribe", "resize", "window-focus", "theme-mode", "ext-send"].contains(&cmd)) { return None; }
+    // A GUI digitando nao e auditoria; agentes e scripts sao.
+    if arg_str(a, "client").is_some_and(|c| c.starts_with("gui-")) { return None; }
+    let mut a = a.clone();
+    if let Some(t) = a.get_mut("text") { *t = json!(clean(t.as_str().unwrap_or(""), 200)); }
+    // Arquivo (file-put) e token (push-token) nao vao para o log.
+    if let Some(d) = a.get_mut("data") { *d = json!(format!("<{} bytes base64>", d.as_str().map(str::len).unwrap_or(0))); }
+    if let Some(t) = a.get_mut("token") { *t = json!(crate::secure::short(t.as_str().unwrap_or(""))); }
+    let mut line = json!({"ts": now_secs(), "caller_pane": caller.0, "req": a});
+    if let Some(v) = via { line["caller"] = json!(v); }
+    Some(line)
 }
 
 fn wait_approval(srv: &Arc<Server>, id: u64, timeout: Duration) -> bool {
@@ -2872,6 +2890,9 @@ fn handle(srv: &Arc<Server>, a: &Value, caller: Caller) -> Result<Value, String>
     }
     // Comandos que bloqueiam nao podem segurar o lock.
     if cmd == "wait" { return wait(srv, a); }
+    if cmds::handles(cmd) { return cmds::run(srv, a, caller, cmd); }
+    // Diff de um arquivo: git fora do lock.
+    if cmd == "changes" && a.get("file").is_some() { return cmds::diff(srv, a); }
     let mut m = srv.lock();
     let m = &mut *m;
     let r = match cmd {
@@ -4349,10 +4370,12 @@ fn serve_conn(srv: Arc<Server>, conn: Stream, token: String) {
     loop {
         line.clear();
         match reader.read_line(&mut line) { Ok(0) | Err(_) => return, _ => {} }
-        let req: Value = match serde_json::from_str(&line) {
+        let mut req: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => { let _ = writeln!(reader.get_mut(), "{}", json!({"error": e.to_string()})); continue; }
         };
+        // `via` (quem chamou no audit) so vem da sessao do celular, nunca do pipe.
+        if let Some(o) = req.as_object_mut() { o.remove("via"); }
         if req.get("cmd").and_then(|c| c.as_str()) == Some("subscribe") {
             if caller.0.is_some() { return; } // so o dono assina a tela
             let client = req.get("client").and_then(|c| c.as_str()).unwrap_or("gui").to_string();
@@ -4585,6 +4608,7 @@ pub fn run() {
         std::thread::spawn(move || crate::relay::client_loop(relay, relay_secret, key, relay_status, handle));
     }
     { let s = srv.clone(); std::thread::spawn(move || pair_poll_loop(s)); }
+    { let s = srv.clone(); std::thread::spawn(move || mobile::push_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || event_loop(s, rx)); }
     { let s = srv.clone(); std::thread::spawn(move || agent_loop(s)); }
     { let s = srv.clone(); std::thread::spawn(move || autosave_loop(s)); }
@@ -4621,7 +4645,10 @@ pub(crate) mod testkit {
 
     pub(crate) fn cfg() -> Config {
         let lua = mlua::Lua::new();
-        config::parse(&lua.create_table().unwrap())
+        let mut c = config::parse(&lua.create_table().unwrap());
+        // Testes nao escrevem no audit.log do usuario.
+        c.audit = false;
+        c
     }
 
     pub(crate) fn server(size: (u16, u16)) -> Arc<Server> {
@@ -4687,6 +4714,16 @@ pub(crate) mod testkit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_do_celular() {
+        let l = audit_line(Caller(None), &json!({"cmd": "read", "pane": 3, "via": "mobile:pixel"})).unwrap();
+        assert_eq!(l["caller"], "mobile:pixel");
+        assert!(audit_line(Caller(None), &json!({"cmd": "read", "pane": 3})).is_none(), "leitura comum nao audita");
+        let l = audit_line(Caller(None), &json!({"cmd": "file-put", "data": "QUJD", "via": "mobile:pixel"})).unwrap();
+        assert_eq!(l["req"]["data"], "<4 bytes base64>");
+        assert!(audit_line(Caller(Some(2)), &json!({"cmd": "send", "text": "x"})).unwrap().get("caller").is_none());
+    }
 
     #[test]
     fn restore_warning_perfil_sem_hooks() {

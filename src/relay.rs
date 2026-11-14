@@ -13,11 +13,16 @@
 //! - `{"accept": id, "secret"}`: o Duck registrado abre esta conexao para o
 //!   pedido `id`; o relay responde `{"ok":true}` aos dois e emenda.
 //!
+//! - `{"push": [tokens], "secret", "data": {...}}`: o Duck pede um push do
+//!   FCM para os celulares (so dados, sem texto; ver docs/MOBILE.md). Precisa
+//!   de `--fcm-credentials` (conta de servico do Firebase); 30 por minuto por
+//!   segredo. Responde `{"ok":true,"sent":n}` ou o erro.
+//!
 //! Registrar a chave de outro so faz as conexoes para ele falharem (sem a
 //! chave privada o handshake nao fecha): o pior caso e negar servico.
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
@@ -57,6 +62,16 @@ pub fn dial(relay: &str, secret: &str, key: &str) -> Result<TcpStream, String> {
     if v["ok"].as_bool() != Some(true) { return Err(format!("relay: {}", v["error"].as_str().unwrap_or("recusou"))); }
     let _ = s.set_read_timeout(None);
     Ok(s)
+}
+
+/// Pede ao relay um push para os celulares (tokens do FCM).
+pub fn push(relay: &str, secret: &str, tokens: &[String], data: &Value) -> Result<Value, String> {
+    let mut s = connect(relay)?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+    send_line(&mut s, &json!({"push": tokens, "secret": secret, "data": data}))?;
+    let v: Value = serde_json::from_str(&read_line(&mut s)?).map_err(|e| e.to_string())?;
+    if v["ok"].as_bool() != Some(true) { return Err(format!("relay: {}", v["error"].as_str().unwrap_or("recusou"))); }
+    Ok(v)
 }
 
 /// Mantem este Duck registrado no relay e entrega cada conexao que chega
@@ -104,6 +119,19 @@ struct Hub {
     regs: HashMap<String, TcpStream>,
     /// id -> conexao de quem discou (esperando o aceite)
     waiting: HashMap<String, (TcpStream, Instant)>,
+    /// segredo -> pushes do ultimo minuto.
+    pushes: HashMap<String, VecDeque<Instant>>,
+}
+
+/// Pushes por minuto por segredo.
+const PUSH_PER_MIN: usize = 30;
+
+/// Limite de janela deslizante: true se ainda cabe (e conta este).
+fn allow(q: &mut VecDeque<Instant>, now: Instant, max: usize, window: Duration) -> bool {
+    while q.front().is_some_and(|t| now.duration_since(*t) >= window) { q.pop_front(); }
+    if q.len() >= max { return false; }
+    q.push_back(now);
+    true
 }
 
 /// Copia bytes nos dois sentidos ate um lado fechar.
@@ -119,30 +147,40 @@ fn splice(a: TcpStream, b: TcpStream) {
     let _ = t.join();
 }
 
-/// `duck relay [--listen ip:porta] [--secret S]`.
+/// `duck relay [--listen ip:porta] [--secret S] [--fcm-credentials conta.json]`.
 pub fn main(args: &[String]) -> i32 {
     let mut listen = "0.0.0.0:7879".to_string();
     let mut secret = std::env::var("DUCK_RELAY_SECRET").unwrap_or_default();
+    let mut fcm_path = std::env::var("DUCK_RELAY_FCM_CREDENTIALS").unwrap_or_default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--listen" => if let Some(v) = it.next() { listen = v.clone() },
             "--secret" => if let Some(v) = it.next() { secret = v.clone() },
-            _ => { eprintln!("uso: duck relay [--listen 0.0.0.0:7879] [--secret SENHA]  (ou DUCK_RELAY_SECRET)"); return 2; }
+            "--fcm-credentials" => if let Some(v) = it.next() { fcm_path = v.clone() },
+            _ => { eprintln!("uso: duck relay [--listen 0.0.0.0:7879] [--secret SENHA] [--fcm-credentials conta.json]  (ou DUCK_RELAY_SECRET, DUCK_RELAY_FCM_CREDENTIALS)"); return 2; }
         }
     }
+    let fcm = if fcm_path.is_empty() { None } else {
+        match crate::fcm::Fcm::load(&fcm_path) {
+            Ok(f) => { println!("push do celular ligado (FCM, projeto {})", f.project()); Some(Arc::new(f)) }
+            Err(e) => { eprintln!("duck relay: {e}"); return 1; }
+        }
+    };
     let l = match TcpListener::bind(&listen) {
         Ok(l) => l,
         Err(e) => { eprintln!("duck relay: {listen}: {e}"); return 1; }
     };
     println!("duck relay escutando em {listen}{}", if secret.is_empty() { " (sem senha)" } else { " (com senha)" });
     println!("Nos Ducks: painel Computadores > Relay, ou peer = {{ relay = 'ESTE_IP:{}' }} no ~/.duck-local.lua", crate::peer::port_of(&listen));
-    serve(l, secret);
+    serve_with(l, secret, fcm);
     0
 }
 
 /// Roda o relay num listener ja aberto (tambem usado pelos testes).
-pub fn serve(l: TcpListener, secret: String) {
+pub fn serve(l: TcpListener, secret: String) { serve_with(l, secret, None) }
+
+pub fn serve_with(l: TcpListener, secret: String, fcm: Option<Arc<crate::fcm::Fcm>>) {
     let hub = Arc::new(Mutex::new(Hub::default()));
     // Batimento: derruba registros mortos e pedidos que ninguem aceitou.
     {
@@ -155,12 +193,28 @@ pub fn serve(l: TcpListener, secret: String) {
         });
     }
     for s in l.incoming().flatten() {
-        let (hub, secret) = (hub.clone(), secret.clone());
-        std::thread::spawn(move || relay_conn(hub, s, &secret));
+        let (hub, secret, fcm) = (hub.clone(), secret.clone(), fcm.clone());
+        std::thread::spawn(move || relay_conn(hub, s, &secret, fcm));
     }
 }
 
-fn relay_conn(hub: Arc<Mutex<Hub>>, mut s: TcpStream, secret: &str) {
+/// Linha `push`: confere o limite e manda pelo FCM (um pedido por token).
+fn push_in(hub: &Mutex<Hub>, v: &Value, fcm: Option<&crate::fcm::Fcm>) -> Value {
+    let Some(fcm) = fcm else { return json!({"ok": false, "error": "este relay nao tem push (falta --fcm-credentials)"}) };
+    let tokens: Vec<&str> = v["push"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).filter(|t| !t.is_empty() && t.len() < 4096).take(16).collect();
+    if tokens.is_empty() || !v["data"].is_object() { return json!({"ok": false, "error": "push sem token ou sem data"}); }
+    let key = v["secret"].as_str().unwrap_or("").to_string();
+    if !allow(hub.lock().unwrap().pushes.entry(key).or_default(), Instant::now(), PUSH_PER_MIN, Duration::from_secs(60)) {
+        return json!({"ok": false, "error": "limite de 30 pushes por minuto"});
+    }
+    let (mut sent, mut errs) = (0, vec![]);
+    for t in tokens {
+        match fcm.send(t, &v["data"]) { Ok(()) => sent += 1, Err(e) => errs.push(json!({"token": crate::secure::short(t), "error": e})) }
+    }
+    json!({"ok": sent > 0 || errs.is_empty(), "sent": sent, "errors": errs, "error": if sent == 0 { errs.first().and_then(|e| e["error"].as_str()).unwrap_or("") } else { "" }})
+}
+
+fn relay_conn(hub: Arc<Mutex<Hub>>, mut s: TcpStream, secret: &str, fcm: Option<Arc<crate::fcm::Fcm>>) {
     let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
     let Ok(line) = read_line(&mut s) else { return };
     let Ok(v) = serde_json::from_str::<Value>(&line) else { let _ = send_line(&mut s, &json!({"ok": false, "error": "json"})); return };
@@ -200,6 +254,9 @@ fn relay_conn(hub: Arc<Mutex<Hub>>, mut s: TcpStream, secret: &str) {
             h.waiting.insert(id, (c, Instant::now()));
         }
         // A conexao fica com o hub; o accept responde e emenda.
+    } else if v.get("push").is_some() {
+        let r = push_in(&hub, &v, fcm.as_deref());
+        let _ = send_line(&mut s, &r);
     } else if let Some(id) = v["accept"].as_str() {
         let Some((mut d, _)) = hub.lock().unwrap().waiting.remove(id) else {
             let _ = send_line(&mut s, &json!({"ok": false, "error": "pedido expirou"}));
@@ -217,6 +274,20 @@ fn relay_conn(hub: Arc<Mutex<Hub>>, mut s: TcpStream, secret: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limite_de_push() {
+        let mut q = VecDeque::new();
+        let t0 = Instant::now();
+        for i in 0..30 { assert!(allow(&mut q, t0 + Duration::from_millis(i), 30, Duration::from_secs(60))); }
+        assert!(!allow(&mut q, t0 + Duration::from_secs(30), 30, Duration::from_secs(60)));
+        assert!(allow(&mut q, t0 + Duration::from_secs(61), 30, Duration::from_secs(60)));
+        // Sem FCM o relay recusa o push (sem travar).
+        let hub = Mutex::new(Hub::default());
+        let r = push_in(&hub, &json!({"push": ["t"], "secret": "s", "data": {"kind": "done"}}), None);
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("fcm-credentials"));
+    }
 
     /// Registro, discagem e bytes indo e voltando pelo relay.
     #[test]

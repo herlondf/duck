@@ -303,6 +303,9 @@ impl Host {
     }
 
     /// Manda so se a extensao tem a permissao; ext "*" = todas que tem.
+    /// A extensao esta rodando (processo proprio ou no hospedeiro).
+    pub fn is_running(&self, ext: &str) -> bool { self.procs.iter().any(|p| p.name == ext) }
+
     pub fn send_perm(&mut self, ext: &str, perm: &str, msg: Value) {
         if perm == "context" && ext == "*" { self.context = Some(msg.clone()); }
         let names: Vec<String> = self.procs.iter().filter(|p| (ext == "*" || p.name == ext) && p.permissions.iter().any(|x| x == perm)).map(|p| p.name.clone()).collect();

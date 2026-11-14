@@ -2244,7 +2244,7 @@ impl Gui {
         if ap.detail_pane == row.pane && ap.detail_at.elapsed() < Duration::from_secs(3) { return; }
         ap.detail_pane = row.pane;
         ap.detail_at = Instant::now();
-        let plan = row.session.as_deref().and_then(|s| find_transcript(&row.config_dir, s))
+        let plan = row.session.as_deref().and_then(|s| crate::claude::find_transcript(&row.config_dir, s))
             .map(|p| crate::cli::transcript_plan(&p.to_string_lossy())).unwrap_or_default();
         let ch = self.call(json!({"cmd": "changes", "pane": row.pane})).unwrap_or_default();
         let files = ch["list"].as_array().into_iter().flatten().filter_map(|f| Some((f[0].as_str()?.to_string(), f[1].as_str()?.to_string(), f[2].as_i64().unwrap_or(0), f[3].as_i64().unwrap_or(0)))).collect();
@@ -2259,54 +2259,30 @@ impl Gui {
         let pick = self.active().filter(|p| p.session.is_some()).map(|p| (p.session.clone(), p.config_dir.clone()))
             .or_else(|| self.frame.panes.iter().find(|p| p.session.is_some()).map(|p| (p.session.clone(), p.config_dir.clone())));
         let Some((Some(session), dir)) = pick else { return self.flash("Nenhuma sessao de agente nesta aba (hooks do Duck instalados?)") };
-        let Some(path) = find_transcript(dir.as_deref().unwrap_or(""), &session) else { return self.flash("Transcript da sessao nao encontrado") };
+        let Some(path) = crate::claude::find_transcript(dir.as_deref().unwrap_or(""), &session) else { return self.flash("Transcript da sessao nao encontrado") };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
         let mut items = Vec::new();
         // O transcript grava em UTC; mostra no fuso da maquina.
         let utc_now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| (d.as_secs() / 60 % 1440) as i64).unwrap_or(0);
         let local_now = clock().split(':').map(|x| x.parse::<i64>().unwrap_or(0)).fold(0, |a, x| a * 60 + x);
         let off = (local_now - utc_now).rem_euclid(1440);
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-            let ts = v["timestamp"].as_str().and_then(|t| t.get(11..16)).map(|hm| {
+        for e in crate::claude::timeline(&text) {
+            let ts = e["ts"].as_str().and_then(|t| t.get(11..16)).map(|hm| {
                 let m = hm.split(':').map(|x| x.parse::<i64>().unwrap_or(0)).fold(0, |a, x| a * 60 + x);
                 let l = (m + off).rem_euclid(1440);
                 format!("{:02}:{:02}", l / 60, l % 60)
             }).unwrap_or_default();
-            let content = &v["message"]["content"];
-            if v["type"] == "user" {
-                if let Some(t) = content.as_str() {
-                    if !t.starts_with('<') { items.push(Item::new(format!("💬 {}", t.replace('\n', " ").chars().take(120).collect::<String>()), ts.clone(), "", vec![])); }
-                }
-                for b in content.as_array().into_iter().flatten() {
-                    if b["type"] == "tool_result" && b["is_error"] == true {
-                        let msg = b["content"].as_str().map(String::from).or_else(|| b["content"].as_array().and_then(|a| a.iter().find_map(|x| x["text"].as_str().map(String::from)))).unwrap_or_default();
-                        items.push(Item::new(format!("✗ erro: {}", msg.lines().next().unwrap_or("").chars().take(120).collect::<String>()), ts.clone(), "", vec![]));
-                    } else if b["type"] == "text" {
-                        let t = b["text"].as_str().unwrap_or("");
-                        if !t.starts_with('<') && !t.is_empty() { items.push(Item::new(format!("💬 {}", t.replace('\n', " ").chars().take(120).collect::<String>()), ts.clone(), "", vec![])); }
-                    }
-                }
-            }
-            if v["type"] == "assistant" {
-                for b in content.as_array().into_iter().flatten().filter(|b| b["type"] == "tool_use") {
-                    let name = b["name"].as_str().unwrap_or("");
-                    let i = &b["input"];
-                    let file = i["file_path"].as_str().or_else(|| i["notebook_path"].as_str()).unwrap_or("");
-                    let it = match name {
-                        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => Item::new(format!("✎ {name} {file}"), ts.clone(), "preview", vec![json!(file), json!(1), json!(1)]),
-                        "Read" => Item::new(format!("📄 Read {file}"), ts.clone(), "preview", vec![json!(file), json!(1), json!(1)]),
-                        "Bash" | "PowerShell" => Item::new(format!("⚙ {name}: {}", i["command"].as_str().unwrap_or("").replace('\n', " ").chars().take(110).collect::<String>()), ts.clone(), "", vec![]),
-                        "TaskCreate" => Item::new(format!("☐ tarefa: {}", i["subject"].as_str().unwrap_or("")), ts.clone(), "", vec![]),
-                        "TaskUpdate" => Item::new(format!("☑ tarefa {} → {}", i["taskId"], i["status"].as_str().unwrap_or("")), ts.clone(), "", vec![]),
-                        _ => {
-                            let d = i["pattern"].as_str().or_else(|| i["description"].as_str()).or_else(|| i["query"].as_str()).unwrap_or("");
-                            Item::new(format!("⚙ {name} {}", d.chars().take(100).collect::<String>()), ts.clone(), "", vec![])
-                        }
-                    };
-                    items.push(it);
-                }
-            }
+            let t = e["text"].as_str().unwrap_or("");
+            let file = e["file"].as_str().unwrap_or("");
+            let it = match e["kind"].as_str().unwrap_or("") {
+                "prompt" => Item::new(format!("💬 {t}"), ts, "", vec![]),
+                "error" => Item::new(format!("✗ erro: {t}"), ts, "", vec![]),
+                "edit" => Item::new(format!("✎ {t}"), ts, "preview", vec![json!(file), json!(1), json!(1)]),
+                "read" => Item::new(format!("📄 {t}"), ts, "preview", vec![json!(file), json!(1), json!(1)]),
+                "task" => Item::new(format!("{} {t}", if t.starts_with("tarefa:") { "☐" } else { "☑" }), ts, "", vec![]),
+                _ => Item::new(format!("⚙ {t}"), ts, "", vec![]),
+            };
+            items.push(it);
         }
         if items.is_empty() { return self.flash("Linha do tempo vazia"); }
         let start = items.len().saturating_sub(600);
@@ -2320,7 +2296,7 @@ impl Gui {
     pub(super) fn session_items(&mut self, limit: usize) -> Vec<Item> {
         // (mtime, perfil, sessao, caminho, WSL: (dominio, home no Linux))
         let mut found: Vec<(u64, String, String, String, Option<(String, String)>)> = Vec::new();
-        for (mtime, prof, session, path) in scan_profiles(&config::home()) {
+        for (mtime, prof, session, path) in crate::claude::scan_profiles(&config::home()) {
             found.push((mtime, prof, session, path, None));
         }
         found.extend(wsl_sessions(&self.cfg.domains));
@@ -3049,6 +3025,26 @@ fn draw_overlay(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, o: &Overla
         out.truncate(lines);
         out
     };
+    // QR do celular: cartao com o QR em quads (modulo inteiro em pixels, sem emenda).
+    if let Some((n, mods, foot)) = &o.qr {
+        let n = (*n).max(1);
+        let room = (h - top - 60.0 - ch * 4.0).min(w - 80.0).clamp(120.0, 560.0);
+        let q = (room / (n as f32 + 8.0)).floor().max(2.0);
+        let side = q * (n as f32 + 8.0);
+        let (ow, oh) = (side + 48.0, side + 40.0 + ch * 3.6);
+        let (x, y) = (((w - ow) / 2.0).round(), (top + ((h - top) - oh) / 2.0).round());
+        card(l, x, y, ow, oh);
+        l.texts.push(TextItem { bold: true, clip_right: Some(x + ow - 20.0), ..uit(x + 24.0, y + 14.0, &o.title, theme.fg, 1.0) });
+        let (qx, qy) = (x + 24.0, y + 22.0 + ch * 1.4);
+        l.quads.push(Quad { x: qx, y: qy, w: side, h: side, color: [1.0, 1.0, 1.0, 1.0] });
+        for (i, d) in mods.iter().enumerate() {
+            if *d { l.quads.push(Quad { x: qx + ((i % n) as f32 + 4.0) * q, y: qy + ((i / n) as f32 + 4.0) * q, w: q, h: q, color: [0.0, 0.0, 0.0, 1.0] }); }
+        }
+        for (k, t) in wrap(r, foot, ow - 48.0, 0.8, 2).iter().enumerate() {
+            l.texts.push(uit(x + 24.0, qy + side + 10.0 + k as f32 * ch * 0.95, t, theme.muted, 0.8));
+        }
+        return spot;
+    }
     match &o.kind {
         OverlayKind::Preview { file, line, first, lines, .. } => {
             // So as linhas que cabem, com a pedida perto do meio.
@@ -3246,12 +3242,6 @@ fn draw_overlay(r: &mut Renderer, l: &mut Layer, hits: &mut Vec<Hit>, o: &Overla
     spot
 }
 
-/// Transcript da sessao: <perfil>/projects/*/<sessao>.jsonl.
-fn find_transcript(config_dir: &str, session: &str) -> Option<std::path::PathBuf> {
-    let base = if config_dir.is_empty() { config::home().join(".claude") } else { std::path::PathBuf::from(config_dir) };
-    std::fs::read_dir(base.join("projects")).ok()?.flatten().map(|d| d.path().join(format!("{session}.jsonl"))).find(|p| p.is_file())
-}
-
 // -------------------------------------------------------------- tema do papel de parede
 
 fn hsl(c: Rgb) -> (f32, f32, f32) {
@@ -3339,26 +3329,6 @@ fn badge_name(key: &str) -> &str {
 }
 
 
-/// Transcripts do Claude Code nos perfis (~/.claude*/projects) de uma home:
-/// (mtime, perfil, sessao, caminho). Copias de seguranca ficam de fora.
-fn scan_profiles(home: &std::path::Path) -> Vec<(u64, String, String, String)> {
-    let mut found = Vec::new();
-    for prof in std::fs::read_dir(home).into_iter().flatten().flatten() {
-        let pname = prof.file_name().to_string_lossy().to_string();
-        if !pname.starts_with(".claude") || pname.contains(".bak") || pname.contains("backup") || !prof.path().join("projects").is_dir() { continue; }
-        for proj in std::fs::read_dir(prof.path().join("projects")).into_iter().flatten().flatten() {
-            for f in std::fs::read_dir(proj.path()).into_iter().flatten().flatten() {
-                let p = f.path();
-                if p.extension().is_none_or(|e| e != "jsonl") { continue; }
-                let mtime = f.metadata().and_then(|m| m.modified()).ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-                found.push((mtime, pname.clone(), p.file_stem().unwrap().to_string_lossy().to_string(), p.to_string_lossy().to_string()));
-            }
-        }
-    }
-    found
-}
-
 /// Sessoes do Claude Code dentro das distros do WSL que sao dominios do Duck.
 /// So as distros ja rodando (ler \\wsl.localhost acorda uma parada), e o
 /// resultado vale 60 s (o acesso pelo 9P e lento).
@@ -3392,7 +3362,7 @@ fn wsl_sessions(domains: &[config::Domain]) -> Vec<(u64, String, String, String,
                 let base = std::path::PathBuf::from(format!(r"\\wsl.localhost\{distro}\home"));
                 for user in std::fs::read_dir(&base).into_iter().flatten().flatten() {
                     let uname = user.file_name().to_string_lossy().to_string();
-                    for (mtime, prof, session, path) in scan_profiles(&user.path()) {
+                    for (mtime, prof, session, path) in crate::claude::scan_profiles(&user.path()) {
                         out.push((mtime, prof, session, path, Some((domain.clone(), format!("/home/{uname}")))));
                     }
                 }

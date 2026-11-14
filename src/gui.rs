@@ -29,6 +29,7 @@ mod agents;
 mod ext;
 mod best;
 mod graph;
+mod mobile;
 mod peers;
 mod tr;
 mod update;
@@ -311,6 +312,8 @@ struct Overlay {
     secret: bool,
     /// Painel Computadores: um pedido de conexao pode abrir por cima dele.
     peers: bool,
+    /// QR do pareamento do celular: (largura, modulos, rodape). Desenhado no lugar da lista.
+    qr: Option<(usize, Vec<bool>, String)>,
     /// Paleta: uso por rotulo (ultimo uso em segundos, vezes). Recentes
     /// primeiro com a busca vazia; frequentes sobem no desempate.
     rank: HashMap<String, (u64, u32)>,
@@ -348,13 +351,13 @@ fn fuzzy(q: &str, s: &str) -> Option<i32> {
 impl Overlay {
     fn list(title: &str, items: Vec<Item>) -> Overlay {
         let mut o = Overlay { title: title.into(), input: String::new(), items, shown: vec![], sel: 0, kind: OverlayKind::List, agents: false,
-            dialog: false, home: false, palette: false, gallery: None, secret: false, peers: false, rank: HashMap::new() };
+            dialog: false, home: false, palette: false, gallery: None, secret: false, peers: false, qr: None, rank: HashMap::new() };
         o.filter();
         o
     }
     fn prompt(title: &str, initial: &str, action: &str, args: Vec<Value>) -> Overlay {
         Overlay { title: title.into(), input: initial.into(), items: vec![], shown: vec![], sel: 0, kind: OverlayKind::Prompt(action.into(), args), agents: false,
-            dialog: false, home: false, palette: false, gallery: None, secret: false, peers: false, rank: HashMap::new() }
+            dialog: false, home: false, palette: false, gallery: None, secret: false, peers: false, qr: None, rank: HashMap::new() }
     }
     fn dialog(title: &str, items: Vec<Item>) -> Overlay {
         let mut o = Overlay::list(title, items);
@@ -602,7 +605,7 @@ fn default_menus() -> Vec<Menu> {
         m("janela", "Janela: abas, panes e workspaces", &["Dividir", "Fechar", "Zoom", "Pane", "Nova aba", "Novo pane", "Renomear", "Cor da aba", "Mover", "Redimensionar",
             "Reabrir", "Aba anterior", "Fixar", "PiP", "Trocar o pane",
             "Broadcast", "Trocar de workspace", "Criar/ir", "Salvar workspace", "Restaurar workspace", "Apagar estado", "Modo foco", "Barra lateral", "Layout:", "Inicio:"]),
-        m("config", "Configuração", &["Configuracoes", "Galeria de temas", "Tema a partir", "Fonte", "Densidade", "Segredos:", "Tradutor:", "Glossário", "Recarregar config", "Reiniciar server", "Encerrar server", "Desanexar"]),
+        m("config", "Configuração", &["Configuracoes", "Celulares", "Galeria de temas", "Tema a partir", "Fonte", "Densidade", "Segredos:", "Tradutor:", "Glossário", "Recarregar config", "Reiniciar server", "Encerrar server", "Desanexar"]),
     ]
 }
 
@@ -1545,6 +1548,7 @@ impl Gui {
             b("Recarregar config", "reload_config", vec![]),
             b("Desanexar (fecha a janela, shells continuam)", "detach", vec![]),
             b("Computadores: conectar outro computador (mensagens entre agentes)", "peers", vec![]),
+            b("Celulares: controlar o Duck pelo celular (parear, permissões)", "mobile", vec![]),
             b("Mandar mensagem para um agente de outro computador (escolhe pela aba)", "peer_msg_pick", vec![]),
             b(&match &self.update_ver { Some(v) => format!("Atualizar o Duck: {} -> {v}", crate::update::current()), None => format!("Atualizar o Duck (esta: {}; procura versao nova)", crate::update::current()) }, "duck_update", vec![]),
             b("Reiniciar server (atualiza o Duck; os shells continuam)", "restart_server", vec![]),

@@ -520,7 +520,7 @@ impl Gui {
                     Err(e) => self.flash(&e),
                 }
             }
-            _ => return self.peers_builtin(name, args) || self.update_builtin(name, args) || self.tr_builtin(name, args),
+            _ => return self.peers_builtin(name, args) || self.mobile_builtin(name, args) || self.update_builtin(name, args) || self.tr_builtin(name, args),
         }
         self.redraw();
         true

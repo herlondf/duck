@@ -12,6 +12,7 @@
 //!   duck doctor | run | fleet | mcp | view          ferramentas
 //!   duck guard install|check|scan                   barra segredo/palavra no commit e no push
 //!   duck why <pane> | queue ls|rm|up|now <pane>      estado do agente explicado; fila de recados
+//!   duck mobile pair|list|revoke|scopes             celulares (QR, permissoes)
 //!   duck init | install | plugin                    config, boot e plugins
 
 pub mod cli;
@@ -24,9 +25,12 @@ pub mod linux;
 pub mod peer;
 pub mod secure;
 pub mod relay;
+pub mod fcm;
+pub mod mobile;
 pub mod plugins;
 pub mod proto;
 pub mod ptyhost;
+pub mod claude;
 pub mod colr;
 pub mod render;
 pub mod secret;
@@ -78,6 +82,7 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("why") => cli::why(&args[1..]),
         Some("queue") => cli::queue(&args[1..]),
         Some("peer") => cli::peer(&args[1..]),
+        Some("mobile") => cli::mobile(&args[1..]),
         Some("send-file") => cli::send_file(&args[1..]),
         Some("relay") => relay::main(&args[1..]),
         Some("update") => update::main(&args[1..]),
@@ -87,7 +92,7 @@ pub fn entry(gui_binary: bool) -> ! {
         Some("toast") => toast::run(args.get(1).map(String::as_str).unwrap_or("")),
         Some("--version" | "-V") => { println!("duck {}", env!("CARGO_PKG_VERSION")); 0 }
         Some("--help" | "-h") => {
-            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--statusline settings.json] [--quick] | config set <chave> <valor> | statusline | quick | plugin add|list|update | guard install|scan | why <pane> | queue ls|add|rm|up|now <pane> | msg <peer>[/aba] [--to aba] texto | send-file <peer> <arq> | peer list|find|connect|invite|join|doctor|sessions | relay | update [--check|--release|--source]");
+            println!("duck [--workspace NOME] [--restore] [--quick] | cli <cmd> | hook | doctor | run --cmd C | fleet tarefas.txt | mcp | view <arq> | init | install [--hooks settings.json] [--statusline settings.json] [--quick] | config set <chave> <valor> | statusline | quick | plugin add|list|update | guard install|scan | why <pane> | queue ls|add|rm|up|now <pane> | msg <peer>[/aba] [--to aba] texto | send-file <peer> <arq> | peer list|find|connect|invite|join|doctor|sessions | mobile pair|list|revoke|scopes | relay | update [--check|--release|--source]");
             0
         }
         _ => {

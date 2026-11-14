@@ -29,6 +29,9 @@ serde_json = "1.0.154"
 snow = "0.10"
 base64 = "0.22.1"
 getrandom = "0.3.4"
+qrcode = { version = "0.14", default-features = false }
+rsa = "0.9"
+sha2 = { version = "0.10", features = ["oid"] }
 sysinfo = { version = "0.40.1", default-features = false, features = ["system", "network"] }
 wasmi = { version = "2.0.0", features = ["wat"] }
 wgpu = "30.0.1"
@@ -52,6 +55,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_Graphics_Dwm", "Win32_Fou
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5.19.0"
 x11rb = { version = "0.13.2", default-features = false }
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [build-dependencies]
 embed-resource = "3"
